@@ -8,6 +8,11 @@
 # ignored.
 /conformance/_suite/
 
+# differential suite (tests/differential/): generated artifacts + Node deps
+/tests/differential/node/node_modules/
+/tests/differential/node/out/
+/tests/differential/out/
+
 __pycache__/
 *.py[cod]
 *.swp
