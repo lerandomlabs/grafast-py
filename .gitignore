@@ -1,0 +1,11 @@
+# Python bytecode + tool caches only. Everything else (reference/, tests/,
+# gtests/, bench/, notes/, SUMMARY.md, PRODUCTION_PLAN.md, AGENTS.md, demo_plan.py,
+# uv.lock, *.md reports) is intentionally NOT ignored — it stays untracked and
+# visible in `git status` so we can decide per-item what belongs in the public repo.
+__pycache__/
+*.py[cod]
+*.swp
+.venv/
+.ruff_cache/
+.pytest_cache/
+.benchmarks/

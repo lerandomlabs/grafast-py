@@ -1,0 +1,70 @@
+[project]
+name = "grafast-py"
+version = "0.1.0"
+description = "A plan-then-execute GraphQL execution engine for graphql-core — real Grafast-style automatic batching (the N+1 fix). Drop-in for any graphql-core server (Ariadne, FastAPI, Strawberry-over-core, …); no framework coupling."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Michael Elsdorfer", email = "elsdoerfer@gmail.com" }]
+keywords = [
+    "graphql",
+    "grafast",
+    "graphql-core",
+    "ariadne",
+    "dataloader",
+    "n+1",
+    "batching",
+    "planner",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Framework :: AsyncIO",
+    "Typing :: Typed",
+]
+# The core engine depends ONLY on graphql-core. It is framework-agnostic (works with
+# any graphql-core server) and data-source-agnostic (the generic load_one/load_many
+# batch steps work against anything). The Postgres data source is the `pg` extra.
+dependencies = [
+    "graphql-core>=3.2.8",
+]
+
+[project.optional-dependencies]
+# Postgres data source (grafast_py.pg): PgResource + batched pg_select / Relay
+# connections over async SQLAlchemy. Install with: pip install 'grafast-py[pg]'.
+pg = [
+    "sqlalchemy>=2.0.50",
+    "asyncpg>=0.31.0",
+    "greenlet>=3.5.1",
+]
+# structured kv logging renders structurally when structlog is installed; without
+# it the library falls back to a stdlib-logging kv shim (no hard dependency).
+structlog = ["structlog>=24.1.0"]
+
+[project.urls]
+# placeholder repository URLs — update on first publish.
+Homepage = "https://github.com/miracle2k/grafast-py"
+Repository = "https://github.com/miracle2k/grafast-py"
+Issues = "https://github.com/miracle2k/grafast-py/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/grafast_py"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=9.0.3",
+    "pytest-describe>=3.1.0",
+    "pytest-asyncio>=1.4.0",
+    "pytest-benchmark>=5.2.3",
+    "psutil>=7.2.2",
+    "ariadne>=1.0.1",
+    "psycopg[binary]>=3.3.4",
+]
