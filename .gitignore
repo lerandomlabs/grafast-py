@@ -8,6 +8,10 @@
 # ignored.
 /conformance/_suite/
 
+# generated benchmark reports (regenerate via benchmarks/*.py)
+/benchmarks/results.md
+/benchmarks/soak_results.md
+
 # differential suite (tests/differential/): generated artifacts + Node deps
 /tests/differential/node/node_modules/
 /tests/differential/node/out/
