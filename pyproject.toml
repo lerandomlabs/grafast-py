@@ -29,8 +29,11 @@ classifiers = [
 # The core engine depends ONLY on graphql-core. It is framework-agnostic (works with
 # any graphql-core server) and data-source-agnostic (the generic load_one/load_many
 # batch steps work against anything). The Postgres data source is the `pg` extra.
+# Upper-bounded: the engine subclasses graphql-core's ExecutionContext and calls
+# collect_fields with the 3.2.x signature. graphql-core 3.3 reworks both for
+# incremental delivery (@defer/@stream), so pin to the 3.2 line until ported.
 dependencies = [
-    "graphql-core>=3.2.8",
+    "graphql-core>=3.2.8,<3.3",
 ]
 
 [project.optional-dependencies]

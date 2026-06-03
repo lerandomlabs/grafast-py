@@ -58,7 +58,8 @@ from grafast_py import (
     make_grafast_schema,
 )
 from examples.demo_schema import build_demo_schema
-from grafast_py.pg.engine import DEMO_SCHEMA, count_sql, dispose_engine, get_engine
+from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
+from examples.seed import DEMO_SCHEMA
 
 # fixed fan-out so rows scale LINEARLY in N (N authors -> dataset bounded even at
 # N=1000: 1k authors + 5k posts + 20k comments = 26k rows).

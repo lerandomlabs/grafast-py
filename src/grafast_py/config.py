@@ -91,8 +91,11 @@ class GrafastConfig:
     ------
     execution_timeout_s
         Wall-clock budget for the ASYNC execution path; on overrun the operation
-        raises :class:`GrafastTimeoutError`. The synchronous path has no event loop
-        to interrupt, so the timeout does not apply there (documented limitation).
+        raises :class:`GrafastTimeoutError`. The synchronous path has no event loop to
+        interrupt, so the timeout does not apply there. It bounds the CALLER but does
+        not by itself guarantee in-flight DB statements are cancelled and their
+        connections released — pair it with a server-side ``statement_timeout`` (via
+        the pg engine's ``connect_args``) for a hard database-side bound.
         ``None`` = unbounded.
     max_depth
         Maximum object-selection nesting depth, checked at PLAN time before any
@@ -106,9 +109,12 @@ class GrafastConfig:
         weighting. Over budget raises :class:`GrafastCostLimitError`. ``None`` =
         unbounded.
     max_step_concurrency
-        Caps simultaneously in-flight awaitables in the bucket executor (async
-        resolvers, DB round-trips) via an :class:`asyncio.Semaphore`, independent of
-        the pg connection pool. ``None`` = unbounded.
+        Secondary throttle on the bucket executor's sibling-field completion fan-out,
+        via an :class:`asyncio.Semaphore`. NOTE: this is **not** the bound on
+        concurrent DB round-trips — that is the pg connection pool
+        (``pool_size + max_overflow``), which SQLAlchemy enforces by queuing checkouts.
+        Bound DB concurrency with the pool; this knob bounds in-engine fan-out.
+        ``None`` = unbounded.
 
     Tracing hooks (no-ops by default)
     ---------------------------------

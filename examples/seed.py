@@ -10,9 +10,19 @@ a genuine multi-layer relation graph so a nested query exercises hasOne and hasM
 chaining and the O(depth) batching gate.
 """
 
+import os
+
 from sqlalchemy import text
 
-from grafast_py.pg.engine import DEMO_SCHEMA, get_engine
+from grafast_py.pg.engine import get_engine
+
+# Demo/test fixtures only — NOT part of the shipped library. The demo data lives in
+# this schema of a local scratch database; importing this module points the pg engine
+# at that scratch DB by default (setdefault, so an explicit GRAFAST_PG_URL wins) so the
+# examples/benchmarks/tests touch ONLY the scratch DB and never another database on the
+# server. A real consumer of grafast_py sets their own GRAFAST_PG_URL / configure_engine.
+DEMO_SCHEMA = "grafast_demo"
+os.environ.setdefault("GRAFAST_PG_URL", "postgresql+asyncpg:///grafast_py_test")
 
 # deterministic seed: 3 authors; author i has (i+1) posts; each post has 2 comments.
 _AUTHORS = [

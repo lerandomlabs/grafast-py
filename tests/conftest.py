@@ -8,6 +8,7 @@ here so the suite is self-sufficient: a few tests import the `examples` package
 on the (separate, conformance-only) root conftest.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -15,6 +16,11 @@ import pytest
 
 # repo root (parent of tests/) on sys.path so `import examples.*` resolves.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# DB-backed tests target ONLY the local scratch database (never another DB on the
+# server). setdefault so an explicit GRAFAST_PG_URL still wins; the pg engine itself
+# bakes in no database (see grafast_py.pg.engine).
+os.environ.setdefault("GRAFAST_PG_URL", "postgresql+asyncpg:///grafast_py_test")
 
 
 def pytest_configure(config):

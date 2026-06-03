@@ -18,6 +18,7 @@ two steps with the same class, the same dependency winner ids, the same
 to one, so a value loaded/accessed twice is loaded/accessed once.
 """
 
+import inspect
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from .step_model import Step
@@ -462,8 +463,6 @@ class LoadManyStep(LoadStep):
 
 def _is_coroutine(value: Any) -> bool:
     """Awaitable predicate used by transient sub-DAG runs (EachStep, loaders)."""
-    import inspect
-
     return inspect.isawaitable(value)
 
 

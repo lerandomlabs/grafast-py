@@ -36,7 +36,8 @@ from sqlalchemy import text
 
 from grafast_py import GrafastExecutionContext
 from examples.demo_schema import build_demo_schema
-from grafast_py.pg.engine import DEMO_SCHEMA, get_engine
+from grafast_py.pg.engine import get_engine
+from examples.seed import DEMO_SCHEMA
 
 try:  # current-RSS sampling; psutil is the dev dep for this (preferred over rusage).
     import psutil

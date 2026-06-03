@@ -1,8 +1,10 @@
 # grafast-py
 
-A **plan-then-execute** GraphQL engine for [graphql-core](https://github.com/graphql-python/graphql-core)
-and [Ariadne](https://ariadnegraphql.org/) — a drop-in `ExecutionContext` with real
-[Grafast](https://grafast.org)-style **automatic batching** (the N+1 fix). It is an
+A **plan-then-execute** GraphQL execution engine for
+[graphql-core](https://github.com/graphql-python/graphql-core) — a drop-in
+`ExecutionContext` with real [Grafast](https://grafast.org)-style **automatic
+batching** (the N+1 fix). Framework-agnostic: works with any graphql-core server
+([Ariadne](https://ariadnegraphql.org/), FastAPI, Strawberry-over-core, …). An
 experimental Python re-implementation of the core ideas of Graphile's Grafast.
 
 ## The Grafast idea in 3 lines
@@ -16,14 +18,19 @@ experimental Python re-implementation of the core ideas of Graphile's Grafast.
 ## Install
 
 ```bash
-uv add grafast-py        # or: pip install grafast-py
+uv add grafast-py          # or: pip install grafast-py   (core dep: graphql-core only)
 # optional extras:
-uv add 'grafast-py[ariadne]'    # Ariadne SchemaBindable integration
-uv add 'grafast-py[structlog]'  # structured kv logging
+uv add 'grafast-py[pg]'        # Postgres data source (SQLAlchemy + asyncpg)
+uv add 'grafast-py[structlog]' # structured kv logging (else a stdlib shim is used)
 ```
 
-Runtime dependencies are just `graphql-core`, `sqlalchemy`, `asyncpg`, and `greenlet`.
-The package ships a `py.typed` marker, so type information is available to consumers.
+The **core depends only on `graphql-core`** — it is framework-agnostic (any
+graphql-core server) and data-source-agnostic (the generic `load_one`/`load_many`
+batch steps work against anything). The Postgres data source (`grafast_py.pg`) is the
+optional `[pg]` extra; its symbols import lazily and raise a clear install hint if the
+extra is missing. The package ships a `py.typed` marker for typing consumers.
+
+Ariadne integration needs **no** extra — it works through graphql-core (see below).
 
 ## graphql-core / Ariadne integration
 
@@ -115,7 +122,7 @@ class HardenedContext(GrafastExecutionContext):
         execution_timeout_s=5.0,    # async-path wall-clock budget
         max_depth=12,               # reject deeply nested queries (plan time)
         max_cost=10_000,            # basic static cost guard (plan time)
-        max_step_concurrency=32,    # cap in-flight awaitables / DB round-trips
+        max_step_concurrency=32,    # cap in-flight step fan-out (see pool note below)
         # tracing hooks (no-ops by default); each may return a context-manager span:
         on_operation=my_op_span,    # (context, operation)
         on_plan=my_plan_span,       # (context, operation)
@@ -123,33 +130,44 @@ class HardenedContext(GrafastExecutionContext):
     )
 ```
 
-Configure the Postgres pool (the URL is fixed to the scratch DB; the knobs tune the
-pool/connection only):
+Point the Postgres data source at **your** database and size its pool — pass `url=`
+or set the `GRAFAST_PG_URL` env var (the library bakes in no database):
 
 ```python
 from grafast_py.pg import configure_engine
-configure_engine(pool_size=32, max_overflow=8, pool_timeout=30)
+configure_engine(
+    url="postgresql+asyncpg://user:pass@host/dbname",
+    pool_size=32, max_overflow=8, pool_timeout=30,
+)
 ```
 
-**Concurrency / pool relationship:** the ceiling on concurrent in-flight SQL is
-`pool_size + max_overflow`. If application concurrency exceeds that, the excess
-queues on checkout and raises the latency tail. Size the pool to your target
-concurrency, cap concurrency with `max_step_concurrency`, or both.
+**Concurrency / pool relationship:** the real ceiling on concurrent in-flight DB
+connections is `pool_size + max_overflow` (SQLAlchemy enforces it; excess operations
+queue on checkout, raising the latency tail). Size the pool to your target
+concurrency. `max_step_concurrency` is a secondary throttle on the engine's own step
+fan-out, not the DB bound — the pool is. For per-statement bounds, set a server-side
+`statement_timeout` via `connect_args`.
 
 ## Status / caveats
 
-This engine **passes a rigorous internal gate set** — see [`SUMMARY.md`](SUMMARY.md)
-for the evidence (conformance, differential parity vs the reference Node Grafast,
-the O(depth) bench table, and the soak numbers) and an **honest** statement of what
-is *not* yet battle-tested. "Passes our rigorous gates" is not the same as
-"validated against your production workload." Before running with real money, pin
-the version, run the differential harness against **your** schema and fixtures, and
-load-test with **your** pool/concurrency. A security review is recommended.
+This engine **passes a rigorous internal gate set**: the full graphql-core 3.2.8
+execution conformance suite (302 on the stock executor / 300 + 2 skipped through this
+engine), differential parity vs the reference Node Grafast (`tests/differential/`), an
+O(depth) N+1 benchmark, and a concurrent soak. **"Passes our gates" is not the same as
+"validated against your production workload."** Before running with real money: pin
+the version, run the differential harness against **your** schema and fixtures,
+load-test with **your** pool size and concurrency, and commission a security review.
+
+Not yet covered: `@defer`/`@stream` incremental delivery (graphql-core 3.3); multiple
+databases in one process (one engine per URL — dispose+reconfigure to switch); a
+`first:`-aware query-cost guard (`max_cost` is structural — use `max_depth` + per-field
+`first` caps against pagination abuse); and the execution timeout bounds the caller but
+does not itself cancel in-flight SQL (pair it with a server-side `statement_timeout`).
 
 ## More
 
 - Examples: [`examples/`](examples/)
-- Production-readiness assessment: [`SUMMARY.md`](SUMMARY.md)
+- Running the test / conformance / differential / benchmark suites: [`AGENTS.md`](AGENTS.md)
 
 ## License
 

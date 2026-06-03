@@ -55,6 +55,8 @@ from .core_steps import (
 from .schema import (
     FieldArgs,
     GrafastSchemaBindable,
+    PlanResolver,
+    attach_plans,
     get_field_plan,
     make_grafast_schema,
     set_field_plan,
@@ -71,6 +73,7 @@ from .step_model import Step
 __all__ = [
     "GrafastExecutionContext",
     "install",
+    "uninstall",
     # hardening config + error classes
     "GrafastConfig",
     "GrafastTimeoutError",
@@ -86,7 +89,9 @@ __all__ = [
     "make_grafast_schema",
     "GrafastSchemaBindable",
     "set_field_plan",
+    "attach_plans",
     "get_field_plan",
+    "PlanResolver",
     "FieldArgs",
     # step base + core steps
     "Step",
@@ -154,28 +159,45 @@ def __getattr__(name: str):
     return value
 
 
+_GRAPHQL_MODULES = ("graphql.execution.execute", "graphql.execution.subscribe")
+_saved_execution_contexts: dict = {}
+
+
+def _graphql_module(name: str):
+    """Return the real graphql-core submodule (via sys.modules to dodge the package's
+    shadowing of the `execute` submodule by the `execute` function)."""
+    module = sys.modules.get(name)
+    if module is None:
+        __import__(name)
+        module = sys.modules[name]
+    return module
+
+
 def install() -> None:
-    """Route graphql-core's `execute()`/`subscribe()` through our engine.
+    """OPT-IN: globally route graphql-core's `execute()`/`subscribe()` through
+    grafast-py for the whole process.
 
-    Patches the *real* `graphql.execution.execute` and `.subscribe` modules
-    (resolved via `sys.modules` to dodge the package-level name shadowing of the
-    `execute` submodule by the `execute` function).
+    Most callers should NOT use this — pass `execution_context_class=
+    GrafastExecutionContext` to `graphql()`/`execute()` (or your Ariadne/FastAPI app)
+    instead, which is explicit and process-local. `install()` exists for true drop-in
+    replacement scenarios where you can't thread the class through. It is idempotent;
+    pair it with `uninstall()` to restore graphql-core's original executor.
     """
-    execute_mod = sys.modules.get("graphql.execution.execute")
-    if execute_mod is None:
-        import graphql.execution.execute as execute_mod  # noqa: F401 (registers it)
-
-        execute_mod = sys.modules["graphql.execution.execute"]
-    execute_mod.ExecutionContext = GrafastExecutionContext
-
-    subscribe_mod = sys.modules.get("graphql.execution.subscribe")
-    if subscribe_mod is None:
-        import graphql.execution.subscribe as subscribe_mod  # noqa: F401
-
-        subscribe_mod = sys.modules["graphql.execution.subscribe"]
-    subscribe_mod.ExecutionContext = GrafastExecutionContext
+    for name in _GRAPHQL_MODULES:
+        module = _graphql_module(name)
+        _saved_execution_contexts.setdefault(name, module.ExecutionContext)
+        module.ExecutionContext = GrafastExecutionContext
 
 
-# install on import: the harness imports this package only under GRAFAST=1, so the
-# stock baseline run (which never imports grafast_py) is unaffected.
-install()
+def uninstall() -> None:
+    """Undo `install()`, restoring graphql-core's original `ExecutionContext`."""
+    for name, original in list(_saved_execution_contexts.items()):
+        module = sys.modules.get(name)
+        if module is not None:
+            module.ExecutionContext = original
+    _saved_execution_contexts.clear()
+
+
+# NOTE: install() is deliberately NOT called on import. Importing grafast_py has no
+# global side effect on graphql-core; use execution_context_class=... (preferred) or
+# call install() explicitly to opt into the process-wide patch.

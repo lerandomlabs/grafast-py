@@ -109,7 +109,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "asyncpg", marker = "extra == 'pg'", specifier = ">=0.31.0" },
-    { name = "graphql-core", specifier = ">=3.2.8" },
+    { name = "graphql-core", specifier = ">=3.2.8,<3.3" },
     { name = "greenlet", marker = "extra == 'pg'", specifier = ">=3.5.1" },
     { name = "sqlalchemy", marker = "extra == 'pg'", specifier = ">=2.0.50" },
     { name = "structlog", marker = "extra == 'structlog'", specifier = ">=24.1.0" },
