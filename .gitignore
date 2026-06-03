@@ -2,6 +2,12 @@
 # gtests/, bench/, notes/, SUMMARY.md, PRODUCTION_PLAN.md, AGENTS.md, demo_plan.py,
 # uv.lock, *.md reports) is intentionally NOT ignored — it stays untracked and
 # visible in `git status` so we can decide per-item what belongs in the public repo.
+# Fetched by scripts/fetch_conformance.py — the third-party graphql-core test
+# suite is downloaded on demand, never committed. The committed conformance/
+# package shell (__init__.py + conftest.py) drives it; only the fetched suite is
+# ignored.
+/conformance/_suite/
+
 __pycache__/
 *.py[cod]
 *.swp
