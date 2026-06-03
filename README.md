@@ -120,8 +120,6 @@ from grafast_py import GrafastConfig, GrafastExecutionContext
 class HardenedContext(GrafastExecutionContext):
     grafast_config = GrafastConfig(
         execution_timeout_s=5.0,    # async-path wall-clock budget
-        max_depth=12,               # reject deeply nested queries (plan time)
-        max_cost=10_000,            # basic static cost guard (plan time)
         max_step_concurrency=32,    # cap in-flight step fan-out (see pool note below)
         # tracing hooks (no-ops by default); each may return a context-manager span:
         on_operation=my_op_span,    # (context, operation)
@@ -148,6 +146,28 @@ concurrency. `max_step_concurrency` is a secondary throttle on the engine's own 
 fan-out, not the DB bound — the pool is. For per-statement bounds, set a server-side
 `statement_timeout` via `connect_args`.
 
+### Query cost / depth limiting — use your validation layer
+
+grafast-py is a drop-in `ExecutionContext`, and **validation runs before execution**,
+so query cost/depth limiting is the validation layer's job and composes with this
+engine for free. It is deliberately **not** built into the engine (the executor isn't
+the right layer, and a baked-in static guard isn't `first:`-aware). Add a validation
+rule — e.g. **Ariadne's `cost_validator`** (`first:`-aware via cost-map multipliers) or
+[`graphql-cost-analysis`](https://github.com/pa-bru/graphql-cost-analysis) — to your
+server:
+
+```python
+from ariadne.asgi import GraphQL
+from ariadne.validation import cost_validator
+from grafast_py import GrafastExecutionContext
+
+app = GraphQL(
+    schema,
+    execution_context_class=GrafastExecutionContext,   # batched execution
+    validation_rules=[cost_validator(maximum_cost=1000, cost_map=COST_MAP)],  # cost limit
+)
+```
+
 ## Status / caveats
 
 This engine **passes a rigorous internal gate set**: the full graphql-core 3.2.8
@@ -159,10 +179,10 @@ the version, run the differential harness against **your** schema and fixtures,
 load-test with **your** pool size and concurrency, and commission a security review.
 
 Not yet covered: `@defer`/`@stream` incremental delivery (graphql-core 3.3); multiple
-databases in one process (one engine per URL — dispose+reconfigure to switch); a
-`first:`-aware query-cost guard (`max_cost` is structural — use `max_depth` + per-field
-`first` caps against pagination abuse); and the execution timeout bounds the caller but
-does not itself cancel in-flight SQL (pair it with a server-side `statement_timeout`).
+databases in one process (one engine per URL — dispose+reconfigure to switch); and the
+execution timeout bounds the caller but does not itself cancel in-flight SQL (pair it
+with a server-side `statement_timeout`). Query cost/depth limiting is by design **not**
+in this engine — do it in your validation layer (see above).
 
 ## More
 

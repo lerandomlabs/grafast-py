@@ -27,8 +27,6 @@ import sys
 
 from .config import (
     GrafastConfig,
-    GrafastCostLimitError,
-    GrafastDepthLimitError,
     GrafastTimeoutError,
 )
 from .context import GrafastExecutionContext
@@ -74,11 +72,9 @@ __all__ = [
     "GrafastExecutionContext",
     "install",
     "uninstall",
-    # hardening config + error classes
+    # hardening config + error class
     "GrafastConfig",
     "GrafastTimeoutError",
-    "GrafastDepthLimitError",
-    "GrafastCostLimitError",
     # NOTE: the Postgres data-source symbols (PgResource, PgRegistry, PgRelation,
     # PgSelectStep, PgSelectSingleStep, PgSelectAllStep, PgConnectionStep,
     # pg_select, pg_select_single, connection) are intentionally NOT in __all__:

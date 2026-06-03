@@ -15,10 +15,11 @@ native non-null null-bubbling and correct error ``path`` accumulation. Fields
 WITHOUT a plan resolver keep a per-parent resolver-adapter path (``ResolveStep``) so
 plain-resolver schemas — and the graphql-core conformance suite — run unchanged.
 
-Production hardening (execution timeout, depth / cost limits, bounded concurrency,
-structured logging, tracing hooks, configurable pg pool) is OPT-IN via a
-:class:`GrafastConfig` attached to the context class; the defaults reproduce the
-engine's pre-hardening behaviour exactly. See :mod:`grafast_py.config`.
+Production hardening (execution timeout, bounded concurrency, structured logging,
+tracing hooks, configurable pg pool) is OPT-IN via a :class:`GrafastConfig` attached
+to the context class; the defaults reproduce the engine's pre-hardening behaviour
+exactly. See :mod:`grafast_py.config`. (Query cost/depth limiting is a validation-layer
+concern — use your server's validation rules, not this executor.)
 """
 
 import asyncio
@@ -52,8 +53,8 @@ class GrafastExecutionContext(ExecutionContext):
 
         Queries and subscription events run the root fields in parallel; mutations
         run them serially (each field's resolver and completion finish before the
-        next field starts). Depth / cost limits are enforced at plan time; the
-        execution timeout and bounded concurrency apply to the async path.
+        next field starts). The execution timeout and bounded concurrency apply to
+        the async path.
         """
         config = type(self).grafast_config
         # expose the opt-in step-batch tracing hook + concurrency gate to the
@@ -83,8 +84,6 @@ class GrafastExecutionContext(ExecutionContext):
 
         op_span = _enter_span(config.on_operation, self, operation)
         plan_span = _enter_span(config.on_plan, self, operation)
-        # depth / cost limits raise out of plan_operation (config carried on context).
-        self._grafast_config = config
         plan = plan_operation(self, operation, root_type, root_fields)
         _exit_span(plan_span)
 

@@ -5,9 +5,9 @@ Each control is OPT-IN via a `GrafastConfig` attached to a *subclass* of
 global install is unaffected). The defaults are exercised implicitly by every other
 suite (which uses the bare base context with `DEFAULT_CONFIG` = no limits).
 
-Covered: depth limit rejects, cost limit rejects, execution timeout fires (async
-path), the step-batch tracing hook is called around each batch, and the pg engine
-honours a configured pool size.
+Covered: execution timeout fires (async path), the operation/plan/step-batch tracing
+hooks are called, and the pg engine honours a configured pool size. (Query cost/depth
+limiting is intentionally a validation-layer concern, not part of this engine.)
 """
 
 import asyncio
@@ -24,8 +24,6 @@ from grafast_py import (
 )
 from grafast_py.config import (
     GrafastConfig,
-    GrafastCostLimitError,
-    GrafastDepthLimitError,
     GrafastTimeoutError,
 )
 
@@ -84,43 +82,6 @@ def run(query, config, variables=None):
         execution_context_class=context_with(config),
         variable_values=variables,
     )
-
-
-# ----------------------------------------------------------------- depth limit
-def test_depth_limit_rejects_too_deep():
-    # Query.user (depth1) -> best (depth2) -> best (depth3): exceeds max_depth=2.
-    result = run(
-        "{ user { id best { id best { id } } } }",
-        GrafastConfig(max_depth=2),
-    )
-    assert result.errors, "expected a depth-limit error"
-    err = result.errors[0]
-    assert isinstance(err.original_error or err, GrafastDepthLimitError)
-    assert "max depth" in err.message
-
-
-def test_depth_limit_allows_within_budget():
-    result = run("{ user { id name } }", GrafastConfig(max_depth=2))
-    assert not result.errors, result.errors
-    assert result.data == {"user": {"id": 1, "name": "Luke"}}
-
-
-# ------------------------------------------------------------------ cost limit
-def test_cost_limit_rejects_over_budget():
-    # 4 fields at field_cost=1 with no list multiplier -> cost 4 > max_cost=2.
-    result = run(
-        "{ user { id name best { id } } }",
-        GrafastConfig(max_cost=2),
-    )
-    assert result.errors
-    err = result.errors[0]
-    assert isinstance(err.original_error or err, GrafastCostLimitError)
-    assert "max cost" in err.message
-
-
-def test_cost_limit_allows_within_budget():
-    result = run("{ user { id } }", GrafastConfig(max_cost=10))
-    assert not result.errors, result.errors
 
 
 # --------------------------------------------------------------- exec timeout

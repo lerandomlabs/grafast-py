@@ -12,9 +12,6 @@ List/NonNull wrappers of those. There is no deferral path — the engine is an
 unconditional drop-in. Fields without a plan resolver still take the per-parent
 resolver-adapter (`ResolveStep`) route, which the planner wires into the same step
 DAG so plain-resolver schemas run unchanged.
-
-Opt-in depth / cost limits (`GrafastConfig`) are enforced here, at plan time,
-before any resolver runs (see `enforce_plan_limits`).
 """
 
 from typing import Any, Callable, Dict, List, NamedTuple, Optional
@@ -30,7 +27,6 @@ from .completion import (
     build_completer,
     find_object_completer,
 )
-from .config import log
 from .dag import Plan
 from .schema import FieldArgs, get_field_plan
 from .step_model import Step
@@ -199,12 +195,6 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     """
     from .core_steps import RootStep
 
-    config = getattr(context, "_grafast_config", None)
-    if config is not None and (
-        config.max_depth is not None or config.max_cost is not None
-    ):
-        enforce_plan_limits(context, operation, root_type, root_fields, config)
-
     plan = Plan()
     root_step = RootStep()
     plan.add_step(root_step)
@@ -219,67 +209,6 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     context._grafast_plan = plan
     context._grafast_root_step = root_step
     return object_plan
-
-
-def enforce_plan_limits(context, operation, root_type, root_fields, config) -> None:
-    """Reject an operation that exceeds the opt-in depth / cost budget, at plan time.
-
-    Walks the collected selection set BEFORE any resolver runs. `depth` is object
-    selection-set nesting (the root set is depth 1). `cost` is a basic static
-    estimate: every field costs `config.field_cost`, and a field's subtree cost is
-    multiplied by `config.list_factor` for each enclosing list field (the standard
-    multiplier heuristic). Over either budget raises a specific GraphQLError subclass
-    located at the operation. Honest scope: the cost guard is purely structural — it
-    has no per-argument (`first:`-aware) weighting.
-    """
-    from graphql.type import (
-        GraphQLObjectType,
-        get_named_type,
-        is_list_type,
-        is_non_null_type,
-    )
-
-    from .config import GrafastCostLimitError, GrafastDepthLimitError
-
-    max_observed = [0]
-    total_cost = [0]
-
-    def has_list_wrapper(gql_type) -> bool:
-        """True if the (possibly non-null-wrapped) type is a list."""
-        while is_non_null_type(gql_type):
-            gql_type = gql_type.of_type
-        return is_list_type(gql_type)
-
-    def walk(parent_type, fields, depth, multiplier) -> None:
-        if depth > max_observed[0]:
-            max_observed[0] = depth
-        for field_nodes in fields.values():
-            field_def = get_field_def(context.schema, parent_type, field_nodes[0])
-            if field_def is None:
-                continue
-            total_cost[0] += config.field_cost * multiplier
-            child_multiplier = multiplier
-            if has_list_wrapper(field_def.type):
-                child_multiplier = multiplier * config.list_factor
-            named = get_named_type(field_def.type)
-            if isinstance(named, GraphQLObjectType):
-                sub_fields = context.collect_subfields(named, field_nodes)
-                walk(named, sub_fields, depth + 1, child_multiplier)
-
-    walk(root_type, root_fields, 1, 1)
-
-    if config.max_depth is not None and max_observed[0] > config.max_depth:
-        log.warning("depth limit exceeded", depth=max_observed[0], limit=config.max_depth)
-        raise GrafastDepthLimitError(
-            f"operation exceeds max depth {config.max_depth} (depth {max_observed[0]})",
-            operation,
-        )
-    if config.max_cost is not None and total_cost[0] > config.max_cost:
-        log.warning("cost limit exceeded", cost=total_cost[0], limit=config.max_cost)
-        raise GrafastCostLimitError(
-            f"operation exceeds max cost {config.max_cost} (cost {total_cost[0]})",
-            operation,
-        )
 
 
 def remap_object_plan(object_plan: ObjectPlan, remap: Dict[int, Step]) -> ObjectPlan:

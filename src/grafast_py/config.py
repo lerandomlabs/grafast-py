@@ -67,14 +67,6 @@ class GrafastTimeoutError(GraphQLError):
     """Raised when an operation exceeds ``execution_timeout_s`` (async path only)."""
 
 
-class GrafastDepthLimitError(GraphQLError):
-    """Raised at plan time when selection-set nesting exceeds ``max_depth``."""
-
-
-class GrafastCostLimitError(GraphQLError):
-    """Raised at plan time when the static cost estimate exceeds ``max_cost``."""
-
-
 def _noop_span(*args: Any, **kwargs: Any) -> Optional[Any]:
     """Default tracing hook: returns None (no span). Zero overhead."""
     return None
@@ -87,6 +79,12 @@ class GrafastConfig:
     Defaults reproduce the engine's pre-hardening behaviour exactly (no limits, no
     bounded concurrency, no-op tracing), so attaching a default config is a no-op.
 
+    Query COST and DEPTH limiting are deliberately NOT here — they are validation-layer
+    concerns. graphql-core runs validation rules before this executor, so they compose
+    with any ``ExecutionContext``; use your server's validation rules (e.g. Ariadne's
+    ``cost_validator``, which is ``first:``-aware, or ``graphql-cost-analysis``). This
+    config covers only the true execution-layer concerns below.
+
     Limits
     ------
     execution_timeout_s
@@ -97,17 +95,6 @@ class GrafastConfig:
         connections released — pair it with a server-side ``statement_timeout`` (via
         the pg engine's ``connect_args``) for a hard database-side bound.
         ``None`` = unbounded.
-    max_depth
-        Maximum object-selection nesting depth, checked at PLAN time before any
-        resolver runs; over the limit raises :class:`GrafastDepthLimitError`.
-        ``None`` = unbounded.
-    max_cost
-        Budget for a basic STATIC structural cost estimate computed at plan time:
-        each field costs ``field_cost``, and a field's subtree cost is multiplied by
-        ``list_factor`` for each enclosing list (the standard multiplier heuristic).
-        This is intentionally basic — it has no per-argument ``first:``-aware
-        weighting. Over budget raises :class:`GrafastCostLimitError`. ``None`` =
-        unbounded.
     max_step_concurrency
         Secondary throttle on the bucket executor's sibling-field completion fan-out,
         via an :class:`asyncio.Semaphore`. NOTE: this is **not** the bound on
@@ -132,10 +119,6 @@ class GrafastConfig:
     """
 
     execution_timeout_s: Optional[float] = None
-    max_depth: Optional[int] = None
-    max_cost: Optional[int] = None
-    field_cost: int = 1
-    list_factor: int = 10
     max_step_concurrency: Optional[int] = None
 
     on_operation: Callable[..., Optional[Any]] = field(default=_noop_span)
@@ -151,7 +134,5 @@ __all__ = [
     "GrafastConfig",
     "DEFAULT_CONFIG",
     "GrafastTimeoutError",
-    "GrafastDepthLimitError",
-    "GrafastCostLimitError",
     "log",
 ]

@@ -21,7 +21,8 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
   completion.py        wrapping-type completers (leaf/object/list/non-null/abstract) + null-bubbling
   bubble.py            null-bubble sentinel
   schema.py            plan-resolver API: set_field_plan, make_grafast_schema, FieldArgs
-  config.py            GrafastConfig (timeout, depth/cost limits, concurrency) + error classes
+  config.py            GrafastConfig (execution timeout, concurrency, logging, tracing) + error class
+                       (query cost/depth limiting is a validation-layer concern, not here)
   pg/                  Postgres data source — the optional `[pg]` extra (SQLAlchemy/asyncpg):
                        resource.py (PgResource), steps.py (pg_select…), connection.py (Relay),
                        engine.py (async engine, configure_engine, count_sql)
