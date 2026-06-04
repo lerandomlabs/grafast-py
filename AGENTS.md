@@ -24,9 +24,20 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
   config.py            GrafastConfig (execution timeout, concurrency, logging, tracing) + error class
                        (query cost/depth limiting is a validation-layer concern, not here)
   pg/                  Postgres data source — the optional `[pg]` extra (SQLAlchemy/asyncpg):
-                       resource.py (PgResource), steps.py (pg_select…), connection.py (Relay),
+                       resource.py (PgResource: attributes/codecs/relations, select_customizer),
+                       steps.py (pg_select / pg_select_single / PgSelectAllStep, batched = ANY($1)),
+                       connection.py (keyset Relay connection: forward+reverse, separate totalCount),
+                       cursor.py (keyset/seek cursors + the NULL-aware keyset WHERE comparator),
+                       ordering.py (OrderTerm → structured ORDER BY, direction/nulls/multi-column),
+                       pagination.py (per-parent first/offset window slice),
+                       customize.py (host WHERE: select_customizer + per-plan .where()/.apply()),
+                       mutations.py (pg_insert/update/delete_single on the serial seam),
                        engine.py (async engine, configure_engine, count_sql),
-                       from_sqlalchemy.py (derive PgResource descriptors from ORM models)
+                       executor.py (request-scoped PgExecutor + pg_request_context, pgSettings/RLS),
+                       from_sqlalchemy.py (derive PgResource descriptors from ORM models).
+                       Deferred: multi-column relation keys, runtime from_step placeholders,
+                       single-shared-request-transaction mode, query inlining/LATERAL,
+                       GROUP BY/HAVING/aggregates, a full codec types table.
 
 tests/                 our own pytest suite (fast, pure-Python; run in CI)
 tests/differential/    parity vs reference Node Grafast (on-demand; needs Node) — see its README
@@ -72,6 +83,15 @@ uv run python benchmarks/soak.py
 - **Batching is the point.** A relation/loader must fire its batch callback once per
   layer, not once per parent. `tests/differential` asserts our `fetchCounts` match
   reference Grafast exactly; `benchmarks/bench_nplus1.py` asserts SQL is O(depth).
+- **The pg hot path runs through the request executor, not `get_engine`.** Production
+  injects a host executor per request — `SQLAlchemyExecutor(host_engine)` (or a
+  `RawExecutor` over a host pool) bound via `pg_request_context` around `await
+  graphql(...)`. `get_engine`/`configure_engine` are a demo/test convenience (one
+  process-global engine); the steps must read `current_pg_request().executor`, never call
+  `get_engine` on the hot path. Per-request `pgSettings`/RLS: pass `settings={...}` to
+  `pg_request_context`; the executor applies them with transaction-local `set_config` in
+  the query's own transaction (auto-clearing at commit). Enforcement needs a DB role that
+  does not bypass RLS — a superuser/`BYPASSRLS` role is never subject to a policy.
 
 ## Database (DB-backed tests + benchmarks)
 
