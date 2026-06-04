@@ -109,6 +109,30 @@ uv run python examples/pg_blog.py
 `grafast_py.pg` is the canonical import path for the data source; the most-used
 symbols are also re-exported at the top level for convenience.
 
+### Define resources from your SQLAlchemy models
+
+If your tables are already mapped as SQLAlchemy declarative models, you can derive
+the `PgResource` descriptors instead of re-typing table / column / relation metadata:
+
+```python
+from grafast_py import resources_from_models
+from myapp.models import Author, Post, Comment
+
+registry = resources_from_models([Author, Post, Comment])
+schema = build_my_schema(registry)   # you still write the SDL + plan resolvers
+```
+
+This is **resources-only** — it derives table, columns, primary key and hasOne/hasMany
+relations from the ORM. It does **not** generate the GraphQL SDL or the plan resolvers
+(you still write those) and does not map column types/codecs. `resource_from_model(model, …)`
+builds a single resource; `resources_from_models([...])` builds a `PgRegistry` and wires
+relations between models that are both in the batch.
+
+Limits (pass an override or the relation is skipped): a composite/absent primary key
+needs `primary_key="…"`; many-to-many relations, composite-foreign-key relations, and
+relations whose target model is not in the batch are skipped with a warning (set
+`strict=True` to raise instead).
+
 ## Hardening config (opt-in)
 
 All production controls are opt-in via a `GrafastConfig` on the context class; the

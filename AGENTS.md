@@ -25,13 +25,15 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        (query cost/depth limiting is a validation-layer concern, not here)
   pg/                  Postgres data source — the optional `[pg]` extra (SQLAlchemy/asyncpg):
                        resource.py (PgResource), steps.py (pg_select…), connection.py (Relay),
-                       engine.py (async engine, configure_engine, count_sql)
+                       engine.py (async engine, configure_engine, count_sql),
+                       from_sqlalchemy.py (derive PgResource descriptors from ORM models)
 
 tests/                 our own pytest suite (fast, pure-Python; run in CI)
 tests/differential/    parity vs reference Node Grafast (on-demand; needs Node) — see its README
 benchmarks/            N+1 benchmark + concurrent soak (on-demand; need Postgres)
 conformance/           harness for graphql-core's execution suite (fetched on demand)
 examples/              runnable demos (plan_blog: in-memory; pg_blog: Postgres) + demo fixtures
+                       (models.py: SQLAlchemy ORM mapping of the grafast_demo tables)
 scripts/               dev tooling (fetch_conformance.py)
 ```
 

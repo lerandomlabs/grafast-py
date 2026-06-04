@@ -125,6 +125,8 @@ _PG_LAZY = {
     "PgSelectStep": ".pg.steps",
     "pg_select": ".pg.steps",
     "pg_select_single": ".pg.steps",
+    "resource_from_model": ".pg.from_sqlalchemy",
+    "resources_from_models": ".pg.from_sqlalchemy",
 }
 
 

@@ -103,9 +103,21 @@ def build_registry() -> Tuple[PgRegistry, PgResource, PgResource, PgResource]:
     return registry, authors, posts, comments
 
 
-def build_demo_schema() -> GraphQLSchema:
-    """Build the Postgres-backed demo GraphQL schema with plan resolvers."""
-    _registry, authors, posts, comments = build_registry()
+def build_demo_schema(registry: Optional[PgRegistry] = None) -> GraphQLSchema:
+    """Build the Postgres-backed demo GraphQL schema with plan resolvers.
+
+    With no ``registry`` the demo builds its own (hand-declared) resources via
+    :func:`build_registry`. When a ``registry`` is passed — e.g. one derived from
+    SQLAlchemy models by :func:`grafast_py.pg.resources_from_models` — the three
+    resources are fetched from it by name and the SAME plans are wired, so a
+    model-derived registry drives the identical schema.
+    """
+    if registry is None:
+        _registry, authors, posts, comments = build_registry()
+    else:
+        authors = registry["authors"]
+        posts = registry["posts"]
+        comments = registry["comments"]
 
     plans = {
         "Query": {

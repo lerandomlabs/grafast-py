@@ -8,6 +8,7 @@ Phase A step model, so a depth-D nested query issues ~D batched SQL statements t
 
 from .connection import PgConnectionStep, connection, decode_cursor, encode_cursor
 from .engine import configure_engine, count_sql, dispose_engine, get_engine
+from .from_sqlalchemy import resource_from_model, resources_from_models
 from .resource import PgRegistry, PgRelation, PgResource
 from .steps import (
     PgSelectAllStep,
@@ -34,4 +35,6 @@ __all__ = [
     "configure_engine",
     "dispose_engine",
     "count_sql",
+    "resource_from_model",
+    "resources_from_models",
 ]
