@@ -66,6 +66,8 @@ class Plan:
             for step in order_steps(self.steps):
                 if survivors.get(step.id) is not step:
                     continue  # already merged away
+                if not step.dedupable:
+                    continue  # side-effecting (e.g. mutation): never merge with a peer
                 key = _structural_key(step, survivors)
                 winner = by_key.get(key)
                 if winner is None:
