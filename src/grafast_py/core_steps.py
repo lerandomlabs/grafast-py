@@ -247,8 +247,8 @@ class EachStep(Step):
     bucket (so a ``loadMany`` inside the mapper batches across ALL items of ALL
     parents), then re-grouping per parent.
 
-    Phase A note: the flat-bucket re-execution is driven here directly via
-    ``run_steps`` over the mapper's sub-DAG, seeded by an :class:`ItemStep` source.
+    The flat-bucket re-execution is driven here directly via ``run_steps`` over the
+    mapper's sub-DAG, seeded by an :class:`ItemStep` source.
     """
 
     is_sync_and_safe = False

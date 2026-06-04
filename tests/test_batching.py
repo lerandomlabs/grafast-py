@@ -8,7 +8,7 @@ executor must run that step ONCE over the whole bucket, so the user batch-load
 callback fires exactly once per layer — verified with a hard call counter — not once
 per parent (the N+1 it replaces).
 
-The schema/data are static plain dicts (no database — Phase A is source-agnostic);
+The schema/data are static plain dicts (no database — the batch model is source-agnostic);
 the loaders are plain Python callbacks with counters. We assert BOTH the data and
 the batch-call counts.
 """

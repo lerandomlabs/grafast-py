@@ -1,4 +1,4 @@
-"""Phase C — differential parity test vs the reference Node Grafast.
+"""Differential parity test vs the reference Node Grafast.
 
 Regenerates BOTH result files (so a stale file can never mask a regression), then
 diffs them per fixture:

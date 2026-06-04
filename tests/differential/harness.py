@@ -1,4 +1,4 @@
-"""Phase C — grafast-py harness (Python side of the differential corpus).
+"""grafast-py harness (Python side of the differential corpus).
 
 For each fixture in ``corpus.py``: install a per-fixture fetch counter around
 every named batch loader (by mutating ``LOADERS`` so the plan closures pick up the

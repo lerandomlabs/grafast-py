@@ -1,4 +1,4 @@
-// Phase C — SHARED differential corpus (reference / Node side).
+// Shared differential corpus (reference / Node side).
 //
 // This file is the canonical-TS-Grafast encoding of the corpus. Its Python twin is
 // gtests/diff_corpus.py — the two MUST encode the same fixtures (same `name`, same

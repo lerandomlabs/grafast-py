@@ -1,4 +1,4 @@
-"""Phase C — SHARED differential corpus (Python / grafast-py side).
+"""Shared differential corpus (Python / grafast-py side).
 
 This is the grafast-py twin of ``node/corpus.mjs``. The two files MUST encode
 the same fixtures: same ``name``, same SDL text, same seed values, matched plan

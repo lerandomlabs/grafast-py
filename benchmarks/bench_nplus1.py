@@ -59,6 +59,7 @@ from grafast_py import (
 )
 from examples.demo_schema import build_demo_schema
 from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
+from grafast_py.pg.executor import SQLAlchemyExecutor, pg_request_context
 from examples.seed import DEMO_SCHEMA
 
 # fixed fan-out so rows scale LINEARLY in N (N authors -> dataset bounded even at
@@ -199,12 +200,17 @@ def naive_sql_count(n: int) -> int:
 
 
 async def run_nested_once(schema: GraphQLSchema):
-    """Execute the nested query once through our engine; return (data, errors)."""
-    result = await graphql(
-        schema,
-        NESTED_QUERY,
-        execution_context_class=GrafastExecutionContext,
-    )
+    """Execute the nested query once through our engine; return (data, errors).
+
+    Binds a :class:`SQLAlchemyExecutor` over the shared engine for the request so the
+    pg steps run their statements via the request-scoped executor.
+    """
+    with pg_request_context(SQLAlchemyExecutor(get_engine())):
+        result = await graphql(
+            schema,
+            NESTED_QUERY,
+            execution_context_class=GrafastExecutionContext,
+        )
     return result.data, result.errors
 
 

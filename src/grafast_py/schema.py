@@ -33,9 +33,8 @@ class FieldArgs:
     """A thin read accessor over a field's coerced argument values.
 
     ``field_args.get("name")`` / ``field_args["name"]`` return the already-coerced
-    argument value (NOT a step, in this Phase-A surface — plan resolvers treat args
-    as plain values and lift them with ``constant`` when a step is needed). ``raw``
-    exposes the whole coerced dict.
+    argument value (NOT a step — plan resolvers treat args as plain values and lift
+    them with ``constant`` when a step is needed). ``raw`` exposes the whole coerced dict.
     """
 
     def __init__(self, args: Optional[Mapping[str, Any]]) -> None:

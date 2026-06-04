@@ -30,19 +30,28 @@ from graphql import graphql
 
 from grafast_py import GrafastExecutionContext
 from examples.demo_schema import build_demo_schema
-from grafast_py.pg.engine import count_sql, dispose_engine
+from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
+from grafast_py.pg.executor import SQLAlchemyExecutor, pg_request_context
 from examples.seed import setup_demo_schema
 
 
 async def run(schema, query, variables=None):
-    """Execute one operation through our plan-then-execute engine, counting SQL."""
-    with count_sql() as counter:
-        result = await graphql(
-            schema,
-            query,
-            variable_values=variables,
-            execution_context_class=GrafastExecutionContext,
-        )
+    """Execute one operation through our plan-then-execute engine, counting SQL.
+
+    Builds a :class:`SQLAlchemyExecutor` over the convenience engine and binds it for
+    the request, so the pg steps run their statements via the request-scoped executor;
+    ``count_sql`` instruments that same engine.
+    """
+    engine = get_engine()
+    executor = SQLAlchemyExecutor(engine)
+    with count_sql(engine) as counter:
+        with pg_request_context(executor):
+            result = await graphql(
+                schema,
+                query,
+                variable_values=variables,
+                execution_context_class=GrafastExecutionContext,
+            )
     if result.errors:
         raise AssertionError(f"query errored: {result.errors}")
     return result.data, counter
