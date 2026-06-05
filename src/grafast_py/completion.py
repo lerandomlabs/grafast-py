@@ -790,7 +790,7 @@ def abstract_child_plan(context, completer, object_type):
     """
     from .core_steps import RootStep
     from .dag import Plan
-    from .plan import plan_object, remap_object_plan
+    from .plan import finalize_plan, plan_object
 
     cached = completer.plan_cache.get(object_type.name)
     if cached is not None:
@@ -803,8 +803,7 @@ def abstract_child_plan(context, completer, object_type):
     child_plan = plan_object(
         context, object_type, sub_fields, parent_step=root_step, plan=plan
     )
-    remap = plan.deduplicate()
-    child_plan = remap_object_plan(child_plan, remap)
+    child_plan = finalize_plan(plan, child_plan)
 
     completer.plan_cache[object_type.name] = child_plan
     return child_plan
