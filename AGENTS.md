@@ -51,9 +51,22 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        from_sqlalchemy.py (derive PgResource descriptors from ORM models),
                        inline.py (Wave 3b LATERAL relation inlining: InlineSpec + NestedExtractStep +
                          the equivalence-preserving safety predicate; opt-in via
-                         GrafastConfig.inline_relations, default OFF, per-table opt_out_inline).
-                       Experimental/opt-in: LATERAL relation inlining (default OFF; ships dark).
-                       Deferred: runtime from_step placeholders + plan caching, HAVING on aggregates.
+                         GrafastConfig.inline_relations, default OFF, per-table opt_out_inline),
+                       placeholders.py (Wave 4 runtime placeholders: pg_placeholder builds a
+                         value-agnostic bindparam tagged with a SOURCE identity — "var:<name>" —
+                         so a WHERE/pagination value dedups by source, NEVER by runtime value;
+                         literals still inline + dedup by value unchanged).
+                       Experimental/opt-in: LATERAL relation inlining + cross-request plan caching
+                       + runtime placeholders (all default OFF; ship dark).
+                       Deferred: HAVING on aggregates.
+
+src/grafast_py/cache.py  Wave 4 cross-request plan cache (core, sqlalchemy-free): a bounded-LRU
+                       process cache of finalized plans keyed by (id(schema), document-text hash,
+                       operation name, variable-arg fingerprint); a HIT re-binds each placeholder
+                       to THIS request's variables by source tag. Opt-in via GrafastConfig.cache_plans
+                       (default OFF); only a value-agnostic (placeholder-bearing / all-literal) plan
+                       is cacheable across values, so a plan that inlined a variable literal is never
+                       reused.
 
 tests/                 our own pytest suite (fast, pure-Python; run in CI)
 tests/differential/    parity vs reference Node Grafast (on-demand; needs Node) — see its README
@@ -71,6 +84,13 @@ uv run pytest tests                                   # our suite (fast)
 GRAFAST_INLINE_RELATIONS=1 uv run pytest tests -m pg  # CI inline-on oracle: whole pg suite
                                                       # re-run with LATERAL inlining forced on,
                                                       # proving byte-identical data everywhere
+GRAFAST_CACHE_PLANS=1 uv run pytest tests             # CI cache-on oracle: whole suite re-run
+                                                      # with cross-request plan caching (+ runtime
+                                                      # placeholders) forced on — a hit changes only
+                                                      # WHETHER planning re-runs, so byte-identical
+GRAFAST_PLACEHOLDERS=1 uv run pytest tests            # CI placeholders-on oracle: the variable
+                                                      # provenance + placeholder dedup path forced
+                                                      # on WITHOUT caching (A/B'd independently)
 uv run python examples/plan_blog.py                   # see batching with no DB
 
 # conformance (graphql-core's own execution suite as an oracle)
