@@ -38,7 +38,6 @@ from grafast_py.pg.conditions import (
     And,
     Compare,
     Condition,
-    Not,
     Or,
     compile_condition,
 )

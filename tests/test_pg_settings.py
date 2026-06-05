@@ -22,7 +22,7 @@ DB tests are marked ``pg`` (deselectable ``-m 'not pg'``); they touch ONLY the
 import pytest
 import pytest_asyncio
 from graphql import graphql
-from sqlalchemy import any_, bindparam, column, func, select, table, text
+from sqlalchemy import func, select, text
 
 from grafast_py.context import GrafastExecutionContext
 from grafast_py.core_steps import access, constant

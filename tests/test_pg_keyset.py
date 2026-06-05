@@ -31,7 +31,7 @@ from graphql import graphql
 from sqlalchemy import NUMERIC, TIMESTAMP, column, select, table
 
 from grafast_py.context import GrafastExecutionContext
-from grafast_py.core_steps import access, constant
+from grafast_py.core_steps import constant
 from grafast_py.pg.connection import PgConnectionStep
 from grafast_py.pg.cursor import (
     decode_keyset_cursor,

@@ -27,7 +27,6 @@ from grafast_py.pg.mutations import (
     pg_update_single,
 )
 from grafast_py.pg.resource import PgRegistry, PgResource
-from grafast_py.pg.steps import pg_select, pg_select_single
 
 SDL = """
 type Query {
