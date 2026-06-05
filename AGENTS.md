@@ -48,9 +48,12 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        engine.py (async engine, configure_engine, count_sql),
                        executor.py (request-scoped PgExecutor + pg_request_context[_async], pgSettings/RLS,
                          opt-in shared_txn REPEATABLE READ mode),
-                       from_sqlalchemy.py (derive PgResource descriptors from ORM models).
-                       Deferred: runtime from_step placeholders + plan caching, query inlining/LATERAL,
-                       HAVING on aggregates.
+                       from_sqlalchemy.py (derive PgResource descriptors from ORM models),
+                       inline.py (Wave 3b LATERAL relation inlining: InlineSpec + NestedExtractStep +
+                         the equivalence-preserving safety predicate; opt-in via
+                         GrafastConfig.inline_relations, default OFF, per-table opt_out_inline).
+                       Experimental/opt-in: LATERAL relation inlining (default OFF; ships dark).
+                       Deferred: runtime from_step placeholders + plan caching, HAVING on aggregates.
 
 tests/                 our own pytest suite (fast, pure-Python; run in CI)
 tests/differential/    parity vs reference Node Grafast (on-demand; needs Node) — see its README
@@ -65,6 +68,9 @@ scripts/               dev tooling (fetch_conformance.py)
 
 ```bash
 uv run pytest tests                                   # our suite (fast)
+GRAFAST_INLINE_RELATIONS=1 uv run pytest tests -m pg  # CI inline-on oracle: whole pg suite
+                                                      # re-run with LATERAL inlining forced on,
+                                                      # proving byte-identical data everywhere
 uv run python examples/plan_blog.py                   # see batching with no DB
 
 # conformance (graphql-core's own execution suite as an oracle)
