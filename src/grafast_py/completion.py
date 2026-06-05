@@ -773,16 +773,39 @@ def abstract_child_plan(context, completer, object_type):
     """Build (and cache) the ObjectPlan for one concrete type under this field.
 
     Subfields are collected with the concrete `object_type` (so type-conditioned
-    fragments resolve), then planned. Cached per concrete type on the completer so
-    repeated buckets of the same type reuse the plan.
+    fragments resolve), then planned as a SELF-CONTAINED subtree: a fresh `RootStep`
+    seeds this concrete-type group's row objects and every plan-resolver field (incl.
+    nested pg relations) hangs its step off it, exactly as `plan_operation` does for the
+    operation root. The subtree's DAG is deduplicated + remapped so the executor seeds
+    `child_plan.parent_step` (the RootStep) with the group's objects and runs the steps
+    once per group. Cached per concrete type on the completer so repeated buckets of the
+    same type reuse the plan.
+
+    Why a fresh RootStep per concrete type rather than threading the field's outer plan:
+    an abstract value resolves to a DIFFERENT concrete type per row, so no single child
+    step DAG spans them — each concrete-type group is its own bucket. A concrete type with
+    no plan-resolver fields (the legacy/resolver path, e.g. the conformance suite) plans to
+    an empty DAG with a RootStep parent, so the executor's bucket-step run is a no-op and
+    the legacy per-parent resolver path is entirely unaffected.
     """
-    from .plan import plan_object
+    from .core_steps import RootStep
+    from .dag import Plan
+    from .plan import plan_object, remap_object_plan
 
     cached = completer.plan_cache.get(object_type.name)
     if cached is not None:
         return cached
     sub_fields = context.collect_subfields(object_type, completer.field_nodes)
-    child_plan = plan_object(context, object_type, sub_fields)
+
+    plan = Plan()
+    root_step = RootStep()
+    plan.add_step(root_step)
+    child_plan = plan_object(
+        context, object_type, sub_fields, parent_step=root_step, plan=plan
+    )
+    remap = plan.deduplicate()
+    child_plan = remap_object_plan(child_plan, remap)
+
     completer.plan_cache[object_type.name] = child_plan
     return child_plan
 
