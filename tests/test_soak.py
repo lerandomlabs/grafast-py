@@ -25,7 +25,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "benchmarks"))
 
 from soak_core import run_soak, scale_seed, SoakResult  # noqa: E402
-from grafast_py.pg.engine import dispose_engine, get_engine  # noqa: E402
+from grafast_py.pg.engine import dispose_engine  # noqa: E402
+from examples.seed import reseed_lock  # noqa: E402
 
 pytestmark = pytest.mark.pg
 
@@ -42,19 +43,27 @@ CI_RSS_THRESHOLD_MB = 50.0
 async def test_concurrent_soak_no_errors_no_leak_bounded_rss():
     """1000 mixed ops at concurrency 16: zero errors, no pool leak, bounded RSS."""
     await dispose_engine()  # fresh engine bound to THIS test's loop
-    # scale_seed commits AND verifies the author count is visible over a fresh connection
-    # before returning, so the soak never starts against a stale/half-seeded schema; drive
-    # the soak's expectations off the VERIFIED committed count, not the constant.
-    seeded = await scale_seed(CI_N_AUTHORS)
-    assert seeded == CI_N_AUTHORS
+    # Hold the cross-process reseed lock for the WHOLE soak (reseed + every concurrent read):
+    # the soak reseeds grafast_demo to exactly CI_N_AUTHORS and asserts that count, so a
+    # SECOND pytest process reseeding the same shared schema mid-run would corrupt the
+    # snapshot. The session-level advisory lock blocks any other reseeder (their fixtures
+    # take the matching transaction-level lock) until this soak releases. Released before
+    # the engine is disposed, since the lock is held on one of that engine's connections.
     try:
-        res: SoakResult = await run_soak(
-            total_ops=CI_TOTAL_OPS,
-            concurrency=CI_CONCURRENCY,
-            n_authors=seeded,
-            warmup_ops=CI_WARMUP_OPS,
-            rss_threshold_mb=CI_RSS_THRESHOLD_MB,
-        )
+        async with reseed_lock():
+            # scale_seed commits AND verifies the author count is visible over a fresh
+            # connection before returning, so the soak never starts against a
+            # stale/half-seeded schema; drive the soak's expectations off the VERIFIED
+            # committed count, not the constant.
+            seeded = await scale_seed(CI_N_AUTHORS)
+            assert seeded == CI_N_AUTHORS
+            res: SoakResult = await run_soak(
+                total_ops=CI_TOTAL_OPS,
+                concurrency=CI_CONCURRENCY,
+                n_authors=seeded,
+                warmup_ops=CI_WARMUP_OPS,
+                rss_threshold_mb=CI_RSS_THRESHOLD_MB,
+            )
     finally:
         await dispose_engine()
 

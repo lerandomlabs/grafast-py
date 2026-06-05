@@ -11,11 +11,13 @@ chaining and the O(depth) batching gate.
 """
 
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
-from grafast_py.pg.engine import get_engine
+from grafast_py.pg.engine import URL_ENV_VAR, get_engine
 
 # Demo/test fixtures only — NOT part of the shipped library. The demo data lives in
 # this schema of a local scratch database; importing this module points the pg engine
@@ -24,6 +26,56 @@ from grafast_py.pg.engine import get_engine
 # server. A real consumer of grafast_py sets their own GRAFAST_PG_URL / configure_engine.
 DEMO_SCHEMA = "grafast_demo"
 os.environ.setdefault("GRAFAST_PG_URL", "postgresql+asyncpg:///grafast_py_test")
+
+# A fixed Postgres advisory-lock key serializing every reseed of the shared
+# ``grafast_demo`` schema ACROSS PROCESSES. Two pytest processes share the one local
+# ``grafast_py_test`` database, so two reseeders dropping+recreating ``grafast_demo``
+# concurrently would corrupt each other's snapshot mid-run (the soak seeds 50 authors and
+# asserts exactly that; a regular fixture reseeds 3). Every reseeder takes this lock (the
+# regular fixtures transaction-scoped, the soak session-scoped for its whole run), so the
+# reseed+read windows can never interleave. The key is arbitrary but stable — any reseeder
+# of this schema, in any process, must use THIS value.
+RESEED_LOCK_KEY = 0x6772_6166  # 'graf'
+
+
+@asynccontextmanager
+async def reseed_lock():
+    """Hold the cross-process ``grafast_demo`` reseed lock for the duration of the block.
+
+    Acquires a SESSION-level Postgres advisory lock on :data:`RESEED_LOCK_KEY` and releases
+    it on exit. Session-level (not transaction-level) so a caller can hold it across MANY
+    transactions — the soak holds it across its reseed AND its whole concurrent-read run, so
+    no other process can reseed the schema mid-soak. A regular fixture's transaction-level
+    ``pg_advisory_xact_lock`` on the same key contends with this, so it blocks until the soak
+    releases (and vice versa).
+
+    The lock is taken over a DEDICATED single-connection engine (same ``grafast_py_test`` URL
+    as the shared engine, never another database) rather than the shared engine's pool: the
+    soak measures that shared pool's checkout/leak counts, and a held lock connection would
+    register as a phantom checkout and a non-empty pool at quiescence, breaking the soak's
+    no-leak assertions. An isolated engine keeps the lock entirely off the measured pool.
+    """
+    url = os.environ.get(URL_ENV_VAR)
+    if not url:
+        raise RuntimeError(
+            f"reseed_lock: {URL_ENV_VAR} is not set — refusing to open a lock "
+            "connection without an explicit grafast_py_test URL"
+        )
+    lock_engine = create_async_engine(url, pool_size=1, max_overflow=0)
+    try:
+        async with lock_engine.connect() as conn:
+            await conn.execute(
+                text("SELECT pg_advisory_lock(:key)"), {"key": RESEED_LOCK_KEY}
+            )
+            try:
+                yield
+            finally:
+                await conn.execute(
+                    text("SELECT pg_advisory_unlock(:key)"), {"key": RESEED_LOCK_KEY}
+                )
+    finally:
+        await lock_engine.dispose()
+
 
 # deterministic seed: 3 authors; author i has (i+1) posts; each post has 2 comments.
 _AUTHORS = [
@@ -64,6 +116,12 @@ async def setup_demo_schema() -> None:
 
     engine = get_engine()
     async with engine.begin() as conn:
+        # serialize against any concurrent reseeder (another pytest process, the soak):
+        # a transaction-level advisory lock auto-released at commit, contending with the
+        # soak's session-level lock on the same key so the two reseeds never interleave.
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"), {"key": RESEED_LOCK_KEY}
+        )
         await conn.execute(text(f"DROP SCHEMA IF EXISTS {DEMO_SCHEMA} CASCADE"))
         await conn.execute(text(f"CREATE SCHEMA {DEMO_SCHEMA}"))
 
