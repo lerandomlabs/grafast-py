@@ -126,10 +126,11 @@ def resources_from_models(
     is also in the batch. Returns the registry (a fresh :class:`PgRegistry` if none
     is passed).
 
-    Each relation is wired only when it is a plain single-column hasOne / hasMany to
-    an in-batch target. Many-to-many relations, composite-FK relations, and relations
-    whose target is out of the batch are skipped with a ``log.warning``; with
-    ``strict=True`` every such skip is raised as a ``ValueError`` instead.
+    Each relation is wired when it is a single-column OR a composite-FK hasOne / hasMany
+    to an in-batch target (a composite FK becomes a relation over the column tuples).
+    Many-to-many relations and relations whose target is out of the batch are skipped
+    with a ``log.warning``; with ``strict=True`` every such skip is raised as a
+    ``ValueError`` instead.
     """
     registry = registry if registry is not None else PgRegistry()
     model_list = list(models)
@@ -151,12 +152,12 @@ def wire_relations(
     *,
     strict: bool,
 ) -> None:
-    """Wire ``model``'s single-column relations onto its resource.
+    """Wire ``model``'s relations onto its resource.
 
-    Iterates ``sa_inspect(model).relationships`` and adds a hasOne / hasMany relation
-    for every plain single-column relation whose target model is in
-    ``model_to_resource``. Unsupported shapes (many-to-many, composite FK, out-of-batch
-    target) are skipped with a warning, or raised when ``strict``.
+    Iterates ``sa_inspect(model).relationships`` and adds a hasOne / hasMany relation for
+    every single-column OR composite-FK relation whose target model is in
+    ``model_to_resource``. Unsupported shapes (many-to-many, out-of-batch target) are
+    skipped with a warning, or raised when ``strict``.
     """
     resource = model_to_resource[model]
     for rel in sa_inspect(model).relationships:
@@ -172,12 +173,14 @@ def add_relation(
 ) -> None:
     """Add a single relationship ``rel`` to ``resource`` (or skip it loudly).
 
-    ``rel.local_remote_pairs[0]`` is ``(local, remote)`` oriented relative to the
-    relationship's OWN parent class — local is a column on this resource's table,
+    ``rel.local_remote_pairs`` is the list of ``(local, remote)`` pairs oriented relative
+    to the relationship's OWN parent class — local is a column on this resource's table,
     remote a column on the target's table — which matches
     :class:`~grafast_py.pg.resource.PgRelation`'s convention directly, so no
-    re-orientation is needed. Kind is ``has_one`` when ``rel.uselist`` is ``False``
-    (covers many-to-one AND one-to-one) and ``has_many`` otherwise.
+    re-orientation is needed. A single pair is a single-column FK; several pairs are a
+    COMPOSITE FK (wired as the local/remote column tuples). Kind is ``has_one`` when
+    ``rel.uselist`` is ``False`` (covers many-to-one AND one-to-one) and ``has_many``
+    otherwise.
     """
     if rel.direction.name == "MANYTOMANY":
         if strict:
@@ -187,20 +190,6 @@ def add_relation(
             )
         log.warning(
             "skip many-to-many relation", resource=resource.name, relation=rel.key
-        )
-        return
-
-    if len(rel.local_remote_pairs) != 1:
-        if strict:
-            raise ValueError(
-                f"resource {resource.name!r}: cannot derive composite-FK relation "
-                f"{rel.key!r} ({len(rel.local_remote_pairs)} column pairs)"
-            )
-        log.warning(
-            "skip composite foreign key relation",
-            resource=resource.name,
-            relation=rel.key,
-            pairs=len(rel.local_remote_pairs),
         )
         return
 
@@ -219,20 +208,23 @@ def add_relation(
         )
         return
 
-    local_col, remote_col = rel.local_remote_pairs[0]
+    # local/remote column tuples in pair order; a single pair is the single-column FK, a
+    # composite FK carries several pairs matched as a whole tuple.
+    local_columns = tuple(local.name for local, _ in rel.local_remote_pairs)
+    remote_columns = tuple(remote.name for _, remote in rel.local_remote_pairs)
     if rel.uselist is False:
         resource.has_one(
             rel.key,
             target=target_resource,
-            local_column=local_col.name,
-            remote_column=remote_col.name,
+            local_columns=local_columns,
+            remote_columns=remote_columns,
         )
     else:
         resource.has_many(
             rel.key,
             target=target_resource,
-            local_column=local_col.name,
-            remote_column=remote_col.name,
+            local_columns=local_columns,
+            remote_columns=remote_columns,
         )
 
 

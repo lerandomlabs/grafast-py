@@ -399,6 +399,249 @@ async def setup_labels_table() -> None:
         )
 
 
+async def setup_codec_rows_table() -> None:
+    """Create + seed ``grafast_demo.codec_rows`` (the array/range/enum/composite codec fixture).
+
+    A dedicated fixture for the codec registry's RECURSIVE container codecs, exercising every
+    kind in one table so a plain select observes each decode path:
+
+    - ``tags`` (``text[]``) — an ARRAY codec maps an element ``to_py`` over each element;
+    - ``scores`` (``numeric[]``) — an ARRAY over a non-native element, so the array carries
+      the ``numeric[]`` cast type for the keyset path while asyncpg returns ``Decimal``s;
+    - ``span`` (``int4range``) / ``period`` (``tstzrange``) — RANGE codecs decode the
+      ``asyncpg.Range`` into a plain ``{lower, upper, ...}`` dict;
+    - ``mood`` (a schema-local ENUM) — an ENUM codec validates the label set;
+    - ``point`` (a schema-local COMPOSITE ``(x int, y int)``) — a COMPOSITE codec zips the
+      record into a ``{x, y}`` dict.
+
+    The ENUM + composite are CREATEd inside ``grafast_demo`` (schema-scoped, dropped first so
+    re-seeding is idempotent) — never a server-global type. ``owner_id`` groups rows so the
+    same table serves a hasMany-style ``match_column`` lookup. Lives in ``grafast_demo``
+    alongside the demo tables but is independent of them, so it does not perturb the
+    authors/posts/comments parity fixtures. Run AFTER :func:`setup_demo_schema` (which creates
+    the schema).
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        # drop the table before its dependent types (a column still referencing the type
+        # would block the DROP TYPE); recreate the types fresh so re-seeding is idempotent.
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.codec_rows"))
+        await conn.execute(text(f"DROP TYPE IF EXISTS {DEMO_SCHEMA}.codec_mood"))
+        await conn.execute(text(f"DROP TYPE IF EXISTS {DEMO_SCHEMA}.codec_point"))
+        await conn.execute(
+            text(f"CREATE TYPE {DEMO_SCHEMA}.codec_mood AS ENUM ('happy', 'sad', 'meh')")
+        )
+        await conn.execute(
+            text(f"CREATE TYPE {DEMO_SCHEMA}.codec_point AS (x integer, y integer)")
+        )
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.codec_rows (
+                    id       integer PRIMARY KEY,
+                    owner_id integer NOT NULL,
+                    tags     text[] NOT NULL,
+                    scores   numeric(8,2)[] NOT NULL,
+                    span     int4range NOT NULL,
+                    period   tstzrange NOT NULL,
+                    mood     {DEMO_SCHEMA}.codec_mood NOT NULL,
+                    point    {DEMO_SCHEMA}.codec_point NOT NULL
+                )
+                """
+            )
+        )
+        # owner 1 owns rows 1..3, owner 2 owns row 4. tags are lowercase so an uppercasing
+        # element codec is observable; the ranges/enum/composite values are deterministic so
+        # the decoded dicts are checkable.
+        base = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            (1, 1, ["alpha", "beta"], ["1.50", "2.25"], (1, 5), "happy", (3, 4)),
+            (2, 1, ["gamma"], ["9.99"], (10, 20), "sad", (5, 6)),
+            (3, 1, ["delta", "epsilon"], ["0.00"], (0, 1), "meh", (7, 8)),
+            (4, 2, ["zeta"], ["3.33", "4.44"], (100, 200), "happy", (9, 10)),
+        ]
+        # the range columns are built SERVER-SIDE (int4range(...) / tstzrange(...)) from
+        # plain int / timestamp binds: asyncpg pre-binds a range-typed parameter as a Range
+        # object, so a text-literal CAST would error — building the range in SQL keeps the
+        # binds plain scalars.
+        await conn.execute(
+            text(
+                f"""
+                INSERT INTO {DEMO_SCHEMA}.codec_rows
+                  (id, owner_id, tags, scores, span, period, mood, point)
+                VALUES
+                  (:id, :owner_id, :tags, CAST(:scores AS numeric(8,2)[]),
+                   int4range(:span_lower, :span_upper, '[)'),
+                   tstzrange(:period_lower, :period_upper, '[)'),
+                   CAST(:mood AS {DEMO_SCHEMA}.codec_mood),
+                   ROW(:px, :py)::{DEMO_SCHEMA}.codec_point)
+                """
+            ),
+            [
+                {
+                    "id": i,
+                    "owner_id": o,
+                    "tags": tags,
+                    "scores": scores,
+                    "span_lower": span[0],
+                    "span_upper": span[1],
+                    "period_lower": base.replace(day=i),
+                    "period_upper": base.replace(day=i + 1),
+                    "mood": mood,
+                    "px": pt[0],
+                    "py": pt[1],
+                }
+                for i, o, tags, scores, span, mood, pt in rows
+            ],
+        )
+
+
+async def setup_line_items_table() -> None:
+    """Create + seed ``grafast_demo.line_items`` (the connection-aggregate fixture) idempotently.
+
+    A dedicated fixture for the SEPARATE batched connection aggregate
+    (``sum``/``avg``/``min``/``max``/``count``, optionally GROUPed). ``order_id`` groups the
+    rows so an ``order -> line_items`` hasMany connection aggregates a known per-parent set:
+    ``quantity`` (integer) and ``price`` (numeric) give checkable sum/avg/min/max, ``category``
+    (a categorical column) gives an extra GROUP BY key for the grouped-aggregate path, and
+    ``status`` gives a WHERE-filterable column so the aggregate-under-filter case is
+    observable. Lives in ``grafast_demo`` alongside the demo tables but is independent of
+    them, so it does not perturb the authors/posts/comments parity fixtures. Run AFTER
+    :func:`setup_demo_schema` (which creates the schema).
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.line_items"))
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.line_items (
+                    id       integer PRIMARY KEY,
+                    order_id integer NOT NULL,
+                    category text NOT NULL,
+                    status   text NOT NULL,
+                    quantity integer NOT NULL,
+                    price    numeric(10,2) NOT NULL
+                )
+                """
+            )
+        )
+        # order 1 owns 4 items across 2 categories, order 2 owns 2 items, order 3 owns NONE
+        # (so the empty-aggregate path is observable). quantity/price are deterministic so
+        # the per-order sum/avg/min/max and per-category grouped sub-totals are checkable.
+        # One item is 'void' so a status filter removes a known row from the aggregate.
+        rows = [
+            (1, 1, "book", "ok", 2, "10.00"),
+            (2, 1, "book", "ok", 3, "20.00"),
+            (3, 1, "media", "ok", 1, "5.00"),
+            (4, 1, "media", "void", 10, "99.00"),
+            (5, 2, "book", "ok", 4, "8.00"),
+            (6, 2, "media", "ok", 5, "12.50"),
+        ]
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.line_items"
+                " (id, order_id, category, status, quantity, price)"
+                " VALUES (:id, :order_id, :category, :status, :quantity,"
+                " CAST(:price AS numeric(10,2)))"
+            ),
+            [
+                {
+                    "id": i,
+                    "order_id": o,
+                    "category": c,
+                    "status": s,
+                    "quantity": q,
+                    "price": p,
+                }
+                for i, o, c, s, q, p in rows
+            ],
+        )
+
+
+async def setup_composite_tables() -> None:
+    """Create + seed ``grafast_demo.regions`` and ``grafast_demo.stores`` idempotently.
+
+    A dedicated fixture for the COMPOSITE-key match path: ``regions`` has a two-column
+    primary key ``(org_id, region_id)`` and ``stores`` carries a two-column foreign key
+    ``(org_id, region_id)`` back to it. So a region -> stores hasMany and a store -> region
+    hasOne both match on the column TUPLE (the tuple-IN skeleton), and a row whose
+    ``(org, region)`` pair appears under several single-column values proves the match is
+    over the whole tuple — never a single column. ``label`` / ``name`` make the decoded rows
+    checkable. Lives in ``grafast_demo`` alongside the demo tables but is independent of
+    them, so it does not perturb the authors/posts/comments parity fixtures. Run AFTER
+    :func:`setup_demo_schema` (which creates the schema).
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        # drop the child first (its FK references the parent), then the parent.
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.stores"))
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.regions"))
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.regions (
+                    org_id    integer NOT NULL,
+                    region_id integer NOT NULL,
+                    label     text NOT NULL,
+                    PRIMARY KEY (org_id, region_id)
+                )
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.stores (
+                    id        integer PRIMARY KEY,
+                    org_id    integer NOT NULL,
+                    region_id integer NOT NULL,
+                    name      text NOT NULL,
+                    FOREIGN KEY (org_id, region_id)
+                        REFERENCES {DEMO_SCHEMA}.regions (org_id, region_id)
+                )
+                """
+            )
+        )
+        # two orgs, each with two regions. The (org_id, region_id) pairs deliberately reuse
+        # the same single-column values across orgs — org 1/region 1 and org 2/region 1 share
+        # region_id 1, and both orgs use org-local region_id 1,2 — so a match on region_id
+        # ALONE (or org_id alone) would cross-link rows; only the tuple match is correct.
+        regions = [
+            (1, 1, "org1-north"),
+            (1, 2, "org1-south"),
+            (2, 1, "org2-north"),
+            (2, 2, "org2-south"),
+        ]
+        # region (1,1) owns 2 stores, (1,2) owns 1, (2,1) owns 3, (2,2) owns 0 — so per-parent
+        # counts differ and the (2,2) empty case is observable.
+        stores = [
+            (1, 1, 1, "store-a"),
+            (2, 1, 1, "store-b"),
+            (3, 1, 2, "store-c"),
+            (4, 2, 1, "store-d"),
+            (5, 2, 1, "store-e"),
+            (6, 2, 1, "store-f"),
+        ]
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.regions (org_id, region_id, label)"
+                " VALUES (:org_id, :region_id, :label)"
+            ),
+            [{"org_id": o, "region_id": r, "label": lb} for o, r, lb in regions],
+        )
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.stores (id, org_id, region_id, name)"
+                " VALUES (:id, :org_id, :region_id, :name)"
+            ),
+            [
+                {"id": i, "org_id": o, "region_id": r, "name": n}
+                for i, o, r, n in stores
+            ],
+        )
+
+
 __all__ = [
     "setup_demo_schema",
     "setup_things_table",
@@ -407,4 +650,7 @@ __all__ = [
     "setup_settings_probe_view",
     "setup_rls_table",
     "setup_labels_table",
+    "setup_codec_rows_table",
+    "setup_line_items_table",
+    "setup_composite_tables",
 ]

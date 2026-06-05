@@ -5,8 +5,11 @@
 they ride the SAME bucket executor, dedup and ``EachStep`` flattening as the core
 steps — no second executor. The Grafast batching property is realised in
 ``execute``: it receives EVERY lookup key across the bucket at once (its dep-0 key
-column), folds them into a single ``WHERE match_column = ANY($1)`` statement run ONCE
-on the async engine, then scatters the rows to the parents whose key matched.
+column), folds them into a single ``WHERE match = ANY($1)`` statement run ONCE on the
+async engine, then scatters the rows to the parents whose key matched. The match key is
+ONE column (the fast path ``= ANY``) OR a COMPOSITE tuple of columns
+(``(c1, c2, ...) IN (...)``); the grouping/scatter key is the scalar value for a single
+column and the column TUPLE for a composite (see :func:`grouping_key`).
 
 Hence a depth-D nested query issues ~D SQL statements total (one per resource-layer):
 ``authors`` (1) -> for ALL authors' posts ``WHERE author_id = ANY(...)`` (1) -> for
@@ -18,9 +21,9 @@ Rows come back as plain dicts keyed by column name so the existing ``AccessStep`
 projects leaf columns with no special-casing.
 """
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from sqlalchemy import any_, bindparam, column, select, table
+from sqlalchemy import any_, bindparam, column, select, table, tuple_
 
 from ..config import log
 from ..core_steps import access
@@ -30,6 +33,53 @@ from .executor import current_pg_request
 from .ordering import OrderTerm, normalize_order, order_clauses
 from .pagination import window_slice, window_slice_params
 from .resource import PgResource
+
+
+def as_match_columns(match: Union[str, Sequence[str]]) -> Tuple[str, ...]:
+    """Coerce a step's ``match`` argument to a column tuple (single str -> 1-tuple).
+
+    The step constructors accept EITHER a single column name (the single-column fast
+    path) or an already-built tuple of names (a COMPOSITE key); both collapse to the one
+    ``match_columns`` tuple every emission/grouping path reads.
+    """
+    if isinstance(match, str):
+        return (match,)
+    columns = tuple(match)
+    if not columns:
+        raise ValueError("a pg step needs at least one match column")
+    return columns
+
+
+def grouping_key(row: Mapping[str, Any], match_columns: Tuple[str, ...]) -> Any:
+    """The dict key a row groups/scatters under: the scalar value, or the column tuple.
+
+    Single-column keeps the cheap scalar (``row[col]``) so the key step's scalar value
+    matches directly; a COMPOSITE key reduces to ``tuple(row[c] for c in cols)`` so a row
+    groups under the same tuple the key step supplies. Computed on the RAW row (before any
+    codec decode) so a codec on a match column cannot misgroup (see the connection path).
+    """
+    if len(match_columns) == 1:
+        return row[match_columns[0]]
+    return tuple(row[c] for c in match_columns)
+
+
+def normalize_lookup_key(raw_key: Any, composite: bool) -> Any:
+    """Reduce a per-entry key-step value to its hashable lookup/grouping form, or ``None``.
+
+    Single column: the scalar key passes through (``None`` looks up nothing). COMPOSITE: a
+    :class:`ListStep` hands each entry a LIST of the local-column values; tuple-ify it so it
+    is hashable and aligns with :func:`grouping_key`. A composite key with ANY ``None``
+    component (or a missing whole key) cannot match a row (the FK is not fully present), so
+    it normalises to ``None`` — scattering to null/empty, never to a partial match.
+    """
+    if not composite:
+        return raw_key
+    if raw_key is None:
+        return None
+    key = tuple(raw_key)
+    if any(component is None for component in key):
+        return None
+    return key
 
 
 def _coalesce_keys(keys: List[Any], count: int) -> Tuple[List[Any], List[Optional[int]]]:
@@ -56,16 +106,22 @@ def _coalesce_keys(keys: List[Any], count: int) -> Tuple[List[Any], List[Optiona
 
 
 class PgSelectStep(PgCustomizable):
-    """Batched ``SELECT ... WHERE match_column = ANY($1)`` returning a LIST per entry.
+    """Batched key-matched ``SELECT`` returning a LIST per entry.
 
     One dependency: the per-entry key step (dep 0), e.g. an author id for an
     ``Author.posts`` hasMany. ``execute`` gathers every key in the bucket, runs ONE
-    statement, groups rows by their ``match_column`` value, and scatters each entry's
-    list of matching rows (missing key -> empty list).
+    statement, groups rows by their match key, and scatters each entry's list of matching
+    rows (missing key -> empty list).
+
+    The key match has two skeletons selected by the match-column count: a SINGLE column is
+    the fast path ``match = ANY($1)`` (a ``$1::T[]`` array param); a COMPOSITE key emits
+    ``(c1, c2, ...) IN (:keys)`` over a tuple, the list-of-tuples baked onto the bindparam
+    at build time. The grouping key follows suit: a scalar for single, the column tuple for
+    composite (see :func:`grouping_key`).
 
     Host customization: UNIFORM WHERE predicates AND-combined onto the batched WHERE —
     the resource ``select_customizer`` (resolved once against the per-request context)
-    plus per-plan ``.where()``s via :meth:`builder`. The skeleton (``= ANY($1)`` / window
+    plus per-plan ``.where()``s via :meth:`builder`. The skeleton (key match / window
     partition) stays ours; hosts add only uniform additions.
     """
 
@@ -75,7 +131,7 @@ class PgSelectStep(PgCustomizable):
         self,
         resource: PgResource,
         key_step: Step,
-        match_column: str,
+        match: Union[str, Sequence[str]],
         order_by: Optional[Sequence[Union[str, OrderTerm]]] = None,
         order_is_unique: bool = False,
         first: Optional[int] = None,
@@ -83,7 +139,9 @@ class PgSelectStep(PgCustomizable):
     ) -> None:
         super().__init__()
         self.resource = resource
-        self.match_column = match_column
+        # ``match`` is a single column name (the fast path) OR a tuple of names (a
+        # COMPOSITE key); collapse both to the one column tuple every path reads.
+        self.match_columns: Tuple[str, ...] = as_match_columns(match)
         self.order_is_unique = order_is_unique
         self.order_by: Tuple[OrderTerm, ...] = normalize_order(
             order_by, primary_key=resource.primary_key, order_is_unique=order_is_unique
@@ -104,6 +162,21 @@ class PgSelectStep(PgCustomizable):
         """Whether a per-parent page bound is set (window slice) vs plain select."""
         return self.first is not None or self.offset != 0
 
+    @property
+    def is_composite(self) -> bool:
+        """Whether the match key spans more than one column (the tuple-IN path)."""
+        return len(self.match_columns) > 1
+
+    @property
+    def match_column(self) -> str:
+        """The lone match column (single-column fast path; raises if composite)."""
+        if self.is_composite:
+            raise ValueError(
+                f"select on {self.resource.name!r} is composite "
+                f"({self.match_columns}); use match_columns"
+            )
+        return self.match_columns[0]
+
     def add_order_term(self, term: Union[str, OrderTerm]) -> None:
         """Append a UNIFORM ordering term (re-normalised with the PK tie-break)."""
         existing = [t for t in self.order_by]
@@ -123,13 +196,36 @@ class PgSelectStep(PgCustomizable):
         """Set the structured per-parent page offset."""
         self.offset = offset
 
-    def build_query(self):
-        """Build the batched ``= ANY($1)`` SELECT via SQLAlchemy Core.
+    def match_predicate(self, unique_keys: Optional[List[Any]] = None):
+        """The batched key-match predicate: ``= ANY(:keys)`` (single) or tuple-IN (composite).
+
+        Single column keeps the cheap ``match = ANY(:keys)`` (``$1::T[]`` array, keys bound
+        as a flat list via the execute-time params) — it ignores ``unique_keys``, so the
+        plain skeleton renders without any keys. A COMPOSITE key emits
+        ``(c1, c2, ...) IN (:keys)`` over a ``tuple_`` with ``expanding=True``; the
+        list-of-tuples value is baked onto the bindparam at BUILD time because the
+        RawExecutor ``render_postcompile`` path needs the value present to expand the IN
+        list (a value-less expanding bind cannot postcompile). The SQLAlchemyExecutor path
+        reads the same baked value, so binding it here serves both executors.
+        """
+        if not self.is_composite:
+            match = column(self.match_columns[0])
+            return match == any_(bindparam("keys", expanding=False))
+        cols = [column(c) for c in self.match_columns]
+        return tuple_(*cols).in_(
+            bindparam("keys", value=unique_keys or [], expanding=True)
+        )
+
+    def build_query(self, unique_keys: Optional[List[Any]] = None):
+        """Build the batched key-matched SELECT via SQLAlchemy Core.
 
         With no page bound (``first is None and offset == 0``) this is the plain
         ORDER BY select — no window overhead. With a bound it is the shared per-parent
         window slice (``row_number() OVER (PARTITION BY match)`` then ``__rn`` filtered),
-        so only each parent's page rows come back in the single bucket statement.
+        so only each parent's page rows come back in the single bucket statement. The
+        key-match clause is single (``= ANY``) or composite (tuple-IN) per
+        :meth:`match_predicate`; ``unique_keys`` is consumed only by the composite branch
+        (it bakes the IN list at build time), and ignored by the single fast path.
         """
         if not self.is_limited:
             tbl = table(
@@ -137,11 +233,10 @@ class PgSelectStep(PgCustomizable):
                 *[column(c) for c in self.resource.columns],
                 schema=self.resource.schema,
             )
-            match = column(self.match_column)
             # project the stored columns PLUS each computed attribute's labelled
             # expression (over the table columns) in the SAME select — no extra statement.
             stmt = select(tbl, *self.resource.computed_projections()).where(
-                match == any_(bindparam("keys", expanding=False))
+                self.match_predicate(unique_keys)
             )
             # AND each host predicate onto the batched WHERE alongside the skeleton.
             for predicate in self.where_predicates:
@@ -154,7 +249,8 @@ class PgSelectStep(PgCustomizable):
             schema=self.resource.schema,
             table_name=self.resource.table,
             columns=self.resource.columns,
-            match_column=self.match_column,
+            match_columns=self.match_columns,
+            unique_keys=unique_keys,
             order_by=self.order_by,
             first=self.first,
             offset=self.offset,
@@ -166,16 +262,23 @@ class PgSelectStep(PgCustomizable):
         """Run the batched statement once and return the RAW (undecoded) rows.
 
         Codec decode is applied AFTER grouping (see :meth:`group_and_decode`), not here:
-        a codec on the match column would otherwise change ``row[match_column]`` and the
-        rows would group under the decoded value while the key step supplies the raw one,
+        a codec on the match column would otherwise change the grouping value and the rows
+        would group under the decoded value while the key step supplies the raw one,
         scattering to nobody. Grouping on the raw value first keeps that safe.
+
+        The single-column path binds ``keys`` as the flat array param at execute time; the
+        composite path already baked the list-of-tuples onto the IN bindparam at build
+        time, so it passes no ``keys`` param (a re-bind would clash with the expanded
+        per-element binds).
         """
         request = current_pg_request()
-        params: Dict[str, Any] = {"keys": unique_keys}
+        params: Dict[str, Any] = {}
+        if not self.is_composite:
+            params["keys"] = unique_keys
         if self.is_limited:
             params.update(window_slice_params(self.first, self.offset))
         rows = await request.executor.run(
-            self.build_query(), params, settings=request.settings
+            self.build_query(unique_keys), params, settings=request.settings
         )
         log.debug(
             "pg batch select",
@@ -186,11 +289,11 @@ class PgSelectStep(PgCustomizable):
         return rows
 
     def group_rows(self, rows: List[Dict[str, Any]]) -> Dict[Any, List[Dict[str, Any]]]:
-        """Group rows by their RAW ``match_column`` value (preserving query order)."""
+        """Group rows by their RAW match key — the scalar value or the column tuple."""
         grouped: Dict[Any, List[Dict[str, Any]]] = {}
-        col = self.match_column
+        match_columns = self.match_columns
         for row in rows:
-            grouped.setdefault(row[col], []).append(row)
+            grouped.setdefault(grouping_key(row, match_columns), []).append(row)
         return grouped
 
     def group_and_decode(
@@ -209,17 +312,25 @@ class PgSelectStep(PgCustomizable):
             return grouped
         return {key: self.resource.decode_rows(group) for key, group in grouped.items()}
 
+    def normalized_keys(self, keys: List[Any]) -> List[Any]:
+        """Each entry's lookup/grouping key (scalar or tuple), ``None`` when it matches none."""
+        composite = self.is_composite
+        return [normalize_lookup_key(k, composite) for k in keys]
+
     def scatter(
         self,
         grouped: Dict[Any, List[Dict[str, Any]]],
         keys: List[Any],
         count: int,
     ) -> List[Any]:
-        """Per-entry list of matching rows (missing key -> empty list)."""
+        """Per-entry list of matching rows (missing key -> empty list).
+
+        ``keys`` are the NORMALIZED keys (scalar or tuple), aligned with the grouping key.
+        """
         return [grouped.get(keys[i], []) for i in range(count)]
 
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
-        keys = values[0]
+        keys = self.normalized_keys(values[0])
         unique_keys, _slot = _coalesce_keys(keys, count)
         if not unique_keys:
             return [[] for _ in range(count)]
@@ -237,10 +348,12 @@ class PgSelectStep(PgCustomizable):
         # SQL-relevant ordering difference — folding the raw flag too would only
         # over-discriminate (miss merging byte-identical statements). first/offset
         # change the page slice (and thus the SQL), so they must discriminate too. The
+        # match_columns tuple discriminates single vs composite (and which columns) — it
+        # changes the SQL skeleton (= ANY vs tuple-IN) and the grouping key. The
         # customization signature folds the host WHERE predicates so the cheap pre-filter
         # never merges byte-different statements.
         return (
-            f"pg_select|{self.resource.qualified_table}|{self.match_column}"
+            f"pg_select|{self.resource.qualified_table}|{self.match_columns!r}"
             f"|{self.order_by!r}|{self.first}|{self.offset}"
             f"|{self.customization_signature()!r}"
         )
@@ -248,7 +361,7 @@ class PgSelectStep(PgCustomizable):
     def dedup_params(self) -> Tuple[Any, ...]:
         return (
             self.resource.qualified_table,
-            self.match_column,
+            self.match_columns,
             self.order_by,
             self.first,
             self.offset,
@@ -374,11 +487,12 @@ class PgSelectAllStep(PgCustomizable):
 
 
 class PgSelectSingleStep(PgSelectStep):
-    """Batched ``SELECT ... WHERE match_column = ANY($1)`` returning ONE row per entry.
+    """Batched key-matched ``SELECT`` returning ONE row per entry.
 
-    Same single-statement batching as :class:`PgSelectStep`; each entry's result is
-    its single matching row (or ``None`` for a missing key) rather than a list. Used
-    for hasOne relations (``Post.author``) and ``resource.get(id)``.
+    Same single-statement batching as :class:`PgSelectStep` (the single ``= ANY`` or the
+    composite tuple-IN skeleton); each entry's result is its single matching row (or
+    ``None`` for a missing key) rather than a list. Used for hasOne relations
+    (``Post.author``) and ``resource.get(id)``.
     """
 
     def scatter(
@@ -394,7 +508,7 @@ class PgSelectSingleStep(PgSelectStep):
         return out
 
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
-        keys = values[0]
+        keys = self.normalized_keys(values[0])
         unique_keys, _slot = _coalesce_keys(keys, count)
         if not unique_keys:
             return [None] * count
@@ -408,7 +522,7 @@ class PgSelectSingleStep(PgSelectStep):
     @property
     def peer_key(self) -> str:
         return (
-            f"pg_select_single|{self.resource.qualified_table}|{self.match_column}"
+            f"pg_select_single|{self.resource.qualified_table}|{self.match_columns!r}"
             f"|{self.order_by!r}|{self.customization_signature()!r}"
         )
 
@@ -425,24 +539,28 @@ class PgSelectSingleStep(PgSelectStep):
 def pg_select(
     resource: PgResource,
     key_step: Step,
-    match_column: str,
+    match: Union[str, Sequence[str]],
     order_by: Optional[Sequence[Union[str, OrderTerm]]] = None,
     order_is_unique: bool = False,
     first: Optional[int] = None,
     offset: int = 0,
 ) -> PgSelectStep:
+    """A batched select keyed on ``match`` (a single column name or a composite tuple)."""
     return PgSelectStep(
-        resource, key_step, match_column,
+        resource, key_step, match,
         order_by=order_by, order_is_unique=order_is_unique,
         first=first, offset=offset,
     )
 
 
 def pg_select_single(
-    resource: PgResource, key_step: Step, match_column: Optional[str] = None
+    resource: PgResource,
+    key_step: Step,
+    match: Optional[Union[str, Sequence[str]]] = None,
 ) -> PgSelectSingleStep:
+    """A batched single-row select keyed on ``match`` (defaults to the primary key)."""
     return PgSelectSingleStep(
-        resource, key_step, match_column or resource.primary_key
+        resource, key_step, match if match is not None else resource.primary_key
     )
 
 
