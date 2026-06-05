@@ -38,6 +38,7 @@ async def fresh_engine():
     await dispose_engine()
 
 
+@pytest.mark.inline_off
 @pytest.mark.asyncio
 async def test_pg_sql_count_is_o_depth_constant_in_n(fresh_engine):
     """Batched pg nested query == 3 SQL statements for every N (O(depth))."""

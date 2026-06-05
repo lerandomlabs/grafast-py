@@ -103,6 +103,7 @@ async def test_pg_select_single_missing_key_is_null():
 # ----------------------------------------------------------- end-to-end O(depth)
 
 
+@pytest.mark.inline_off
 @pytest.mark.asyncio
 async def test_nested_query_is_o_depth_not_o_rows(demo_schema):
     """A 3-level nested query issues one batched statement per resource-layer.
@@ -141,6 +142,7 @@ async def test_nested_query_is_o_depth_not_o_rows(demo_schema):
     assert first_post["comments"][0]["author"]["name"]  # resolved, non-empty
 
 
+@pytest.mark.inline_off
 @pytest.mark.asyncio
 async def test_deep_query_statement_count_independent_of_rows(demo_schema):
     """Adding more rows-per-layer does not add statements: count stays at depth."""
@@ -157,6 +159,7 @@ async def test_deep_query_statement_count_independent_of_rows(demo_schema):
     assert counter_deep.count == 3  # authors + posts + comments
 
 
+@pytest.mark.inline_off
 @pytest.mark.asyncio
 async def test_hasone_relation_resolves_single_parent(demo_schema):
     """Post.author (hasOne) returns the single owning author row."""

@@ -222,6 +222,7 @@ async def test_insert_not_null_no_default_omitted_fails_loud():
     await dispose_engine()
 
 
+@pytest.mark.inline_off
 @pytest.mark.asyncio
 async def test_read_path_untouched_by_mutations(demo_schema):
     """The batched read path stays O(depth) after the mutation work — a sanity gate.
