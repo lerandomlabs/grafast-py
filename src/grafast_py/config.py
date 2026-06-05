@@ -103,6 +103,24 @@ class GrafastConfig:
         Bound DB concurrency with the pool; this knob bounds in-engine fan-out.
         ``None`` = unbounded.
 
+    Optimization knobs (off by default)
+    -----------------------------------
+    inline_relations
+        Opportunistic LATERAL inlining of hasOne / unpaginated-hasMany relations: when
+        ON, a parent pg select absorbs a safe-to-fold child relation into its own
+        statement via a ``LEFT JOIN LATERAL`` whose nested ``json_agg`` rows the child
+        bucket reads off the parent row — fewer SQL statements, byte-identical data. It
+        is a pure optimization: the result is provably equivalent to the batched
+        ``= ANY($1)`` path (the correctness baseline), gated by a strict safety predicate
+        that SKIPS (falls back to the batched child) whenever equivalence is not
+        provable. ``False`` (default) ships it dark — the optimize pass is a no-op and
+        every pg step's ``optimize`` short-circuits to identity, so the executed result
+        is byte-identical to a build without this flag. A host opts in globally here; a
+        single suspect table opts back out via ``PgResource(opt_out_inline=True)``. This
+        is a PLAN-LEVEL constant (one operation = one decision): like ``shared_txn`` it
+        MUST NOT enter a non-inlined step's peer_key / dedup_params (it never changes
+        the SQL text such a step emits). ``False`` = no inlining.
+
     Tracing hooks (no-ops by default)
     ---------------------------------
     Each hook is called with the noted arguments and may return an object usable as
@@ -120,6 +138,8 @@ class GrafastConfig:
 
     execution_timeout_s: Optional[float] = None
     max_step_concurrency: Optional[int] = None
+
+    inline_relations: bool = False
 
     on_operation: Callable[..., Optional[Any]] = field(default=_noop_span)
     on_plan: Callable[..., Optional[Any]] = field(default=_noop_span)

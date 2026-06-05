@@ -203,6 +203,10 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     from .core_steps import RootStep
 
     plan = Plan()
+    # thread the plan-level inlining decision off the context's config so each pg
+    # step's `optimize(self, plan)` reads one constant (`plan.inline_relations`)
+    # instead of the whole context. Default-OFF config => no-op optimize pass.
+    plan.inline_relations = type(context).grafast_config.inline_relations
     root_step = RootStep()
     plan.add_step(root_step)
 

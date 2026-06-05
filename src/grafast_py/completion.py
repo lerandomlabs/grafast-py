@@ -798,6 +798,11 @@ def abstract_child_plan(context, completer, object_type):
     sub_fields = context.collect_subfields(object_type, completer.field_nodes)
 
     plan = Plan()
+    # mirror `plan_operation`: an abstract concrete-type subtree is its own finalize
+    # path (own RootStep + DAG), so it must carry the same plan-level inlining
+    # decision off the context's config, else a relation under a polymorphic field
+    # would never be considered for folding even with inlining enabled.
+    plan.inline_relations = type(context).grafast_config.inline_relations
     root_step = RootStep()
     plan.add_step(root_step)
     child_plan = plan_object(

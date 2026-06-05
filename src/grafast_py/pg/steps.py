@@ -21,18 +21,90 @@ Rows come back as plain dicts keyed by column name so the existing ``AccessStep`
 projects leaf columns with no special-casing.
 """
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
-from sqlalchemy import any_, bindparam, column, select, table, tuple_
+from sqlalchemy import any_, bindparam, column, select, table, true, tuple_
 
 from ..config import log
+
+if TYPE_CHECKING:
+    from ..dag import Plan
 from ..core_steps import access
 from ..step_model import Step
-from .customize import PgCustomizable
+from .customize import PgCustomizable, predicate_key
 from .executor import current_pg_request
+from .inline import (
+    InlineSpec,
+    build_lateral,
+    find_inline_candidates,
+    fold_inline_candidates,
+)
 from .ordering import OrderTerm, normalize_order, order_clauses
 from .pagination import window_slice, window_slice_params
 from .resource import PgResource
+
+
+def inline_specs_signature(inline_specs: Sequence[InlineSpec]) -> Tuple[Any, ...]:
+    """A content-based dedup key for a parent's inlined child folds (ORDER-significant).
+
+    Each :class:`InlineSpec` adds a LATERAL whose SQL text depends on the child resource,
+    kind, FK columns, ordering AND the child's reproduced ``where_predicates`` / ``computed``
+    projections. The frozen spec is hashable on its structural fields, but its
+    ``where_predicates`` / ``computed`` ride ``compare=False`` (Core ``ColumnElement``s have
+    no stable hash), so this folds their content keys explicitly — the SAME
+    value-discriminated :func:`grafast_py.pg.customize.predicate_key` the standalone child
+    uses, so an inlined filter discriminates exactly as a batched one would. The spec ORDER
+    matters: ``apply_laterals`` joins them left-to-right, so a different fold order is a
+    different statement.
+    """
+    return tuple(
+        (
+            spec.resource.qualified_table,
+            spec.kind,
+            spec.nested_alias,
+            spec.local_columns,
+            spec.remote_columns,
+            spec.order_by,
+            tuple(predicate_key(p) for p in spec.where_predicates),
+            tuple(predicate_key(c) for c in spec.computed),
+        )
+        for spec in inline_specs
+    )
+
+
+def apply_laterals(stmt: Any, parent_table: Any, inline_specs: Sequence[InlineSpec]):
+    """LEFT JOIN LATERAL each inlined child onto ``stmt`` over ``parent_table``.
+
+    Shared by every parent step's ``build_query``: for each :class:`InlineSpec` it builds
+    the correlated ``json_agg`` / ``to_jsonb`` LATERAL (:func:`build_lateral`), outer-joins
+    it ``ON true`` so a parent with no children survives as a NULL nested column (decoded to
+    ``[]`` / ``None`` by the :class:`NestedExtractStep`), and projects the nested column onto
+    the result row under ``spec.nested_alias``. With no specs the statement is returned
+    untouched — the byte-identical no-op the empty-spec parent keeps. The parent table stays
+    in the FROM and is correlated OUT inside each LATERAL, so the folds compose left-to-right
+    into ONE statement.
+    """
+    # no specs -> return the statement UNTOUCHED (no add_columns/select_from), so the
+    # default-built parent emits byte-identical SQL to the pre-Wave-3b batched path.
+    if not inline_specs:
+        return stmt
+    from_obj = parent_table
+    nested_columns = []
+    for spec in inline_specs:
+        lateral = build_lateral(spec, parent_table)
+        from_obj = from_obj.outerjoin(lateral, true())
+        nested_columns.append(lateral.c[spec.nested_alias])
+    return stmt.add_columns(*nested_columns).select_from(from_obj)
 
 
 def as_match_columns(match: Union[str, Sequence[str]]) -> Tuple[str, ...]:
@@ -136,6 +208,7 @@ class PgSelectStep(PgCustomizable):
         order_is_unique: bool = False,
         first: Optional[int] = None,
         offset: int = 0,
+        inline_specs: Sequence[InlineSpec] = (),
     ) -> None:
         super().__init__()
         self.resource = resource
@@ -151,6 +224,12 @@ class PgSelectStep(PgCustomizable):
         # bucket-wide LIMIT, which would limit the whole ANY($1) result across parents).
         self.first = first
         self.offset = offset
+        # the inlined child relations this parent absorbed into its own statement (Wave
+        # 3b): empty until the optimize pass attaches a fold, so the default-built step is
+        # byte-identical to the batched path. When present, build_query LEFT JOINs one
+        # LATERAL per spec (see apply_laterals); they fold into the dedup key (two parents
+        # inlining different children must never merge).
+        self.inline_specs: Tuple[InlineSpec, ...] = tuple(inline_specs)
         # dep 0 is the key step; values[0] is the key column at execute time.
         self.add_dependency(key_step)
         # seed the WHERE list with the resource's select-customizer predicates (resolved
@@ -243,8 +322,17 @@ class PgSelectStep(PgCustomizable):
                 stmt = stmt.where(predicate)
             if self.order_by:
                 stmt = stmt.order_by(*order_clauses(self.order_by))
-            return stmt
+            # fold any inlined child relations into this ONE statement via a LEFT JOIN
+            # LATERAL each (no-op when empty — the byte-identical batched path).
+            return apply_laterals(stmt, tbl, self.inline_specs)
 
+        # the window-sliced path is the per-parent LIMIT skeleton; the inlining safety
+        # predicate never folds a child into a window-sliced parent (the LATERAL would have
+        # to attach to the post-slice outer query), so specs here are a wiring bug.
+        assert not self.inline_specs, (
+            "inline_specs on a window-sliced (limited) pg select is unsupported; the "
+            "safety predicate must not fold a child into a paginated parent"
+        )
         return window_slice(
             schema=self.resource.schema,
             table_name=self.resource.table,
@@ -352,11 +440,84 @@ class PgSelectStep(PgCustomizable):
         # changes the SQL skeleton (= ANY vs tuple-IN) and the grouping key. The
         # customization signature folds the host WHERE predicates so the cheap pre-filter
         # never merges byte-different statements.
+        # the inline_specs genuinely change the SQL text (each adds a LATERAL), so they
+        # must discriminate: two parents that inlined different children/orders/filters
+        # emit byte-different statements and must NOT dedup-merge. inline_signature folds
+        # the structural spec fields PLUS the per-spec customization keys (a frozen spec is
+        # hashable on its dedup-relevant fields, but its where_predicates/computed ride
+        # compare=False, so their content keys are folded explicitly here).
         return (
             f"pg_select|{self.resource.qualified_table}|{self.match_columns!r}"
             f"|{self.order_by!r}|{self.first}|{self.offset}"
-            f"|{self.customization_signature()!r}"
+            f"|{self.customization_signature()!r}|{self.inline_signature()!r}"
         )
+
+    def inline_signature(self) -> Tuple[Any, ...]:
+        return inline_specs_signature(self.inline_specs)
+
+    def inline_candidates(
+        self, plan: "Plan"
+    ) -> List[Tuple[Step, InlineSpec]]:
+        """The child relations PROVABLY safe to fold into this select (the safety predicate).
+
+        Delegates to :func:`grafast_py.pg.inline.find_inline_candidates` — the pure
+        equivalence-preserving predicate that returns ``[(child_step, InlineSpec), ...]`` for
+        each child relation step that passes EVERY safety condition (FK-correlatable,
+        unpaginated, faithfully ordered, unfiltered, json-stable codecs, not a mutation /
+        connection), reading ``plan.inline_relations`` and returning ``[]`` when inlining is
+        off. The parent's ``optimize`` (a later Wave 3b step) consumes this to build the
+        replacement parent + rewrite each folded child into a ``NestedExtractStep``; this
+        method only DECIDES, conservatively. A window-sliced (limited) parent cannot host a
+        LATERAL, so it never absorbs a child — return no candidates rather than emit a fold
+        that ``build_query`` would assert against.
+        """
+        if self.is_limited:
+            return []
+        return find_inline_candidates(self, plan)
+
+    def clone_with_inline_specs(
+        self, inline_specs: Sequence[InlineSpec]
+    ) -> "PgSelectStep":
+        """A replacement carrying THIS step's skeleton PLUS ``inline_specs``.
+
+        The same class, same key step (dep 0), same match columns / order / paging and the
+        SAME host ``where_predicates`` — only the inlined child folds are added, so the
+        replacement's ``build_query`` grows one LATERAL per spec while the batched skeleton
+        is byte-identical. ``where_predicates`` is copied verbatim rather than re-resolving
+        the resource customizer (which the constructor seeds), so the replacement's
+        customization is identical to this step's, predicate-for-predicate.
+        """
+        clone = type(self)(
+            self.resource,
+            self.dependencies[0],
+            self.match_columns,
+            order_by=self.order_by,
+            order_is_unique=self.order_is_unique,
+            first=self.first,
+            offset=self.offset,
+            inline_specs=inline_specs,
+        )
+        # the constructor re-seeds the resource customizer; replace it with THIS step's
+        # already-resolved predicates so the fold reproduces the parent's WHERE verbatim.
+        clone.where_predicates = list(self.where_predicates)
+        clone._signature_cache = None
+        return clone
+
+    def optimize(self, plan: "Plan") -> Step:
+        """Absorb every safe-to-fold child relation into this select's ONE statement.
+
+        Direction is DOWNWARD: the parent (which owns the SQL that must grow a LATERAL)
+        pulls its children in. The safety predicate (:meth:`inline_candidates`) returns the
+        children PROVABLY equivalent to fold; with none (inlining off, or every child
+        skipped) this returns ``self`` — the Wave 3a no-op invariant, byte-identical to the
+        batched path. Otherwise it builds the replacement parent + rewrites each folded
+        child into a :class:`NestedExtractStep` (see :func:`fold_inline_candidates`) and
+        returns the replacement, which the optimize pass wires in.
+        """
+        candidates = self.inline_candidates(plan)
+        if not candidates:
+            return self
+        return fold_inline_candidates(self, candidates, plan)
 
     def dedup_params(self) -> Tuple[Any, ...]:
         return (
@@ -366,6 +527,7 @@ class PgSelectStep(PgCustomizable):
             self.first,
             self.offset,
             self.customization_signature(),
+            self.inline_signature(),
         )
 
 
@@ -394,6 +556,7 @@ class PgSelectAllStep(PgCustomizable):
         order_is_unique: bool = False,
         first: Optional[int] = None,
         offset: int = 0,
+        inline_specs: Sequence[InlineSpec] = (),
     ) -> None:
         super().__init__()
         self.resource = resource
@@ -405,6 +568,10 @@ class PgSelectAllStep(PgCustomizable):
         # page bounds for the single root result (plain LIMIT/OFFSET; see class doc).
         self.first = first
         self.offset = offset
+        # the inlined child relations this root collection absorbed (Wave 3b): empty until
+        # the optimize pass folds one. A root list has ONE bucket entry, so a LATERAL per
+        # spec folds the child rows into the same single statement (see build_query).
+        self.inline_specs: Tuple[InlineSpec, ...] = tuple(inline_specs)
         self.seed_resource_customization(resource)
 
     def for_parent(self, parent_step: Step) -> "PgSelectAllStep":
@@ -453,7 +620,10 @@ class PgSelectAllStep(PgCustomizable):
             stmt = stmt.offset(self.offset)
         if self.first is not None:
             stmt = stmt.limit(self.first)
-        return stmt
+        # fold any inlined child relations into this single root statement via a LEFT JOIN
+        # LATERAL each (no-op when empty — the byte-identical batched path). The plain
+        # LIMIT/OFFSET bounds the parent rows; each LATERAL fetches that row's children.
+        return apply_laterals(stmt, tbl, self.inline_specs)
 
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
         async def run():
@@ -470,11 +640,67 @@ class PgSelectAllStep(PgCustomizable):
 
     @property
     def peer_key(self) -> str:
+        # inline_specs add a LATERAL each (byte-different SQL), so they discriminate the
+        # dedup key exactly like the customization signature does for host predicates.
         return (
             f"pg_select_all|{self.resource.qualified_table}"
             f"|{self.order_by!r}|{self.first}|{self.offset}"
-            f"|{self.customization_signature()!r}"
+            f"|{self.customization_signature()!r}|{self.inline_signature()!r}"
         )
+
+    def inline_signature(self) -> Tuple[Any, ...]:
+        return inline_specs_signature(self.inline_specs)
+
+    def inline_candidates(
+        self, plan: "Plan"
+    ) -> List[Tuple[Step, InlineSpec]]:
+        """The child relations PROVABLY safe to fold into this root collection.
+
+        The root-collection counterpart of :meth:`PgSelectStep.inline_candidates`: a
+        ``Query.authors`` root absorbs e.g. ``Author.posts`` into its single statement via a
+        LATERAL. Delegates to the same pure :func:`grafast_py.pg.inline.find_inline_candidates`
+        predicate (``[]`` when inlining is off). A root list pages with a plain LIMIT/OFFSET
+        over ONE bucket entry, so unlike a per-parent window slice it CAN host a LATERAL even
+        when ``first``/``offset`` is set — each LATERAL fetches that row's children — so this
+        does not short-circuit on ``first``/``offset``.
+        """
+        return find_inline_candidates(self, plan)
+
+    def clone_with_inline_specs(
+        self, inline_specs: Sequence[InlineSpec]
+    ) -> "PgSelectAllStep":
+        """A replacement root collection carrying this step's skeleton PLUS ``inline_specs``.
+
+        The root counterpart of :meth:`PgSelectStep.clone_with_inline_specs`: same class,
+        same order / paging, same host ``where_predicates`` and the SAME bucket-sizing parent
+        (re-wired via :meth:`for_parent` from dep 0) — only the inlined child folds are added.
+        A root list pages with a plain LIMIT/OFFSET over its ONE bucket entry, so the folds
+        ride that single statement.
+        """
+        clone = type(self)(
+            self.resource,
+            order_by=self.order_by,
+            order_is_unique=self.order_is_unique,
+            first=self.first,
+            offset=self.offset,
+            inline_specs=inline_specs,
+        ).for_parent(self.dependencies[0])
+        clone.where_predicates = list(self.where_predicates)
+        clone._signature_cache = None
+        return clone
+
+    def optimize(self, plan: "Plan") -> Step:
+        """Absorb every safe-to-fold child relation into this root collection's statement.
+
+        The root-collection counterpart of :meth:`PgSelectStep.optimize`: the parent owns
+        the SQL that grows a LATERAL, so it pulls its safe children in. No candidates
+        (inlining off, or every child skipped) -> ``self`` (the no-op invariant). Otherwise
+        build the replacement + rewrite each folded child into a :class:`NestedExtractStep`.
+        """
+        candidates = self.inline_candidates(plan)
+        if not candidates:
+            return self
+        return fold_inline_candidates(self, candidates, plan)
 
     def dedup_params(self) -> Tuple[Any, ...]:
         return (
@@ -483,6 +709,7 @@ class PgSelectAllStep(PgCustomizable):
             self.first,
             self.offset,
             self.customization_signature(),
+            self.inline_signature(),
         )
 
 
@@ -521,9 +748,12 @@ class PgSelectSingleStep(PgSelectStep):
 
     @property
     def peer_key(self) -> str:
+        # like PgSelectStep, the inline_specs change the SQL text (each adds a LATERAL), so
+        # they discriminate the dedup key; two singles inlining different hasOnes never merge.
         return (
             f"pg_select_single|{self.resource.qualified_table}|{self.match_columns!r}"
             f"|{self.order_by!r}|{self.customization_signature()!r}"
+            f"|{self.inline_signature()!r}"
         )
 
     def get(self, attr: Any) -> Step:

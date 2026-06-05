@@ -28,6 +28,41 @@ class Plan:
     def __init__(self) -> None:
         self.steps: List[Step] = []
         self._seen: set[int] = set()
+        # plan-level inlining decision (one operation = one decision): the
+        # `GrafastConfig.inline_relations` flag, stashed here by `plan_operation` /
+        # `abstract_child_plan` so a pg step's `optimize(self, plan)` can read it
+        # without plumbing the whole execution context. Default `False` so a `Plan`
+        # built without a config (e.g. unit tests) never inlines — the Wave 3a no-op
+        # invariant holds: every step's `optimize` short-circuits to identity.
+        self.inline_relations: bool = False
+        # SIDE replacements an `optimize` hook records beyond the one step it returns.
+        # A `Step.optimize` rewrites only ITSELF (its return value), but a DEPENDENT-
+        # absorbing optimizer (the LATERAL inliner) must ALSO rewrite the children it
+        # folded — each absorbed child relation step becomes a `NestedExtractStep` reading
+        # the parent's nested column. The hook pushes `(old_child, replacement)` here via
+        # `record_replacement`; `optimize` drains the buffer into its `replaced` map after
+        # each hook runs, so the SAME survivor-chain rewire repoints every reference to the
+        # folded child (the child bucket's parent_step + the AccessSteps reading its rows).
+        # Empty for the default identity optimize, so it is a no-op there.
+        self._optimize_side_replacements: List[tuple[Step, Step]] = []
+        # ids of steps already REPLACED AWAY during the running optimize pass. A replaced
+        # step is structurally still in `self.steps` (it is trimmed only at tree_shake),
+        # but it is DEAD — no live consumer reads it — so `dependents_of` must not surface
+        # it to a dependent-absorbing optimizer, else the inliner would re-fold an already-
+        # folded child forever (a fixpoint that never settles). Populated by `optimize`,
+        # empty otherwise (so `dependents_of` is unfiltered for any non-optimize caller).
+        self._replaced_away: set[int] = set()
+
+    def record_replacement(self, old: Step, new: Step) -> None:
+        """Record a SIDE replacement (`old` -> `new`) for the running optimize pass.
+
+        Used by a dependent-absorbing `optimize` hook to rewrite steps OTHER than the one
+        it returns: the LATERAL inliner's parent `optimize` returns its replacement parent
+        but ALSO folds child relation steps, recording each `child -> NestedExtractStep`
+        here so `optimize` rewires every reference to the folded child to the extract step.
+        `new` must already be registered (`add_step`) so it carries an id before the rewire.
+        """
+        self._optimize_side_replacements.append((old, new))
 
     def add_step(self, step: Step) -> Step:
         """Register ``step`` and its transitive dependencies; assign ids; return it."""
@@ -57,6 +92,11 @@ class Plan:
         recorded and every reference to the old step is rewired to the replacement via the
         SAME survivor-chain machinery `deduplicate` uses (`_rewire_dependencies`/`_resolve`).
 
+        A hook may ALSO record SIDE replacements via `record_replacement` (the LATERAL
+        inliner folds child relation steps into the parent it returns, rewriting each
+        `child -> NestedExtractStep`); those are drained into `replaced` right after the
+        hook runs, so the same rewire repoints every reference to a folded child.
+
         With the shipped default identity `Step.optimize`, the loop runs exactly once, no
         replacement is recorded, no rewire fires, and the returned remap is empty — a
         provable no-op over the finalized plan.
@@ -69,26 +109,47 @@ class Plan:
                 if replaced.get(step.id, step) is not step:
                     continue  # already replaced away
                 new = step.optimize(self)
+                # drain SIDE replacements the hook recorded (the inliner's folded
+                # children) BEFORE handling its return value, so a parent that returns a
+                # replacement AND folds children rewires both in one pass.
+                if self._optimize_side_replacements:
+                    for old_child, replacement in self._optimize_side_replacements:
+                        replaced[old_child.id] = replacement
+                        self._replaced_away.add(old_child.id)
+                    self._optimize_side_replacements = []
+                    changed = True
                 if new is step:
                     continue
                 replaced[step.id] = new
+                self._replaced_away.add(step.id)
                 if new.id < 0:  # a freshly built replacement not yet registered
                     self.add_step(new)
                 changed = True
             if changed:
                 _rewire_dependencies(self.steps, _as_survivors(self.steps, replaced))
+        self._replaced_away = set()
         return _collapse_chain(self.steps, replaced)
 
     def dependents_of(self, step: Step) -> List[Step]:
-        """Return every registered step that lists `step` among its dependencies.
+        """Return every LIVE registered step that lists `step` among its dependencies.
 
-        The read accessor the future inlining optimizer uses inside its `optimize`
-        hook to find (and absorb) the steps consuming its output. Computed by
-        inverting `step.dependencies` over `self.steps` on demand — no eager
-        reverse-edge map is maintained, since a pure-substrate wave has no consumer
-        of one beyond this lookup.
+        The read accessor the inlining optimizer uses inside its `optimize` hook to find
+        (and absorb) the steps consuming its output. Computed by inverting
+        `step.dependencies` over `self.steps` on demand — no eager reverse-edge map is
+        maintained, since nothing else consumes one.
+
+        Steps already REPLACED AWAY during the running optimize pass (`_replaced_away`) are
+        excluded: such a step is dead (no live consumer reads it) but still structurally in
+        `self.steps` until tree_shake. Surfacing it would let a dependent-absorbing optimizer
+        re-fold an already-folded child forever. Outside an optimize pass `_replaced_away` is
+        empty, so the result is the full structural inversion.
         """
-        return [s for s in self.steps if any(dep is step for dep in s.dependencies)]
+        return [
+            s
+            for s in self.steps
+            if s.id not in self._replaced_away
+            and any(dep is step for dep in s.dependencies)
+        ]
 
     def tree_shake(self, consumption_roots: List[Step]) -> List[Step]:
         """Drop steps unreachable from `consumption_roots` AND not side-effecting.

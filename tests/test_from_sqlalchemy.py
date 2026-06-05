@@ -13,11 +13,15 @@ Two layers:
   in ``tests/test_pg_datasource.py``.
 """
 
+import datetime
+import decimal
+
 import pytest
 import pytest_asyncio
 from graphql import graphql
 from sqlalchemy import ForeignKey, Integer, Table, Column, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import DateTime, Numeric
 
 from grafast_py.context import GrafastExecutionContext
 from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
@@ -95,6 +99,18 @@ class Profile(EdgeBase):
         Integer, ForeignKey("user_acct.id"), nullable=False
     )
     user: Mapped["User"] = relationship("User", back_populates="profile")
+
+
+class Invoice(EdgeBase):
+    """A model with NON-native columns (numeric + timestamptz) — the inline-safety case."""
+
+    __tablename__ = "invoice"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    total: Mapped[decimal.Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    issued_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 # ------------------------------------------------------------------- NO-DB tests
@@ -182,6 +198,46 @@ def test_out_of_batch_relation_target_skipped_and_strict_raises():
         resources_from_models([Post], strict=True)
 
 
+def test_bridge_records_column_types_and_inline_safety():
+    """The bridge records each column's SQL type, gating inline-fold safety per column.
+
+    A model's NATIVE columns (int / text) stay json-stable (foldable), while its NON-native
+    columns (numeric / timestamptz — whose JSON form loses precision / tz-shifts) are recorded
+    in ``column_types`` and make the resource NOT inline-json-safe (the fold SKIPS). Without
+    the bridge carrying ``col.type``, every model with such a column would be silently treated
+    as bare-native and corrupt data on a fold — the blocker-1 real-world vector.
+    """
+    from grafast_py.pg.resource import is_json_stable_native_type
+
+    registry = resources_from_models([Invoice])
+    invoice = registry["invoice"]
+
+    # native columns carry their type and remain provably json-stable.
+    assert is_json_stable_native_type(invoice.attributes["id"].sql_type)
+    assert invoice.attribute_inline_json_safe("id") is True
+    # the non-native columns are recorded for the keyset CAST AND gate the fold off.
+    assert set(invoice.column_types) == {"total", "issued_at"}
+    assert invoice.attribute_inline_json_safe("total") is False
+    assert invoice.attribute_inline_json_safe("issued_at") is False
+    # so the resource as a whole is not foldable — the fold SKIPS, staying byte-identical.
+    assert invoice.is_inline_json_safe is False
+
+
+def test_columns_override_carries_no_types():
+    """An explicit ``columns=`` name-list override stays untyped (the host's plain list).
+
+    The override is the host taking control of the column set; the bridge does not introspect
+    types for it, so those columns are UNKNOWN-typed and (per the fail-safe predicate) not
+    foldable until the host declares types/codecs. The derived path (no override) is what
+    records types.
+    """
+    resource = resource_from_model(Invoice, columns=["id", "total"])
+    assert resource.columns == ["id", "total"]
+    assert resource.column_types == {}
+    assert resource.attributes["id"].sql_type is None
+    assert resource.is_inline_json_safe is False  # untyped override -> fail safe
+
+
 # ------------------------------------------------------------- DB end-to-end parity
 # (the DB tests below carry their own @pytest.mark.pg; the module mixes no-DB and DB
 # tests, so there is deliberately no module-level `pytestmark`.)
@@ -218,6 +274,7 @@ async def model_demo_schema():
     await dispose_engine()
 
 
+@pytest.mark.inline_off
 @pytest.mark.pg
 @pytest.mark.asyncio
 async def test_model_derived_schema_nested_query_matches_o_depth(model_demo_schema):

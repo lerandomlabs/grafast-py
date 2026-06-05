@@ -34,7 +34,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from sqlalchemy.sql import ColumnElement
-from sqlalchemy.types import TypeEngine
+from sqlalchemy.types import (
+    JSON,
+    Boolean,
+    Integer,
+    String,
+    TypeEngine,
+)
 
 from ..core_steps import access, list_step
 from ..step_model import Step
@@ -44,6 +50,32 @@ from .ordering import OrderTerm
 # batched select for the resource (the selectAuth analogue for soft-delete / tenant
 # scoping / visibility). Resolved once per planned step against the per-request context.
 SelectCustomizer = Callable[[Any], Sequence[Any]]
+
+# The PROVABLY-json-stable SQL type classes for the inlining fold (Wave 3b condition 8). A
+# folded column's value travels to_jsonb -> JSON -> Python BEFORE any decode, so it may only
+# fold when that round-trip yields the SAME raw value the batched asyncpg row-decode sees.
+# Only these survive identically: integers (int2/4/8 — JSON renders an exact int), boolean
+# (true/false), the string family (text/varchar/char — verbatim), and json/jsonb (its JSON
+# form IS its Python form). DELIBERATELY EXCLUDED, because their JSON form differs from the
+# asyncpg native value: Numeric (12.5000 -> lossy 12.5), Float, DateTime/Date/Time/Interval
+# (tz-shifted / ISO-string), LargeBinary/bytea (\xdeadbeef string vs bytes), ARRAY, ranges,
+# enums, composites. Integer/String/Boolean/JSON are the SQLAlchemy GENERIC bases, so the
+# postgresql dialect variants (e.g. JSONB subclasses JSON, BIGINT/SMALLINT subclass Integer,
+# VARCHAR/TEXT subclass String) match via isinstance.
+JSON_STABLE_NATIVE_TYPES: Tuple[type, ...] = (Integer, Boolean, String, JSON)
+
+
+def is_json_stable_native_type(sql_type: TypeEngine) -> bool:
+    """Whether ``sql_type`` is a SQL type whose JSON round-trip is provably loss-free.
+
+    Used by the inlining safety predicate to decide whether a KNOWN-typed column with no
+    codec may fold: a type in :data:`JSON_STABLE_NATIVE_TYPES` (int / bool / string / json)
+    round-trips ``to_jsonb`` -> JSON -> Python to the identical value the batched asyncpg
+    row-decode would yield; any other type (numeric / timestamptz / bytea / array / range /
+    enum / composite) does NOT, so it must NOT fold (fail safe). The postgresql dialect type
+    variants subclass these generic bases, so ``isinstance`` catches BIGINT/VARCHAR/JSONB/...
+    """
+    return isinstance(sql_type, JSON_STABLE_NATIVE_TYPES)
 
 
 @dataclass(frozen=True)
@@ -63,30 +95,62 @@ class PgCodec:
     non-native type (numeric/timestamptz/array/range) needs it. ``sql_type`` is compared by
     identity off the dedup path: a codec rides the post-grouping decode, so it never enters a
     step's peer_key / dedup_params (decode is dedup-neutral).
+
+    ``json_stable`` gates whether a column carrying this codec may be folded into a parent's
+    LATERAL by the inlining safety predicate (Wave 3b). A folded column's value travels
+    through ``to_jsonb`` -> JSON -> Python BEFORE ``to_py`` runs, so the codec is only safe to
+    inline when that json round-trip yields the SAME raw value ``to_py`` would have seen on the
+    batched (asyncpg row-decode) path. ``None`` (the default) DERIVES the answer from
+    ``sql_type``: a native-typed column (``sql_type is None`` — text / int / bool) round-trips
+    its JSON form to the identical Python value, so ANY ``to_py`` over it is json-stable; a
+    NON-native column (``sql_type`` set — timestamptz / numeric / array / range, whose JSON
+    form is a string / nested structure that decodes differently) is NOT. A host that has
+    PROVEN a non-native codec json-stable (or wants to force a native one unsafe) overrides
+    with an explicit ``True`` / ``False``. Off the dedup path — purely a fold-safety concern.
     """
 
     to_py: Optional[Callable[[Any], Any]] = None
     to_pg: Optional[Callable[[Any], Any]] = None
     sql_type: Optional[TypeEngine] = field(default=None, compare=False)
+    json_stable: Optional[bool] = field(default=None, compare=False)
+
+    @property
+    def is_json_stable(self) -> bool:
+        """Whether a column with this codec survives the LATERAL json round-trip identically.
+
+        An explicit ``json_stable`` wins (a host's proven override); otherwise it derives
+        from ``sql_type`` — a native-typed column (``sql_type is None``) is json-stable, a
+        non-native one (timestamptz / numeric / array / range, with a ``sql_type`` set) is
+        not. See the class docstring.
+        """
+        if self.json_stable is not None:
+            return self.json_stable
+        return self.sql_type is None
 
 
 @dataclass(frozen=True)
 class PgColumn:
-    """One resource ATTRIBUTE descriptor: a column name plus optional codec/expression.
+    """One resource ATTRIBUTE descriptor: a column name plus optional codec/type/expression.
 
     ``name`` is the attribute name (a stored column's name, or the label of a computed
     column). ``codec`` is the optional per-attribute :class:`PgCodec` (its ``to_py`` is
-    applied on read). ``not_null`` / ``has_default`` are metadata flags (populated e.g.
-    from an ORM model) used by mutations later; they do not affect reads. ``expression``,
-    when set, marks the attribute COMPUTED: a host-authored Core SQL expression (over the
-    table columns) projected as ``expression.label(name)`` — so a computed attribute is
-    NOT a stored table column and is excluded from :attr:`PgResource.columns`.
+    applied on read). ``sql_type`` is the column's SQL type when KNOWN (e.g. recorded by the
+    ORM bridge from ``col.type``): it lets the inlining safety predicate prove whether the
+    column is json-stable native — without it a codec-less column is UNKNOWN-typed and the
+    predicate cannot prove it foldable (fails safe). A NON-native ``sql_type`` also feeds the
+    resource ``column_types`` keyset CAST, exactly like a codec's ``sql_type``. ``not_null`` /
+    ``has_default`` are metadata flags (populated e.g. from an ORM model) used by mutations
+    later; they do not affect reads. ``expression``, when set, marks the attribute COMPUTED:
+    a host-authored Core SQL expression (over the table columns) projected as
+    ``expression.label(name)`` — so a computed attribute is NOT a stored table column and is
+    excluded from :attr:`PgResource.columns`.
     """
 
     name: str
     codec: Optional[PgCodec] = None
     not_null: bool = False
     has_default: bool = False
+    sql_type: Optional[TypeEngine] = field(default=None, compare=False)
     expression: Optional[ColumnElement] = field(default=None, compare=False)
 
     @property
@@ -242,10 +306,18 @@ class PgResource:
         registry: Optional["PgRegistry"] = None,
         select_customizer: Optional[SelectCustomizer] = None,
         column_types: Optional[Mapping[str, TypeEngine]] = None,
+        opt_out_inline: bool = False,
     ) -> None:
         self.name = name
         self.schema = schema
         self.table = table
+        # Per-resource escape hatch for LATERAL relation inlining
+        # (``GrafastConfig.inline_relations``): when True this table is never folded
+        # as a parent NOR inlined as a child, so a host can keep inlining on globally
+        # while disabling it for one table whose codecs or LATERAL semantics are
+        # suspect. Read by the inlining safety predicate; with the global flag off
+        # (the default) it has no effect.
+        self.opt_out_inline = opt_out_inline
         # Each column spec becomes a PgColumn descriptor (a bare string is sugar for a
         # plain stored column). The attributes map preserves declaration order (incl.
         # computed attributes); self.columns below derives the stored-column NAME list.
@@ -383,21 +455,73 @@ class PgResource:
             for a in self.attributes.values()
         )
 
+    @property
+    def is_inline_json_safe(self) -> bool:
+        """Whether EVERY attribute survives the LATERAL json round-trip identically.
+
+        Condition 8 of the inlining safety predicate: a child relation may only be folded
+        into a parent's ``json_agg`` / ``to_jsonb`` LATERAL when every folded column decodes
+        to the SAME Python value off the json column as it would off a standalone batched
+        row. Per attribute, in order:
+
+        - a CODEC present -> :attr:`PgCodec.is_json_stable` (the host's explicit declaration,
+          deriving native-vs-not from the codec's ``sql_type`` or an explicit override);
+        - NO codec but the column's SQL type is KNOWN (the attribute's ``sql_type`` — recorded
+          by the ORM bridge from ``col.type`` — or a :attr:`column_types` entry) -> safe ONLY
+          when that type is provably json-stable native (:func:`is_json_stable_native_type`);
+          a known NON-native type (numeric / timestamptz / bytea / array / range) is NOT
+          json-stable and SKIPS — this is what catches a bare (codec-less) non-native column
+          whose JSON form silently differs from the asyncpg value (lost numeric precision,
+          tz-shifted datetime, bytea-as-string);
+        - NO codec and NO known type -> UNKNOWN: the column might be a non-native scalar, so
+          the predicate cannot PROVE it json-stable and refuses to fold (FAIL SAFE). The
+          ``= ANY($1)`` invariant is paramount: "assumed native -> fold" is exactly the
+          silent-corruption hazard this guards against, so an unprovable column SKIPS. Declare
+          the column's type (a codec, an attribute ``sql_type``, or a ``column_types`` entry —
+          which the ORM bridge does automatically) to make a native column foldable.
+
+        A resource with any unsafe attribute is not foldable — the safety predicate SKIPS it
+        (the batched child stays, always correct). See :meth:`PgCodec.is_json_stable` and
+        :func:`is_json_stable_native_type`.
+        """
+        return all(self.attribute_inline_json_safe(name) for name in self.attributes)
+
+    def attribute_inline_json_safe(self, name: str) -> bool:
+        """Whether ONE attribute survives the LATERAL json round-trip (see is_inline_json_safe)."""
+        attribute = self.attributes[name]
+        if attribute.codec is not None:
+            return attribute.codec.is_json_stable
+        # the column's KNOWN SQL type: the attribute's own ``sql_type`` (e.g. recorded by the
+        # ORM bridge) or a ``column_types`` entry. Known -> provable; unknown -> fail safe.
+        known_type = attribute.sql_type or self.column_types.get(name)
+        if known_type is not None:
+            return is_json_stable_native_type(known_type)
+        # no codec, no known type: cannot PROVE json-stable -> fail safe (do not fold). A
+        # bare, untyped column MIGHT be a non-native scalar whose JSON form differs from the
+        # asyncpg value, so the predicate refuses to fold it rather than ASSUME native.
+        return False
+
     def codec_column_types(self) -> Dict[str, TypeEngine]:
-        """Per-column SQL types DERIVED from attribute codecs (for the keyset CAST).
+        """Per-column SQL types DERIVED from attribute codecs / PgColumn types (keyset CAST).
 
         Each attribute whose codec declares a ``sql_type`` (a non-native scalar, or an
-        array/range whose codec carries the cast type) contributes ``name -> sql_type``, so
-        a codec-typed order column casts a text-origin cursor value back to its type without
-        a separate ``column_types`` declaration. Seeded into :attr:`column_types` at
-        construction (an explicit entry overrides). Off the dedup path — purely a read/cast
-        concern.
+        array/range whose codec carries the cast type), OR whose ``PgColumn.sql_type`` is a
+        NON-native type, contributes ``name -> sql_type``, so a codec-/type-declared order
+        column casts a text-origin cursor value back to its type without a separate
+        ``column_types`` declaration. Native ``PgColumn.sql_type``s are omitted (they bind
+        directly — ``column_types`` stays the non-native-only keyset map). Seeded into
+        :attr:`column_types` at construction (an explicit entry overrides). Off the dedup
+        path — purely a read/cast concern.
         """
-        return {
-            name: attribute.codec.sql_type
-            for name, attribute in self.attributes.items()
-            if attribute.codec is not None and attribute.codec.sql_type is not None
-        }
+        types: Dict[str, TypeEngine] = {}
+        for name, attribute in self.attributes.items():
+            if attribute.codec is not None and attribute.codec.sql_type is not None:
+                types[name] = attribute.codec.sql_type
+            elif attribute.sql_type is not None and not is_json_stable_native_type(
+                attribute.sql_type
+            ):
+                types[name] = attribute.sql_type
+        return types
 
     def codec_for(
         self,
