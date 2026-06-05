@@ -66,9 +66,13 @@ from .schema import (
     FieldArgs,
     GrafastSchemaBindable,
     PlanResolver,
+    TypeResolver,
     attach_plans,
+    attach_type_resolvers,
     get_field_plan,
     make_grafast_schema,
+    resolve_type_from_discriminator,
+    resolve_type_from_tag,
     set_field_plan,
 )
 from .step_model import Step
@@ -101,6 +105,11 @@ __all__ = [
     "get_field_plan",
     "PlanResolver",
     "FieldArgs",
+    # resolve_type bridges for Postgres-backed interfaces/unions (completion-time dispatch)
+    "TypeResolver",
+    "resolve_type_from_discriminator",
+    "resolve_type_from_tag",
+    "attach_type_resolvers",
     # step base + core steps
     "Step",
     "ConstantStep",

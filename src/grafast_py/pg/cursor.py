@@ -168,7 +168,12 @@ def bind_value(
     return bindparam(name, value=value)
 
 
-def column_after(term: OrderTerm, bound: ColumnElement, value: Any) -> ColumnElement:
+def column_after(
+    term: OrderTerm,
+    bound: ColumnElement,
+    value: Any,
+    column_expr: Optional[ColumnElement] = None,
+) -> ColumnElement:
     """The NULL-aware STRICTLY-AFTER predicate for one column in the order's direction.
 
     AFTER means "comes later in the ORDER BY". Resolves the term's effective NULLS
@@ -181,8 +186,12 @@ def column_after(term: OrderTerm, bound: ColumnElement, value: Any) -> ColumnEle
 
     The BEFORE direction (reverse paging) is obtained by the caller flipping each term's
     ``descending`` before building the comparator, so this one function serves both.
+    ``column_expr`` overrides the column the comparison runs against — used by the
+    pgUnionAll keyset, where the ``__typename`` discriminator term is a per-branch LITERAL
+    (``literal('Article')``), not a table column, so the seek runs against that branch's
+    constant tag rather than a non-existent ``__typename`` column.
     """
-    col = column(term.column)
+    col = column(term.column) if column_expr is None else column_expr
     placement = effective_nulls(term)
     value_is_null = value is None
 
@@ -210,6 +219,7 @@ def keyset_where(
     *,
     after: bool,
     column_types: Optional[Mapping[str, TypeEngine]] = None,
+    column_exprs: Optional[Mapping[str, ColumnElement]] = None,
 ) -> ColumnElement:
     """Build the keyset predicate selecting rows strictly AFTER/BEFORE the cursor row.
 
@@ -229,8 +239,13 @@ def keyset_where(
     SAME comparator yields the BEFORE predicate. ``column_types`` maps a column name to
     its SQL type for non-native (datetime/Decimal) columns so the text-origin cursor value
     is cast back to the column type (see :func:`bind_value`); native columns need none.
+    ``column_exprs`` maps an order column NAME to the column expression the comparison runs
+    against, overriding the default ``column(name)`` — the pgUnionAll keyset uses it for the
+    per-branch ``__typename`` discriminator term, which is a constant ``literal(type_name)``
+    on each leg rather than a real table column.
     """
     types = column_types or {}
+    exprs = column_exprs or {}
     terms = (
         list(order_terms)
         if after
@@ -243,7 +258,7 @@ def keyset_where(
         bind_value(values[i], i, types.get(term.column))
         for i, term in enumerate(terms)
     ]
-    return _recursive_after(terms, list(values), bounds, 0)
+    return _recursive_after(terms, list(values), bounds, 0, exprs)
 
 
 def _recursive_after(
@@ -251,15 +266,17 @@ def _recursive_after(
     values: Sequence[Any],
     bounds: Sequence[ColumnElement],
     index: int,
+    column_exprs: Mapping[str, ColumnElement],
 ) -> ColumnElement:
     """Recursively build ``gtI OR (eqI AND rest)`` from term ``index`` onward."""
     term = terms[index]
-    col = column(term.column)
-    gt = column_after(term, bounds[index], values[index])
+    expr = column_exprs.get(term.column)
+    col = column(term.column) if expr is None else expr
+    gt = column_after(term, bounds[index], values[index], expr)
     if index == len(terms) - 1:
         return gt
     eq = col.is_not_distinct_from(bounds[index])
-    rest = _recursive_after(terms, values, bounds, index + 1)
+    rest = _recursive_after(terms, values, bounds, index + 1, column_exprs)
     return or_(gt, and_(eq, rest))
 
 

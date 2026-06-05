@@ -642,6 +642,359 @@ async def setup_composite_tables() -> None:
         )
 
 
+async def setup_media_table() -> None:
+    """Create + seed ``grafast_demo.media`` (the single-table polymorphism fixture) idempotently.
+
+    A dedicated fixture for Postgres polymorphism over ONE table with a ``kind``
+    discriminator: every row is some ``Media`` (interface) — an ``Image`` or a ``Video`` —
+    and ``kind`` (``'image'`` / ``'video'``) tells which. ``title`` is the shared interface
+    field; ``width``/``height`` are populated only on images (NULL on videos) and
+    ``duration_seconds`` only on videos (NULL on images), so a resolve_type bridge keyed on
+    ``kind`` must group the rows by concrete type and each concrete type's sub-selection
+    reads only its own columns. ``owner_id`` groups rows so the same table serves a
+    hasMany-style ``match_column`` lookup AND a root collection. Lives in ``grafast_demo``
+    alongside the demo tables but is independent of them, so it does not perturb the
+    authors/posts/comments parity fixtures. Run AFTER :func:`setup_demo_schema` (which
+    creates the schema).
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        # drop the child media_tags first: its FK references media, so a non-cascade DROP of
+        # media alone would fail if a previous seed left media_tags behind. The normal test
+        # path resets the whole schema first, but dropping child-before-parent here keeps this
+        # fixture independently drop-first idempotent (the setup_composite_tables idiom).
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.media_tags"))
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.media"))
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.media (
+                    id               integer PRIMARY KEY,
+                    owner_id         integer NOT NULL,
+                    kind             text NOT NULL,
+                    title            text NOT NULL,
+                    width            integer NULL,
+                    height           integer NULL,
+                    duration_seconds integer NULL
+                )
+                """
+            )
+        )
+        # owner 1 owns 3 media (2 images, 1 video), owner 2 owns 2 (1 image, 1 video) — so
+        # both concrete-type groups are non-empty under several owners and a root list mixes
+        # the two types in id order. image rows carry width/height (duration NULL); video rows
+        # carry duration_seconds (width/height NULL), so a concrete sub-selection over the
+        # wrong columns would read NULL — a misgrouping is observable.
+        rows = [
+            (1, 1, "image", "sunrise", 1920, 1080, None),
+            (2, 1, "video", "timelapse", None, None, 42),
+            (3, 1, "image", "portrait", 800, 1200, None),
+            (4, 2, "image", "logo", 512, 512, None),
+            (5, 2, "video", "promo", None, None, 90),
+        ]
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.media"
+                " (id, owner_id, kind, title, width, height, duration_seconds)"
+                " VALUES (:id, :owner_id, :kind, :title, :width, :height, :duration_seconds)"
+            ),
+            [
+                {
+                    "id": i,
+                    "owner_id": o,
+                    "kind": k,
+                    "title": t,
+                    "width": w,
+                    "height": h,
+                    "duration_seconds": d,
+                }
+                for i, o, k, t, w, h, d in rows
+            ],
+        )
+
+
+async def setup_media_tags_table() -> None:
+    """Create + seed ``grafast_demo.media_tags`` (a nested-relation-under-polymorphism fixture).
+
+    A child table for :func:`setup_media_table`: each tag belongs to one ``media`` row via
+    ``media_id``, so an ``Image.tags`` (hasMany) relation chains OFF a concrete type resolved
+    at completion time — proving a nested pg relation batches per concrete-type group (one
+    statement across all images in the bucket), not per row. ``label`` makes the decoded tag
+    rows checkable. Lives in ``grafast_demo``; run AFTER :func:`setup_media_table` (its FK
+    references ``media``).
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.media_tags"))
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.media_tags (
+                    id       integer PRIMARY KEY,
+                    media_id integer NOT NULL REFERENCES {DEMO_SCHEMA}.media (id),
+                    label    text NOT NULL
+                )
+                """
+            )
+        )
+        # image 1 has 2 tags, image 3 has 1, image 4 has none, video 2 has 1 tag (so a video's
+        # tags relation is also exercisable). Per-parent counts differ so the batched scatter
+        # back to each parent is observable, and image 4's empty case is covered.
+        rows = [
+            (1, 1, "nature"),
+            (2, 1, "morning"),
+            (3, 3, "people"),
+            (4, 2, "motion"),
+        ]
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.media_tags (id, media_id, label)"
+                " VALUES (:id, :media_id, :label)"
+            ),
+            [{"id": i, "media_id": m, "label": lb} for i, m, lb in rows],
+        )
+
+
+async def setup_union_member_tables() -> None:
+    """Create + seed ``grafast_demo.articles`` and ``grafast_demo.snippets`` idempotently.
+
+    The CROSS-TABLE polymorphism fixture: a ``SearchResult = Article | Snippet`` union whose
+    concrete types live in SEPARATE tables, exercising the pgUnionAll step's ``UNION ALL`` of
+    N member tables. Both members share ``id`` / ``owner_id`` / ``created`` (the shared
+    projection + keyset order columns) and each carries a type-specific column —
+    ``articles.headline`` (with a ``word_count``), ``snippets.body`` — so a NULL-padded shared
+    shape is observable and a misgrouped row would read the wrong member's column. ``owner_id``
+    groups rows so the same tables serve a ROOT collection (``Query.search``) AND a per-parent
+    union (``Author.activity``, keyed on ``owner_id``). The interleaving of ``created`` across
+    the two tables exercises the keyset-over-union ordering (rows from both members sort into
+    one page). Lives in ``grafast_demo`` alongside the demo tables but is independent of them,
+    so it does not perturb the authors/posts/comments parity fixtures. Run AFTER
+    :func:`setup_demo_schema` (which creates the schema).
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.articles"))
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.snippets"))
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.articles (
+                    id         integer PRIMARY KEY,
+                    owner_id   integer NOT NULL,
+                    created    timestamptz NOT NULL,
+                    headline   text NOT NULL,
+                    word_count integer NOT NULL
+                )
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.snippets (
+                    id       integer PRIMARY KEY,
+                    owner_id integer NOT NULL,
+                    created  timestamptz NOT NULL,
+                    body     text NOT NULL
+                )
+                """
+            )
+        )
+        # owner 1 owns 2 articles + 2 snippets, owner 2 owns 1 article + 1 snippet. created
+        # interleaves the two tables (a1 < s1 < a2 < s2 ...) so a keyset page over the union
+        # mixes members in one ordered slice. id is unique PER table; the union's tie-break is
+        # the (created, id) keyset — created is distinct here so the order is unambiguous.
+        base = datetime(2024, 3, 1, 8, 0, 0, tzinfo=timezone.utc)
+        articles = [
+            (1, 1, base.replace(hour=8), "alpha headline", 120),
+            (2, 1, base.replace(hour=10), "beta headline", 80),
+            (3, 2, base.replace(hour=14), "gamma headline", 200),
+        ]
+        snippets = [
+            (1, 1, base.replace(hour=9), "first snippet"),
+            (2, 1, base.replace(hour=11), "second snippet"),
+            (3, 2, base.replace(hour=15), "third snippet"),
+        ]
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.articles"
+                " (id, owner_id, created, headline, word_count)"
+                " VALUES (:id, :owner_id, :created, :headline, :word_count)"
+            ),
+            [
+                {
+                    "id": i,
+                    "owner_id": o,
+                    "created": c,
+                    "headline": h,
+                    "word_count": w,
+                }
+                for i, o, c, h, w in articles
+            ],
+        )
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.snippets (id, owner_id, created, body)"
+                " VALUES (:id, :owner_id, :created, :body)"
+            ),
+            [
+                {"id": i, "owner_id": o, "created": c, "body": b}
+                for i, o, c, b in snippets
+            ],
+        )
+
+
+async def setup_union_collision_tables() -> None:
+    """Create + seed ``grafast_demo.coll_articles`` / ``coll_snippets`` with a CROSS-BRANCH tie.
+
+    The page-boundary HAZARD fixture for the keyset-over-UNION-ALL total order: two SEPARATE
+    member tables whose rows deliberately COLLIDE on the ``(created, id)`` keyset across the
+    branches — both tables hold an ``id=1`` and an ``id=2`` row sharing the SAME ``created``
+    timestamp. The per-table ``id`` is NOT unique across the union, so ``(created, id)`` alone
+    is a non-total order: a page boundary that lands on one tied row would, under a (created,
+    id)-only seek, silently DROP the other tied row (it fails ``id > cursor_id``) or duplicate
+    it. The union's ``__typename`` final tie-break is what restores a total order, so paging
+    through this fixture in pages of 1 must surface EVERY distinct row exactly once with no gap
+    or duplicate. Independent of the ``articles`` / ``snippets`` fixture (own tables) so it
+    perturbs no other assertion. Lives in ``grafast_demo``; run AFTER
+    :func:`setup_demo_schema`.
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.coll_articles"))
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.coll_snippets"))
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.coll_articles (
+                    id       integer PRIMARY KEY,
+                    owner_id integer NOT NULL,
+                    created  timestamptz NOT NULL,
+                    headline text NOT NULL
+                )
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.coll_snippets (
+                    id       integer PRIMARY KEY,
+                    owner_id integer NOT NULL,
+                    created  timestamptz NOT NULL,
+                    body     text NOT NULL
+                )
+                """
+            )
+        )
+        # both tables carry id=1 @09:00 and id=2 @10:00 — a cross-branch (created, id) tie on
+        # EACH pair. A (created, id)-only seek would drop or duplicate the colliding peer at the
+        # page boundary; the __typename tie-break (article < snippet by tag) totally orders them.
+        base = datetime(2024, 5, 1, 9, 0, 0, tzinfo=timezone.utc)
+        coll_articles = [
+            (1, 1, base.replace(hour=9), "coll article one"),
+            (2, 1, base.replace(hour=10), "coll article two"),
+        ]
+        coll_snippets = [
+            (1, 1, base.replace(hour=9), "coll snippet one"),
+            (2, 1, base.replace(hour=10), "coll snippet two"),
+        ]
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.coll_articles"
+                " (id, owner_id, created, headline)"
+                " VALUES (:id, :owner_id, :created, :headline)"
+            ),
+            [
+                {"id": i, "owner_id": o, "created": c, "headline": h}
+                for i, o, c, h in coll_articles
+            ],
+        )
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.coll_snippets"
+                " (id, owner_id, created, body)"
+                " VALUES (:id, :owner_id, :created, :body)"
+            ),
+            [
+                {"id": i, "owner_id": o, "created": c, "body": b}
+                for i, o, c, b in coll_snippets
+            ],
+        )
+
+
+async def setup_union_member_child_tables() -> None:
+    """Create + seed ``grafast_demo.article_comments`` / ``snippet_reactions`` idempotently.
+
+    Child tables for the cross-table union members (:func:`setup_union_member_tables`): a
+    ``comments`` hasMany off ``articles`` and a ``reactions`` hasMany off ``snippets``. Each
+    chains off a CONCRETE union member type resolved at completion time, so a nested pg
+    relation under a union member batches PER concrete-type group — ONE statement across every
+    Article in the bucket for ``comments``, ONE across every Snippet for ``reactions`` — never
+    per row and never per parent. The two distinct child tables let a single query select a
+    relation on EACH member and observe the two type-groups batching independently. ``body`` /
+    ``emoji`` make the decoded child rows checkable. Lives in ``grafast_demo``; run AFTER
+    :func:`setup_union_member_tables` (the FKs reference ``articles`` / ``snippets``).
+    """
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.article_comments")
+        )
+        await conn.execute(
+            text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.snippet_reactions")
+        )
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.article_comments (
+                    id         integer PRIMARY KEY,
+                    article_id integer NOT NULL REFERENCES {DEMO_SCHEMA}.articles (id),
+                    body       text NOT NULL
+                )
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.snippet_reactions (
+                    id         integer PRIMARY KEY,
+                    snippet_id integer NOT NULL REFERENCES {DEMO_SCHEMA}.snippets (id),
+                    emoji      text NOT NULL
+                )
+                """
+            )
+        )
+        # article 1 has 2 comments, article 2 has 1, article 3 has none (the empty-parent case);
+        # snippet 1 has 1 reaction, snippet 3 has 2, snippet 2 has none. Per-parent counts differ
+        # so the batched scatter back to each parent is observable, and the empty cases are covered.
+        comments = [
+            (1, 1, "great read"),
+            (2, 1, "agreed"),
+            (3, 2, "needs sources"),
+        ]
+        reactions = [
+            (1, 1, "thumbsup"),
+            (2, 3, "fire"),
+            (3, 3, "heart"),
+        ]
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.article_comments (id, article_id, body)"
+                " VALUES (:id, :article_id, :body)"
+            ),
+            [{"id": i, "article_id": a, "body": b} for i, a, b in comments],
+        )
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.snippet_reactions (id, snippet_id, emoji)"
+                " VALUES (:id, :snippet_id, :emoji)"
+            ),
+            [{"id": i, "snippet_id": s, "emoji": e} for i, s, e in reactions],
+        )
+
+
 __all__ = [
     "setup_demo_schema",
     "setup_things_table",
@@ -653,4 +1006,9 @@ __all__ = [
     "setup_codec_rows_table",
     "setup_line_items_table",
     "setup_composite_tables",
+    "setup_media_table",
+    "setup_media_tags_table",
+    "setup_union_member_tables",
+    "setup_union_collision_tables",
+    "setup_union_member_child_tables",
 ]

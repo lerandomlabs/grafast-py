@@ -79,6 +79,13 @@ from .steps import (
     pg_select,
     pg_select_single,
 )
+# cross-table union: pgUnionAll over N member tables (UNION ALL + keyset + separate count)
+from .union import (
+    PgUnionAllStep,
+    PgUnionMember,
+    pg_union_all,
+    union_all_connection,
+)
 
 __all__ = [
     "PgResource",
@@ -108,6 +115,11 @@ __all__ = [
     "order_digest",
     "pg_select",
     "pg_select_single",
+    # cross-table union: pgUnionAll over N member tables
+    "PgUnionAllStep",
+    "PgUnionMember",
+    "pg_union_all",
+    "union_all_connection",
     # single-row CRUD mutation steps: the serial-seam write counterpart
     "PgInsertSingleStep",
     "PgUpdateSingleStep",
