@@ -195,6 +195,11 @@ _PG_LAZY = {
     "check_predicate": ".pg.customize",
     "predicate_key": ".pg.customize",
     "resolve_customizer_predicates": ".pg.customize",
+    "pg_placeholder": ".pg.placeholders",
+    "placeholder_source": ".pg.placeholders",
+    "Placeholder": ".pg.placeholders",
+    "unwrap_placeholder": ".pg.placeholders",
+    "placeholder_source_tag": ".pg.placeholders",
 }
 
 

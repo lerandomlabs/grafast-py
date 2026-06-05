@@ -68,6 +68,16 @@ from .mutations import (
     pg_update_single,
 )
 from .ordering import OrderTerm, normalize_order, order_clauses
+# value-agnostic placeholders (Wave 4): a source-tagged WHERE bindparam (`pg_placeholder`)
+# and a `Placeholder` sentinel for a variable-derived pagination value (first/offset/after/
+# before), both dedup-keyed by their stable source tag, not their runtime value.
+from .placeholders import (
+    Placeholder,
+    pg_placeholder,
+    placeholder_source,
+    placeholder_source_tag,
+    unwrap_placeholder,
+)
 from .resource import (
     PgCodec,
     PgColumn,
@@ -162,6 +172,13 @@ __all__ = [
     "check_predicate",
     "predicate_key",
     "resolve_customizer_predicates",
+    # value-agnostic placeholders for a variable-derived value (Wave 4): WHERE bindparam +
+    # the pagination-value (first/offset/after/before) sentinel
+    "pg_placeholder",
+    "placeholder_source",
+    "Placeholder",
+    "unwrap_placeholder",
+    "placeholder_source_tag",
     # codec registry: PgCodec lookup by pg type name + recursive array/range/composite/enum
     "codec_for",
     "array_codec",

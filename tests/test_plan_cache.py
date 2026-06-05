@@ -1,0 +1,865 @@
+"""Cross-request plan cache: the bounded-LRU core module + its no-regression / anti-corruption
+gates (Wave 4, step 7).
+
+Steps 1-6 added the opt-in flags, the ``FieldArgs`` variable provenance, the plan-level flag
+threading, and the pg placeholder surfaces (WHERE + pagination). This step adds the reuse
+layer: :mod:`grafast_py.cache` — a bounded-LRU process cache keyed by ``(id(schema),
+document-text hash, operation name, variable-arg fingerprint)`` storing the finalized
+ObjectPlan + RootStep + Plan, with a per-request placeholder REBIND on a hit — wired into
+``plan_operation`` behind ``GrafastConfig.cache_plans`` (default off).
+
+This module gates:
+
+  * the cache module itself (LRU store/get/eviction, key stability/discrimination, fingerprint);
+  * the CACHEABILITY guard (a plan that inlined a variable LITERAL is NOT cached — reusing it
+    would serve the wrong value);
+  * the REBIND correctness through :func:`grafast_py.cache.rebind_cached_plan` (a cached step's
+    placeholder values are re-pointed by SOURCE to this request's variables);
+  * the NO-REGRESSION oracle (same query cached-off vs cached-on -> byte-identical result), plus
+    the plan-build-SKIP proof (the second request of a document does NOT re-plan);
+  * the ANTI-CORRUPTION gate end-to-end over the DB: the SAME cached value-agnostic plan, run
+    with TWO different variable values, returns each its OWN correct rows (a cache hit must
+    never serve one request the value of another — the worst failure mode in the project).
+
+DB tests are marked ``pg`` (deselectable ``-m 'not pg'``); they touch ONLY the ``grafast_demo``
+``widgets`` fixture and alter nothing else.
+"""
+
+import asyncio
+
+import pytest
+import pytest_asyncio
+from graphql import graphql, graphql_sync, parse
+from sqlalchemy import column
+
+import grafast_py.plan as plan_module
+from grafast_py.cache import (
+    CachedPlan,
+    PlanCache,
+    compute_cache_key,
+    config_fingerprint,
+    default_cache,
+    document_text,
+    isolate_cached_plan,
+    pinned_resources,
+    rebind_cached_plan,
+    values_by_source,
+    variable_arg_fingerprint,
+)
+from grafast_py.config import GrafastConfig
+from grafast_py.context import GrafastExecutionContext
+from grafast_py.core_steps import access, constant
+from grafast_py.dag import Plan
+from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
+from grafast_py.pg.executor import SQLAlchemyExecutor, pg_request_context
+from grafast_py.pg.placeholders import pg_placeholder
+from grafast_py.pg.resource import PgRegistry, PgResource
+from grafast_py.pg.steps import PgSelectAllStep, PgSelectStep
+from examples.seed import setup_demo_schema, setup_widgets_table
+
+
+# --------------------------------------------------------------- the PlanCache (no DB)
+
+
+def make_cached(tag: str) -> CachedPlan:
+    """A throwaway CachedPlan whose ``object_plan`` is a sentinel string (identity only)."""
+    return CachedPlan(object_plan=tag, root_step=None, plan=Plan(), schema=None)
+
+
+def test_cache_store_and_get_roundtrips():
+    """A stored entry is returned by its key; an absent key returns None."""
+    cache = PlanCache()
+    entry = make_cached("a")
+    cache.put(("k",), entry)
+    assert cache.get(("k",)) is entry
+    assert cache.get(("missing",)) is None
+    assert cache.hits == 1 and cache.misses == 1
+
+
+def test_cache_lru_evicts_least_recently_used():
+    """Past the cap the LEAST-recently-used entry is evicted; a GET refreshes recency."""
+    cache = PlanCache(max_entries=2)
+    cache.put(("a",), make_cached("a"))
+    cache.put(("b",), make_cached("b"))
+    # touch "a" so "b" becomes the LRU
+    assert cache.get(("a",)) is not None
+    cache.put(("c",), make_cached("c"))  # over cap -> evict the LRU ("b")
+    assert cache.get(("b",)) is None
+    assert cache.get(("a",)) is not None
+    assert cache.get(("c",)) is not None
+    assert cache.evictions == 1
+    assert len(cache) == 2
+
+
+def test_cache_rejects_zero_cap():
+    """A cache must hold at least one entry; a non-positive cap fails loud."""
+    with pytest.raises(ValueError):
+        PlanCache(max_entries=0)
+
+
+def test_cache_clear_empties():
+    cache = PlanCache()
+    cache.put(("a",), make_cached("a"))
+    cache.clear()
+    assert len(cache) == 0
+    assert cache.get(("a",)) is None
+
+
+# --------------------------------------------------------------- the cache KEY (no DB)
+
+
+SDL = """
+type Query {
+  things(status: String, limit: Int): [Thing!]!
+}
+type Thing {
+  id: Int!
+}
+"""
+
+
+def first_operation(query: str):
+    return parse(query).definitions[0]
+
+
+def test_cache_key_same_document_is_stable():
+    """Two re-parses of the SAME query text produce the SAME key (id() is not used)."""
+    schema = object()
+    op1 = first_operation("query Q($s: String) { things(status: $s) { id } }")
+    op2 = first_operation("query Q($s: String) { things(status: $s) { id } }")
+    assert compute_cache_key(schema, op1) == compute_cache_key(schema, op2)
+    # ...and the operation nodes are genuinely distinct objects (so id() would have differed).
+    assert op1 is not op2
+
+
+def test_cache_key_differs_by_schema_identity():
+    """Two schema instances key differently (a host serving several schemas)."""
+    op = first_operation("{ things(status: \"x\") { id } }")
+    assert compute_cache_key(object(), op) != compute_cache_key(object(), op)
+
+
+def test_cache_key_differs_by_operation_name():
+    """A different operation name selects a different entry (multi-operation document)."""
+    schema = object()
+    a = first_operation("query A { things(status: \"x\") { id } }")
+    b = first_operation("query B { things(status: \"x\") { id } }")
+    assert compute_cache_key(schema, a) != compute_cache_key(schema, b)
+
+
+def test_cache_key_differs_by_literal_vs_variable_structure():
+    """A literal arg and a $variable arg of the same field key DIFFERENTLY.
+
+    The variable-arg fingerprint captures the literal-vs-$var structure, so a value-pinned
+    literal plan can never collide with a value-agnostic placeholder plan in the cache.
+    """
+    schema = object()
+    literal = first_operation("{ things(status: \"x\") { id } }")
+    variable = first_operation("query Q($s: String) { things(status: $s) { id } }")
+    assert compute_cache_key(schema, literal) != compute_cache_key(schema, variable)
+
+
+def test_variable_arg_fingerprint_walks_the_whole_operation():
+    """The fingerprint is the sorted (field-path, arg-name) pairs of every $variable arg."""
+    op = first_operation(
+        "query Q($s: String, $n: Int) { things(status: $s, limit: $n) { id } }"
+    )
+    fp = variable_arg_fingerprint(op)
+    assert fp == (("things", "limit"), ("things", "status"))
+    # an all-literal operation has an empty fingerprint
+    lit = first_operation("{ things(status: \"x\", limit: 3) { id } }")
+    assert variable_arg_fingerprint(lit) == ()
+
+
+def test_document_text_folds_in_fragments():
+    """The document text includes referenced fragment bodies, so a fragment change re-keys."""
+    op = first_operation("query Q { things(status: \"x\") { ...F } }")
+    frag_a = parse("fragment F on Thing { id }").definitions[0]
+    text_a = document_text(op, {"F": frag_a})
+    assert "fragment F" in text_a and "things" in text_a
+
+
+def test_cache_key_differs_by_plan_affecting_config():
+    """A plan-affecting config field re-keys, so two configs sharing the default cache never collide.
+
+    ``placeholders`` / ``cache_plans`` / ``inline_relations`` change the SHAPE of the planned
+    DAG (or whether a resolver placeholders vs inlines), so a plan built under one combination
+    must not be served to a request under another (the cross-config bleed). The limit/tracing
+    knobs do NOT change the plan, so they SHARE an entry.
+    """
+    schema = object()
+    op = first_operation("query Q($s: String) { things(status: $s) { id } }")
+    a = GrafastConfig(placeholders=True, cache_plans=True)
+    b = GrafastConfig(placeholders=False, cache_plans=True)
+    c = GrafastConfig(placeholders=True, cache_plans=True, inline_relations=True)
+    # a config-affecting field re-keys (no cross-config collision on the shared default cache).
+    assert compute_cache_key(schema, op, None, a) != compute_cache_key(schema, op, None, b)
+    assert compute_cache_key(schema, op, None, a) != compute_cache_key(schema, op, None, c)
+    # the SAME config keys identically (so same-config repeats still HIT).
+    a2 = GrafastConfig(placeholders=True, cache_plans=True)
+    assert compute_cache_key(schema, op, None, a) == compute_cache_key(schema, op, None, a2)
+    # a NON-plan-affecting knob (timeout) does NOT re-key — those configs share an entry.
+    d = GrafastConfig(placeholders=True, cache_plans=True, execution_timeout_s=5.0)
+    assert compute_cache_key(schema, op, None, a) == compute_cache_key(schema, op, None, d)
+    # the fingerprint is exactly the three plan-affecting flags, in (inline, placeholders, cache) order.
+    assert config_fingerprint(a) == (False, True, True)
+    assert config_fingerprint(None) == (False, False, False)
+
+
+def test_two_configs_sharing_default_cache_do_not_bleed():
+    """END-TO-END: two configs on ONE schema (both default cache) never serve each other's plan.
+
+    The cross-config bleed: ``compute_cache_key`` carried no config component, so a plan built
+    under config A and a config-B request of the SAME document collided on one default-cache
+    entry — B got a HIT and was served A's plan, its own ``is_variable`` plan resolver bypassed.
+    Folding the config fingerprint into the key turns B's lookup into a MISS (it plans its own).
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    schema = make_grafast_schema(
+        SDL, {"Query": {"things": things_placeholder_plan}, "Thing": {"id": id_plan}}
+    )
+    default_cache().clear()
+    query = "query Q($s: String) { things(status: $s) { id } }"
+    a = plan_query(schema, query, GrafastConfig(placeholders=True, cache_plans=True), {"s": "x"})
+    hits_after_a = default_cache().hits
+    # a DIFFERENT config of the same schema/document must MISS (not be served A's plan).
+    plan_query(schema, query, GrafastConfig(placeholders=False, cache_plans=True), {"s": "x"})
+    assert default_cache().hits == hits_after_a  # config B was a miss, no cross-config hit
+    # the SAME config of the same document IS a hit (caching still works within a config).
+    plan_query(schema, query, GrafastConfig(placeholders=True, cache_plans=True), {"s": "x"})
+    assert default_cache().hits == hits_after_a + 1
+    default_cache().clear()
+    assert a is not None
+
+
+# --------------------------------------------------------------- values_by_source (no DB)
+
+
+def test_values_by_source_prefixes_var_tags():
+    """A request's {variable: value} becomes {source-tag: value} for the rebind."""
+    assert values_by_source({"s": "published", "n": 5}) == {
+        "var:s": "published",
+        "var:n": 5,
+    }
+    assert values_by_source(None) == {}
+    assert values_by_source({}) == {}
+
+
+def test_values_by_source_covers_omitted_variables_as_none():
+    """An OMITTED (no-default) declared variable maps to None, not absent.
+
+    So a cache HIT re-points it to None rather than inheriting the PRIOR request's value (the
+    omitted-no-default correctness gap). A defaulted-but-omitted variable is already folded into
+    ``variable_values`` by graphql-core, so it carries its default here.
+    """
+    op = first_operation("query Q($s: String, $n: Int) { things(status: $s, limit: $n) { id } }")
+    # only `s` supplied; `n` omitted with no default -> None
+    mapping = values_by_source({"s": "published"}, op)
+    assert mapping == {"var:s": "published", "var:n": None}
+
+
+# ------------------------------------------------- rebind correctness (no DB, pg step)
+
+
+def make_widgets() -> PgResource:
+    registry = PgRegistry()
+    return PgResource(
+        "widgets",
+        "grafast_demo",
+        "widgets",
+        ["id", "owner_id", "title", "status", "deleted_at"],
+        registry=registry,
+    )
+
+
+def test_rebind_repoints_where_placeholder_value():
+    """rebind_cached_plan re-points a cached WHERE placeholder to THIS request's value.
+
+    The cached step carried the FIRST request's value ("draft"); after the rebind it carries
+    the new one ("published"), while the dedup key (value-agnostic, source-keyed) is unchanged.
+    """
+    step = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
+    step.builder().where(column("status") == pg_placeholder("var:status", "draft"))
+    key_before = (step.peer_key, step.dedup_params())
+
+    plan = Plan()
+    plan.add_step(step)
+    cached = CachedPlan(object_plan=None, root_step=None, plan=plan, schema=None)
+
+    rebind_cached_plan(cached, {"status": "published"})
+
+    # the bound value moved; the SQL still binds it as a :param (never inlined). The predicate
+    # is `column("status") == <placeholder bind>`, so its right operand IS the bindparam.
+    ph_bind = step.where_predicates[0].right
+    assert ph_bind.value == "published"
+    # the dedup key never depended on the value, so the rebind does not invalidate it.
+    assert (step.peer_key, step.dedup_params()) == key_before
+
+
+def test_rebind_repoints_pagination_placeholder_value():
+    """rebind_cached_plan re-points a cached ``first`` Placeholder to THIS request's value."""
+    from grafast_py.pg.placeholders import Placeholder
+
+    step = PgSelectStep(
+        make_widgets(), constant(None), "owner_id", order_by=["id"],
+        first=Placeholder("var:n", 2),
+    )
+    key_before = (step.peer_key, step.dedup_params())
+    plan = Plan()
+    plan.add_step(step)
+    cached = CachedPlan(object_plan=None, root_step=None, plan=plan, schema=None)
+
+    rebind_cached_plan(cached, {"n": 9})
+
+    assert isinstance(step.first, Placeholder)
+    assert step.first.source == "var:n"
+    assert step.first.value == 9  # the runtime value moved...
+    assert (step.peer_key, step.dedup_params()) == key_before  # ...but the key did not.
+
+
+def test_rebind_is_noop_without_placeholders():
+    """A literal-only / core step ignores the rebind (the default no-op hook)."""
+    step = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
+    step.builder().where(column("status") == "published")  # a literal, not a placeholder
+    plan = Plan()
+    plan.add_step(step)
+    cached = CachedPlan(object_plan=None, root_step=None, plan=plan, schema=None)
+    # rebind with an unrelated variable -> nothing changes (no placeholder to re-point)
+    rebind_cached_plan(cached, {"status": "draft"})
+    assert step.where_predicates[0].right.value == "published"
+
+
+# ------------------------------------------- per-request isolation (concurrency-safety, no DB)
+
+
+def test_isolate_then_rebind_leaves_shared_entry_immutable():
+    """REGRESSION: two requests isolate+rebind their OWN copy; the shared entry never mutates.
+
+    The cross-request value bleed: the rebind mutates placeholder bound values IN PLACE, so two
+    requests of the same cached plan with DIFFERENT variables, if they shared one step DAG, could
+    serve one the other's value. ``isolate_cached_plan`` deep-copies the entry per request, so each
+    rebinds its OWN copy and the shared entry stays at its first-bound value — the property that
+    makes the cache concurrency-safe WITHOUT request serialization.
+    """
+    step = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
+    step.builder().where(column("status") == pg_placeholder("var:status", "published"))
+    plan = Plan()
+    plan.add_step(step)
+    shared = CachedPlan(object_plan="op", root_step=None, plan=plan, schema=None)
+
+    def where_value(cached):
+        for s in cached.plan.steps:
+            preds = getattr(s, "where_predicates", None)
+            if preds:
+                return preds[0].right.value
+        return None
+
+    # two "concurrent" requests each isolate then rebind to their own value.
+    req_a = isolate_cached_plan(shared)
+    rebind_cached_plan(req_a, {"status": "draft"})
+    req_b = isolate_cached_plan(shared)
+    rebind_cached_plan(req_b, {"status": "archived"})
+
+    assert where_value(req_a) == "draft"
+    assert where_value(req_b) == "archived"
+    # the SHARED cache entry is never touched — it still carries the first-bound value.
+    assert where_value(shared) == "published"
+    # the copies are distinct step objects (no shared mutable state between requests).
+    assert req_a.plan.steps is not req_b.plan.steps
+    assert req_a.plan.steps[-1] is not shared.plan.steps[-1]
+
+
+def test_isolate_pins_schema_and_resource_shared():
+    """``isolate_cached_plan`` PINS the schema and pg resources shared (immutable config, not copied).
+
+    The schema must stay ``is``-identical (the hit re-verifies ``entry.schema is request_schema``);
+    a pg resource is immutable shared config (table/columns/codecs) read only at execute time, so a
+    per-request copy would needlessly duplicate it. Only the steps' OWN mutable state is copied.
+    """
+    schema = object()
+    resource = make_widgets()
+    step = PgSelectStep(resource, constant(None), "owner_id", order_by=["id"])
+    step.builder().where(column("status") == pg_placeholder("var:status", "published"))
+    plan = Plan()
+    plan.add_step(step)
+    shared = CachedPlan(object_plan="op", root_step=None, plan=plan, schema=schema)
+
+    # the resource is reachable for pinning, and the schema is pinned by identity.
+    assert resource in pinned_resources(plan)
+    copy_ = isolate_cached_plan(shared)
+    assert copy_.schema is schema  # schema pinned (stays is-identical)
+    copied_step = [s for s in copy_.plan.steps if getattr(s, "resource", None) is not None][0]
+    assert copied_step.resource is resource  # resource pinned (shared, not duplicated)
+    assert copied_step is not step  # ...but the STEP itself is a fresh copy
+
+
+# --------------------------------------------------------------- cacheability guard
+
+
+def things_inlining_plan(parent, args, info):
+    """A plan that INLINES the variable arg value as a literal (the non-cacheable path)."""
+    rows = [{"id": 1, "status": args["status"]}]  # reading args["status"] -> a literal read
+    return constant(rows)
+
+
+def things_placeholder_plan(parent, args, info):
+    """A plan that wraps the variable arg as a value-agnostic placeholder (the cacheable path)."""
+    # it does NOT read the raw value; it only asks for the source tag, so the plan stays
+    # value-independent. (A no-DB constant stands in for a real pg select here.)
+    if args.is_variable("status"):
+        _ = args.source("status")
+    return constant([{"id": 1}])
+
+
+def id_plan(parent, args, info):
+    return access(parent, ("id",))
+
+
+def context_class_with(config: GrafastConfig):
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    return _Ctx
+
+
+def plan_query(schema, query, config, variables):
+    """Plan one operation under ``config`` and return its Plan (the freshly-built one)."""
+    from graphql.execution.collect_fields import collect_fields
+    from grafast_py.plan import plan_operation
+
+    document = parse(query)
+    operation = document.definitions[0]
+    ctx = context_class_with(config).build(
+        schema, document, raw_variable_values=variables or {}
+    )
+    root_fields = collect_fields(
+        ctx.schema, ctx.fragments, ctx.variable_values, schema.query_type,
+        operation.selection_set,
+    )
+    plan_operation(ctx, operation, schema.query_type, root_fields)
+    return ctx._grafast_plan
+
+
+def test_plan_inlining_a_variable_literal_is_not_cacheable():
+    """A plan that INLINED a $variable value as a literal is marked NON-cacheable.
+
+    Reusing it across requests would serve a later request the earlier value, so it must not
+    be cached. ``FieldArgs`` records the raw read; the planner flips ``plan.cacheable`` False.
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    schema = make_grafast_schema(
+        SDL, {"Query": {"things": things_inlining_plan}, "Thing": {"id": id_plan}}
+    )
+    plan = plan_query(
+        schema,
+        "query Q($s: String) { things(status: $s) { id } }",
+        GrafastConfig(placeholders=True, cache_plans=True),
+        {"s": "published"},
+    )
+    assert plan.cacheable is False
+
+
+def test_plan_using_a_placeholder_stays_cacheable():
+    """A plan that wrapped the $variable as a placeholder (read source(), not the value) is cacheable."""
+    from grafast_py.schema import make_grafast_schema
+
+    schema = make_grafast_schema(
+        SDL, {"Query": {"things": things_placeholder_plan}, "Thing": {"id": id_plan}}
+    )
+    plan = plan_query(
+        schema,
+        "query Q($s: String) { things(status: $s) { id } }",
+        GrafastConfig(placeholders=True, cache_plans=True),
+        {"s": "published"},
+    )
+    assert plan.cacheable is True
+
+
+def test_all_literal_plan_is_cacheable():
+    """A plan with NO variable args is cacheable (reading a literal arg is always value-stable)."""
+    from grafast_py.schema import make_grafast_schema
+
+    schema = make_grafast_schema(
+        SDL, {"Query": {"things": things_inlining_plan}, "Thing": {"id": id_plan}}
+    )
+    plan = plan_query(
+        schema,
+        '{ things(status: "published") { id } }',
+        GrafastConfig(placeholders=True, cache_plans=True),
+        {},
+    )
+    assert plan.cacheable is True
+
+
+# -------------------------------------- abstract-field cacheability + provenance (issue #6)
+
+
+ABSTRACT_SDL = """
+type Query { item: Node }
+interface Node { id: Int! }
+type Widget implements Node { id: Int! echo(v: String): String }
+type Gadget implements Node { id: Int! }
+"""
+
+
+def build_abstract_schema(echo_plan):
+    """A schema whose interface field resolves to Widget, with a $variable-taking echo field."""
+    from grafast_py.schema import make_grafast_schema, resolve_type_from_tag
+
+    def item_plan(parent, args, info):
+        return constant({"id": 1, "__typename": "Widget"})
+
+    return make_grafast_schema(
+        ABSTRACT_SDL,
+        {
+            "Query": {"item": item_plan},
+            "Widget": {"id": id_plan, "echo": echo_plan},
+            "Gadget": {"id": id_plan},
+        },
+        type_resolvers={"Node": resolve_type_from_tag("__typename")},
+    )
+
+
+def test_operation_owning_an_abstract_field_is_not_cacheable():
+    """An operation with an interface/union field is NON-cacheable (its subtrees plan lazily).
+
+    An abstract field's per-concrete-type subtree is planned at EXECUTE time and its steps live
+    on the completer, beyond the operation-level placeholder rebind's reach — so a cached
+    operation would serve a later request the first request's inlined value. The operation
+    conservatively refuses to cache when it owns ANY abstract field.
+    """
+    def echo_plan(parent, args, info):
+        return constant(args["v"])
+
+    schema = build_abstract_schema(echo_plan)
+    plan = plan_query(
+        schema,
+        "query Q($v: String) { item { ... on Widget { echo(v: $v) } } }",
+        GrafastConfig(placeholders=True, cache_plans=True),
+        {"v": "x"},
+    )
+    assert plan.cacheable is False
+
+
+def test_abstract_subtree_threads_placeholder_provenance():
+    """ISSUE #6 (A): a $variable arg UNDER a concrete type sees its provenance (is_variable True).
+
+    Without threading ``plan.placeholders`` onto the abstract subtree's own Plan, a field under a
+    concrete type would see empty provenance and inline the variable as a literal even with
+    placeholders enabled. The fix threads the flag so the subtree plans like the operation root.
+    """
+    seen = {}
+
+    def echo_plan(parent, args, info):
+        seen["is_variable"] = args.is_variable("v")
+        if args.is_variable("v"):
+            _ = args.source("v")
+        return constant("ok")
+
+    schema = build_abstract_schema(echo_plan)
+    graphql_sync(
+        schema,
+        "query Q($v: String) { item { ... on Widget { echo(v: $v) } } }",
+        variable_values={"v": "x"},
+        execution_context_class=context_class_with(
+            GrafastConfig(placeholders=True, cache_plans=True)
+        ),
+    )
+    assert seen.get("is_variable") is True
+
+
+def test_abstract_field_no_cross_request_value_bleed_under_cache():
+    """ISSUE #6 end-to-end: two requests of an abstract-field op get THEIR OWN value (no bleed).
+
+    The bug: request 1 inlined its $variable under a concrete type, the operation was cached as
+    cacheable, and request 2 hit the cache and was served request 1's value. With the operation
+    marked non-cacheable, each request re-plans and gets its own value.
+    """
+    def echo_plan(parent, args, info):
+        return constant(args["v"])  # inlines the variable value (raw read)
+
+    schema = build_abstract_schema(echo_plan)
+    default_cache().clear()
+    hits_before = default_cache().hits  # the counter is cumulative; compare the DELTA
+    ctx = context_class_with(GrafastConfig(placeholders=True, cache_plans=True))
+    query = "query Q($v: String) { item { ... on Widget { echo(v: $v) } } }"
+
+    r1 = graphql_sync(schema, query, variable_values={"v": "FIRST"}, execution_context_class=ctx)
+    r2 = graphql_sync(schema, query, variable_values={"v": "SECOND"}, execution_context_class=ctx)
+    assert r1.errors is None and r2.errors is None
+    assert r1.data == {"item": {"echo": "FIRST"}}
+    assert r2.data == {"item": {"echo": "SECOND"}}  # NOT "FIRST" — no cross-request bleed
+    # the operation was never cached (it owns an abstract field), so it was never STORED and
+    # nothing was served from the cache — len stays 0 and no NEW hit was recorded.
+    assert len(default_cache()) == 0
+    assert default_cache().hits == hits_before
+    default_cache().clear()
+
+
+# --------------------------------------------------------------- no-regression (no DB)
+
+
+def test_cache_off_vs_on_byte_identical_result():
+    """NO-REGRESSION: a query's result is identical with caching off vs on (no host placeholder)."""
+    from grafast_py.schema import make_grafast_schema
+
+    schema = make_grafast_schema(
+        SDL, {"Query": {"things": things_placeholder_plan}, "Thing": {"id": id_plan}}
+    )
+    query = "query Q($s: String) { things(status: $s) { id } }"
+    variables = {"s": "published"}
+
+    off = graphql_sync(
+        schema, query, variable_values=variables,
+        execution_context_class=context_class_with(GrafastConfig()),
+    )
+    on = graphql_sync(
+        schema, query, variable_values=variables,
+        execution_context_class=context_class_with(
+            GrafastConfig(placeholders=True, cache_plans=True, plan_cache=PlanCache())
+        ),
+    )
+    assert off.errors is None and on.errors is None
+    assert off.data == on.data == {"things": [{"id": 1}]}
+
+
+def test_second_request_of_a_document_skips_planning(monkeypatch):
+    """The second request of a cacheable document is a HIT — finalize_plan does NOT re-run.
+
+    A cache hit changes only WHETHER planning re-runs: we spy on ``finalize_plan`` and assert
+    it ran exactly ONCE across two identical requests (the first plans + stores, the second
+    hits the cache and skips the build).
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    schema = make_grafast_schema(
+        SDL, {"Query": {"things": things_placeholder_plan}, "Thing": {"id": id_plan}}
+    )
+    cache = PlanCache()
+    config = GrafastConfig(placeholders=True, cache_plans=True, plan_cache=cache)
+
+    calls = []
+    real_finalize = plan_module.finalize_plan
+
+    def spy(plan, object_plan):
+        calls.append(1)
+        return real_finalize(plan, object_plan)
+
+    monkeypatch.setattr(plan_module, "finalize_plan", spy)
+
+    query = "query Q($s: String) { things(status: $s) { id } }"
+    for _ in range(2):
+        result = graphql_sync(
+            schema, query, variable_values={"s": "x"},
+            execution_context_class=context_class_with(config),
+        )
+        assert result.errors is None
+        assert result.data == {"things": [{"id": 1}]}
+
+    assert len(calls) == 1  # planned once; the second request hit the cache
+    assert cache.hits == 1 and cache.misses == 1
+
+
+# --------------------------------------------------------------- anti-corruption (DB)
+
+
+@pytest_asyncio.fixture
+async def seeded():
+    await dispose_engine()
+    await setup_demo_schema()
+    await setup_widgets_table()
+    yield
+    await dispose_engine()
+
+
+WIDGETS_SDL = """
+type Query {
+  widgets(status: String!): [Widget!]!
+}
+type Widget {
+  id: Int!
+  status: String!
+}
+"""
+
+
+def build_widgets_schema():
+    """A schema whose ``widgets`` plan builds a value-agnostic placeholder filter on $status.
+
+    When ``status`` came from a variable it wraps the value as a ``pg_placeholder`` (so the
+    plan is cacheable and value-agnostic); otherwise it inlines the literal. This is the
+    host-declared opt-in surface the cache relies on.
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    registry = PgRegistry()
+    widgets = PgResource(
+        "widgets", "grafast_demo", "widgets",
+        ["id", "owner_id", "title", "status", "deleted_at"], registry=registry,
+    )
+
+    def widgets_plan(parent, args, info):
+        # a root collection over ALL widgets, with a uniform WHERE on status as the host's
+        # filter. With provenance on AND the arg variable-derived, build a value-agnostic
+        # placeholder (cacheable); else inline the literal (value-pinned, not cached).
+        step = PgSelectAllStep(widgets, order_by=["id"]).for_parent(parent)
+        if args.is_variable("status"):
+            step.builder().where(
+                column("status") == pg_placeholder(args.source("status"), args["status"])
+            )
+        else:
+            step.builder().where(column("status") == args["status"])
+        return step
+
+    def widget_id_plan(parent, args, info):
+        return access(parent, ("id",))
+
+    def widget_status_plan(parent, args, info):
+        return access(parent, ("status",))
+
+    return make_grafast_schema(
+        WIDGETS_SDL,
+        {
+            "Query": {"widgets": widgets_plan},
+            "Widget": {"id": widget_id_plan, "status": widget_status_plan},
+        },
+    )
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_cached_plan_serves_two_variable_values_correctly(seeded):
+    """ANTI-CORRUPTION (the crux end-to-end): one cached value-agnostic plan, TWO values.
+
+    The SAME document is run with ``status="draft"`` then ``status="published"``. The second
+    request is a cache HIT that re-binds the placeholder to ITS value — each request must get
+    ITS OWN correct rows. Getting this wrong would serve one request the cached/merged plan of
+    another (cross-request data corruption — the worst failure mode in the project).
+
+    Marked ``cache_off`` so the suite-wide cache-on oracle does not also drive it (it owns its
+    own isolated ``PlanCache`` to assert the hit precisely).
+    """
+    cache = PlanCache()
+    config = GrafastConfig(placeholders=True, cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_widgets_schema()
+    query = "query Q($s: String!) { widgets(status: $s) { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine())):
+        draft = await graphql(
+            schema, query, variable_values={"s": "draft"},
+            execution_context_class=_Ctx,
+        )
+    with pg_request_context(SQLAlchemyExecutor(get_engine())):
+        published = await graphql(
+            schema, query, variable_values={"s": "published"},
+            execution_context_class=_Ctx,
+        )
+
+    assert draft.errors is None and published.errors is None
+    # the second request was a cache HIT (one plan built, reused once).
+    assert cache.hits == 1 and cache.misses == 1
+    # each request got ITS OWN rows — the anti-corruption property.
+    draft_ids = sorted(w["id"] for w in draft.data["widgets"])
+    pub_ids = sorted(w["id"] for w in published.data["widgets"])
+    assert draft_ids == [2, 5]
+    assert pub_ids == [1, 3, 4, 6]
+    assert {w["status"] for w in draft.data["widgets"]} == {"draft"}
+    assert {w["status"] for w in published.data["widgets"]} == {"published"}
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_cached_plan_has_no_cross_request_bleed_under_concurrency(seeded):
+    """ANTI-CORRUPTION under CONCURRENCY: many interleaved cache hits, different values, no bleed.
+
+    The worst failure mode the Wave 4 review found (the shared-rebind race): a cache HIT must
+    isolate a per-request copy BEFORE re-binding its placeholder, or two concurrent requests of
+    the SAME cached plan with DIFFERENT variables overwrite each other's bound value mid-flight.
+    Warm the cache once, then fire 16 interleaved requests (alternating status) through
+    ``asyncio.gather``; each must return ITS OWN correct rows. A shared in-place rebind would
+    surface here as some request seeing another's status rows.
+    """
+    cache = PlanCache()
+    config = GrafastConfig(placeholders=True, cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_widgets_schema()
+    query = "query Q($s: String!) { widgets(status: $s) { id status } }"
+    expected = {"draft": [2, 5], "published": [1, 3, 4, 6]}
+
+    async def one(status: str):
+        with pg_request_context(SQLAlchemyExecutor(get_engine())):
+            return status, await graphql(
+                schema, query, variable_values={"s": status},
+                execution_context_class=_Ctx,
+            )
+
+    # warm the cache so every concurrent request below is a HIT that must isolate its own copy.
+    await one("published")
+
+    statuses = ["draft", "published"] * 8  # 16 interleaved concurrent requests
+    results = await asyncio.gather(*(one(s) for s in statuses))
+
+    for status, result in results:
+        assert result.errors is None
+        ids = sorted(w["id"] for w in result.data["widgets"])
+        assert ids == expected[status], f"{status} request bled: got {ids}"
+        assert {w["status"] for w in result.data["widgets"]} == {status}
+    # only the warm-up missed; all 16 concurrent requests were cache hits that isolated cleanly.
+    assert cache.misses == 1
+    assert cache.hits == len(statuses)
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_cached_result_byte_identical_to_uncached(seeded):
+    """NO-REGRESSION over the DB: the cached path returns the SAME rows + SAME count as uncached.
+
+    The same query run uncached (caching off) and cached (a cache hit on the second call) must
+    produce byte-identical data and the SAME statement count — a hit changes WHETHER planning
+    runs, never the SQL.
+    """
+    schema = build_widgets_schema()
+    query = "query Q($s: String!) { widgets(status: $s) { id status } }"
+
+    uncached_ctx = context_class_with(GrafastConfig())  # caching off
+    cache = PlanCache()
+    cached_ctx = context_class_with(
+        GrafastConfig(placeholders=True, cache_plans=True, plan_cache=cache)
+    )
+
+    engine = get_engine()
+    with pg_request_context(SQLAlchemyExecutor(engine)):
+        with count_sql(engine) as uncached_count:
+            uncached = await graphql(
+                schema, query, variable_values={"s": "published"},
+                execution_context_class=uncached_ctx,
+            )
+    # prime the cache (miss), then the measured run is a HIT.
+    with pg_request_context(SQLAlchemyExecutor(engine)):
+        await graphql(
+            schema, query, variable_values={"s": "published"},
+            execution_context_class=cached_ctx,
+        )
+    with pg_request_context(SQLAlchemyExecutor(engine)):
+        with count_sql(engine) as cached_count:
+            cached = await graphql(
+                schema, query, variable_values={"s": "published"},
+                execution_context_class=cached_ctx,
+            )
+
+    assert uncached.errors is None and cached.errors is None
+    assert uncached.data == cached.data
+    assert cached_count.count == uncached_count.count
+    # the cached context ran twice: the first primed the cache (miss), the measured run hit it.
+    assert cache.hits == 1 and cache.misses == 1

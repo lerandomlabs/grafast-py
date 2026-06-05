@@ -50,6 +50,12 @@ from .cursor import (
 )
 from .executor import current_pg_request
 from .ordering import OrderTerm, normalize_order, order_clauses
+from .placeholders import (
+    Placeholder,
+    placeholder_source_tag,
+    rebind_pagination_value,
+    unwrap_placeholder,
+)
 from .resource import PgResource
 from .steps import as_match_columns, grouping_key, normalize_lookup_key
 
@@ -198,10 +204,10 @@ class PgConnectionStep(PgCustomizable):
         key_step: Step,
         match: Union[str, Sequence[str]],
         order_by: Sequence[Union[str, OrderTerm]],
-        first: Optional[int] = None,
-        after: Optional[str] = None,
-        last: Optional[int] = None,
-        before: Optional[str] = None,
+        first: Optional[Union[int, Placeholder]] = None,
+        after: Optional[Union[str, Placeholder]] = None,
+        last: Optional[Union[int, Placeholder]] = None,
+        before: Optional[Union[str, Placeholder]] = None,
         order_is_unique: bool = False,
         needs_total: bool = False,
         aggregates: Sequence[PgAggregate] = (),
@@ -217,9 +223,18 @@ class PgConnectionStep(PgCustomizable):
             order_by, primary_key=resource.primary_key, order_is_unique=order_is_unique
         )
         resource.assert_order_terms_stored(self.order_by)
+        # page size: a plan-time literal int/None (value-included key) OR a ``Placeholder``
+        # (variable-derived, source-keyed). The keyset page binds page_limit as a param
+        # regardless, so a placeholder changes only the dedup key — the page math unwraps it.
         self.first = first
         self.last = last
         self.needs_total = needs_total
+        # the stable source tags of a variable-derived after/before cursor (``None`` for a
+        # literal cursor). The dedup key emits these in place of the decoded cursor VALUES so
+        # a variable cursor keys value-agnostically (a cache hit across requests of the same
+        # document); the decoded values still drive the keyset SQL, bound as params as before.
+        self.after_source: Optional[str] = placeholder_source_tag(after)
+        self.before_source: Optional[str] = placeholder_source_tag(before)
         # the domain aggregates (selection-gated) and the OPTIONAL extra GROUP BY columns
         # (beyond the match key, e.g. a per-status sub-total). Stored as tuples so the spec
         # is hashable and folds straight into the dedup key; empty ``aggregates`` means no
@@ -244,14 +259,25 @@ class PgConnectionStep(PgCustomizable):
         self.reverse = reverse_arg
         # decode the cursor LOUDLY against the current order (digest-validated); a cursor
         # minted under a different ordering — or a garbage cursor — raises at plan time
-        # rather than being silently misapplied. The decoded VALUES are plan-time content
-        # that discriminate the dedup key.
+        # rather than being silently misapplied. The decoded VALUES drive the keyset SQL
+        # (bound as params). They discriminate the dedup key ONLY for a LITERAL cursor; a
+        # variable-derived cursor (a ``Placeholder``) keys off its source tag instead (see
+        # ``after_source`` / ``before_source``), so the value is unwrapped before decode.
+        after_cursor = unwrap_placeholder(after)
+        before_cursor = unwrap_placeholder(before)
         self.after_values: Optional[List[Any]] = (
-            decode_keyset_cursor(after, self.order_by) if after else None
+            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
         )
         self.before_values: Optional[List[Any]] = (
-            decode_keyset_cursor(before, self.order_by) if before else None
+            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
         )
+        # keep the raw after/before (a literal cursor str or a ``Placeholder``) so the
+        # plan-cache rebind can RE-DECODE a variable-derived cursor for the next request —
+        # the decoded ``after_values`` / ``before_values`` above carry THIS request's value,
+        # which a cache hit must replace. A literal cursor is kept verbatim (its rebind is a
+        # no-op); ``None`` when the arg was absent.
+        self.after = after
+        self.before = before
         # dep 0 is the key step; values[0] is the key column at execute time.
         self.add_dependency(key_step)
         self.seed_resource_customization(resource)
@@ -299,9 +325,37 @@ class PgConnectionStep(PgCustomizable):
         )
         self.resource.assert_order_terms_stored(self.order_by)
 
-    def set_first(self, first: Optional[int]) -> None:
-        """Set the structured per-parent forward page size."""
+    def set_first(self, first: Optional[Union[int, Placeholder]]) -> None:
+        """Set the structured per-parent forward page size (literal int or ``Placeholder``)."""
         self.first = first
+
+    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
+        """Re-point this connection's WHERE, page-size and CURSOR placeholders to a cached request.
+
+        Extends the base WHERE rebind (``super``) with the Relay pagination placeholders:
+
+        * ``first`` / ``last`` page sizes — a variable-derived size is a :class:`Placeholder`
+          re-pointed by source (a literal int is a no-op);
+        * ``after`` / ``before`` cursors — a variable-derived cursor is a :class:`Placeholder`
+          carrying the FIRST request's cursor string; the cached step decoded it into
+          ``after_values`` / ``before_values`` at build, so on a HIT we re-point the sentinel
+          AND RE-DECODE the new cursor against the current order (digest-validated, so a cursor
+          from a different ordering still fails loud). A literal cursor is left verbatim and its
+          decoded values stand — a no-op.
+        """
+        super().rebind_placeholders(values_by_source)
+        self.first = rebind_pagination_value(self.first, values_by_source)
+        self.last = rebind_pagination_value(self.last, values_by_source)
+        self.after = rebind_pagination_value(self.after, values_by_source)
+        self.before = rebind_pagination_value(self.before, values_by_source)
+        after_cursor = unwrap_placeholder(self.after)
+        before_cursor = unwrap_placeholder(self.before)
+        self.after_values = (
+            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
+        )
+        self.before_values = (
+            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
+        )
 
     # ------------------------------------------------------------------ SQL build
 
@@ -320,9 +374,19 @@ class PgConnectionStep(PgCustomizable):
             for t in self.order_by
         )
 
+    def page_size(self) -> Optional[int]:
+        """The active page size as a runtime int, unwrapping a variable-derived ``Placeholder``.
+
+        ``last`` for reverse paging, ``first`` for forward; a ``Placeholder`` yields its
+        request value. The page arithmetic (``page_limit`` / the one-extra-row probe in
+        ``build_connection``) reads THIS, so a placeholder page size pages exactly like a
+        literal — only the dedup key (which keeps the sentinel) differs.
+        """
+        return unwrap_placeholder(self.last if self.reverse else self.first)
+
     def page_limit(self) -> Optional[int]:
         """The per-partition row cap: the page size PLUS ONE extra (for hasNextPage)."""
-        size = self.last if self.reverse else self.first
+        size = self.page_size()
         return None if size is None else size + 1
 
     def cursor_predicate(self):
@@ -585,7 +649,9 @@ class PgConnectionStep(PgCustomizable):
         ``aggregateGroups``. Both are absent (``None``) when no aggregate is selected, so an
         unaggregated connection is byte-identical to before.
         """
-        size = self.last if self.reverse else self.first
+        # the active page size as a runtime int (unwrapping a variable-derived Placeholder),
+        # so the one-extra-row probe is computed against the real size.
+        size = self.page_size()
         has_extra = size is not None and len(rows) > size
         page = rows[:size] if has_extra else rows
         # reverse paging numbered from the tail; restore the requested (forward) order.
@@ -694,16 +760,34 @@ class PgConnectionStep(PgCustomizable):
 
         return run()
 
+    def cursor_key(self, source: Optional[str], values: Optional[List[Any]]) -> Any:
+        """The dedup-key component for a cursor: its SOURCE tag (variable) or its VALUES (literal).
+
+        A variable-derived cursor keys off its stable ``source`` tag (``var:after``) so two
+        requests of the same document share one key (a cache hit) while two different sources
+        never merge — and the runtime value never enters the key. A literal cursor keeps its
+        decoded VALUES (list -> tuple, hashable) so two pages differing only by a literal
+        ``after``/``before`` still get different keys, exactly as before. ``None`` (unpaged on
+        this side) keys as ``None``. The source path tags the tuple (``("var", source)``) so a
+        source string can never coincidentally collide with a same-shaped values tuple.
+        """
+        if source is not None:
+            return ("var", source)
+        return tuple(values) if values is not None else None
+
     @property
     def peer_key(self) -> str:
         # the aggregate spec + extra grouping is APPENDED last (after needs_total +
         # customization_signature), per the unified APPEND-never-insert convention, so two
         # connections differing only by which aggregates they compute (or how they group)
-        # never merge — they emit a byte-different aggregate statement.
+        # never merge — they emit a byte-different aggregate statement. first/last render
+        # their Placeholder source (not the value) when variable-derived; after/before key by
+        # source tag (variable) or decoded values (literal) via cursor_key.
         return (
             f"pg_connection|{self.resource.qualified_table}|{self.match_columns!r}"
             f"|{self.order_by!r}|{self.first}|{self.last}"
-            f"|{self.after_values!r}|{self.before_values!r}|{self.needs_total}"
+            f"|{self.cursor_key(self.after_source, self.after_values)!r}"
+            f"|{self.cursor_key(self.before_source, self.before_values)!r}|{self.needs_total}"
             f"|{self.customization_signature()!r}"
             f"|{self.aggregate_spec()!r}|{self.aggregate_group_by!r}"
         )
@@ -715,11 +799,11 @@ class PgConnectionStep(PgCustomizable):
             self.order_by,
             self.first,
             self.last,
-            # decoded cursor VALUES are plan-time content, so they discriminate the key
-            # (two pages differing only by `after`/`before` must not merge); list ->
-            # tuple to stay hashable in the dedup tuple.
-            tuple(self.after_values) if self.after_values is not None else None,
-            tuple(self.before_values) if self.before_values is not None else None,
+            # the cursor key component: a variable cursor's stable source tag (value-agnostic,
+            # so a cache hit across requests of the same document) or a literal cursor's
+            # decoded VALUES (so two pages differing only by `after`/`before` never merge).
+            self.cursor_key(self.after_source, self.after_values),
+            self.cursor_key(self.before_source, self.before_values),
             self.needs_total,
             self.customization_signature(),
             # the aggregate spec + extra grouping fold in last (APPEND, never insert): the
@@ -749,10 +833,10 @@ def connection(
     key_step: Step,
     match: Union[str, Sequence[str]],
     order_by: Sequence[Union[str, OrderTerm]],
-    first: Optional[int] = None,
-    after: Optional[str] = None,
-    last: Optional[int] = None,
-    before: Optional[str] = None,
+    first: Optional[Union[int, Placeholder]] = None,
+    after: Optional[Union[str, Placeholder]] = None,
+    last: Optional[Union[int, Placeholder]] = None,
+    before: Optional[Union[str, Placeholder]] = None,
     order_is_unique: bool = False,
     needs_total: bool = False,
     aggregates: Sequence[PgAggregate] = (),

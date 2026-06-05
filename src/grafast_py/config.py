@@ -120,6 +120,43 @@ class GrafastConfig:
         is a PLAN-LEVEL constant (one operation = one decision): like ``shared_txn`` it
         MUST NOT enter a non-inlined step's peer_key / dedup_params (it never changes
         the SQL text such a step emits). ``False`` = no inlining.
+    cache_plans
+        Cross-request plan caching: when ON, ``plan_operation`` caches the finalized plan
+        tree keyed by (schema identity, document text, operation name, variable-arg
+        fingerprint) and reuses it across requests of the same document, skipping plan
+        construction on a hit. A cache hit re-binds placeholder values from THIS request's
+        variables at execute time, so the cached SQL is value-agnostic and shared safely.
+        It is a pure optimization: caching changes only WHETHER planning re-runs, never the
+        SQL text or the result data — the first request of a document still plans normally,
+        and a cached plan only ever holds value-INDEPENDENT SQL (every SQL-affecting variable
+        value is either a same-every-request literal or a value-agnostic placeholder), so a
+        plan that inlined a per-request variable as a literal is never cached for reuse. Like
+        ``inline_relations`` this is a PLAN-LEVEL constant read once via
+        ``type(context).grafast_config`` and stashed on the plan. ``False`` (default) ships it
+        dark — ``plan_operation`` never reads or writes the cache, so every operation plans
+        per-request exactly as before and the executed result is byte-identical to a build
+        without this flag. ``False`` = no plan caching. The cache instance is
+        ``plan_cache`` (below) — left ``None`` a process-global bounded cache is used.
+    plan_cache
+        The bounded-LRU :class:`~grafast_py.cache.PlanCache` the operation reads/writes when
+        ``cache_plans`` is on. ``None`` (default) uses the process-global
+        :func:`~grafast_py.cache.default_cache` (one shared bounded cache for the process); a
+        host wanting its own bound, or an inspectable instance, sets
+        ``plan_cache=PlanCache(max_entries=...)``. Inert when ``cache_plans`` is off.
+    placeholders
+        Per-argument variable provenance for value-agnostic predicates: when ON,
+        ``plan_operation`` computes which field arguments originated from a GraphQL
+        ``$variable`` (by walking the field AST) and threads that provenance into
+        ``FieldArgs`` so a host plan resolver can ask ``field_args.is_variable("status")`` and,
+        for a variable-derived value, build a value-agnostic pg placeholder (``pg_placeholder``)
+        instead of inlining the literal. A placeholder predicate dedups by its SOURCE identity
+        (the variable name), NEVER by the runtime value — so two requests of the same document
+        share one plan while two DIFFERENT variable sources (or a placeholder vs a coincidentally
+        equal inlined literal) never merge. This is the enabling surface for ``cache_plans``: only
+        value-agnostic (placeholder-bearing) plans are cacheable across values. ``False`` (default)
+        ships it dark — ``FieldArgs.variable_args`` is empty, ``is_variable`` is always False, every
+        host falls back to literal inlining, and dedup/keys are byte-identical to a build without
+        this flag. ``False`` = no provenance, literal inlining only.
 
     Tracing hooks (no-ops by default)
     ---------------------------------
@@ -140,6 +177,15 @@ class GrafastConfig:
     max_step_concurrency: Optional[int] = None
 
     inline_relations: bool = False
+    cache_plans: bool = False
+    placeholders: bool = False
+
+    # the bounded-LRU plan cache the operation reads/writes when ``cache_plans`` is on. Left
+    # ``None`` (the default), the process-global ``cache.default_cache()`` is used so every
+    # cache_plans-on operation shares one bounded cache; a host wanting its own bound or an
+    # inspectable instance sets ``plan_cache=PlanCache(max_entries=...)``. Inert when
+    # ``cache_plans`` is off (never consulted), so the default config is byte-identical.
+    plan_cache: Optional[Any] = None
 
     on_operation: Callable[..., Optional[Any]] = field(default=_noop_span)
     on_plan: Callable[..., Optional[Any]] = field(default=_noop_span)

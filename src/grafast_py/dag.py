@@ -35,6 +35,25 @@ class Plan:
         # built without a config (e.g. unit tests) never inlines — the Wave 3a no-op
         # invariant holds: every step's `optimize` short-circuits to identity.
         self.inline_relations: bool = False
+        # plan-level placeholder/caching decisions (one operation = one decision each),
+        # the `GrafastConfig.placeholders` / `cache_plans` flags stashed here by
+        # `plan_operation` (mirroring `inline_relations`) so the planner reads one
+        # constant instead of plumbing the whole execution context. `placeholders` gates
+        # whether the planner computes per-argument variable provenance and threads it
+        # into `FieldArgs`; `cache_plans` gates the cross-request plan cache. Both default
+        # `False` so a `Plan` built without a config (e.g. unit tests) ships dark — no
+        # provenance is computed and nothing is cached, byte-identical to pre-Wave-4.
+        self.placeholders: bool = False
+        self.cache_plans: bool = False
+        # whether this finalized plan is VALUE-INDEPENDENT and so safe to cache across
+        # requests of the same document. Defaults True; the planner flips it False when a
+        # GraphQL `$variable` value was INLINED as a plan-time literal (the value is baked
+        # into the SQL text, so the plan is value-specific and reusing it across requests
+        # would serve the wrong value). A value-agnostic plan — every SQL-affecting variable
+        # value is either a same-every-request literal or a source-tagged placeholder — stays
+        # True and may be cached. Only consulted when `cache_plans` is on (default-off => the
+        # cache is never read/written, so the flag is inert and the path is byte-identical).
+        self.cacheable: bool = True
         # SIDE replacements an `optimize` hook records beyond the one step it returns.
         # A `Step.optimize` rewrites only ITSELF (its return value), but a DEPENDENT-
         # absorbing optimizer (the LATERAL inliner) must ALSO rewrite the children it
