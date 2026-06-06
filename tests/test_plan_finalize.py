@@ -7,9 +7,9 @@ the root. `collect_consumption_root_steps` walks the finalized ObjectPlan tree t
 executor's consumption surface (every `FieldPlan.step` + each `ObjectPlan.parent_step`,
 across transitively nested child plans) that tree-shake measures reachability against.
 
-With the shipped default identity `Step.optimize`, the whole finalize is a no-op: the
-result of `plan_operation` is the same ObjectPlan with the same step DAG it produced
-before this wave, which is what keeps the conformance suite byte-identical.
+With the default identity `Step.optimize`, the whole finalize is a no-op: the result of
+`plan_operation` is the same ObjectPlan with the same step DAG, which is what keeps the
+conformance suite byte-identical.
 """
 
 from graphql import parse

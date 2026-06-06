@@ -1,26 +1,27 @@
-"""Step-9 suite oracle: the EXISTING pg suite, run with inlining ON, is byte-identical.
+"""Suite-wide inlining oracle: the whole pg suite, run with inlining ON, is byte-identical.
 
-Wave 3b inlining is an OPPORTUNISTIC, EQUIVALENCE-PRESERVING optimization: for ANY
+Relation inlining is an OPPORTUNISTIC, EQUIVALENCE-PRESERVING optimization: for ANY
 operation the inlined result must be BYTE-IDENTICAL to the batched ``= ANY($1)`` baseline.
-The broadest possible oracle for that claim is the WHOLE existing pg suite — every one of
-those tests already asserts EXACT result data — re-run with the flag forced on. The CI job
-``inline-on`` does exactly that by setting ``GRAFAST_INLINE_RELATIONS=1``, which the autouse
-``inline_relations_suite_toggle`` fixture in ``tests/conftest.py`` honours by flipping the
-base :class:`GrafastExecutionContext`'s config to ``inline_relations=True`` for the run.
+The broadest possible oracle for that claim is the WHOLE pg suite — every one of those tests
+already asserts EXACT result data — re-run with the flag forced on. Setting
+``GRAFAST_INLINE_RELATIONS=1`` does exactly that: the autouse ``inline_relations_suite_toggle``
+fixture in ``tests/conftest.py`` honours it by flipping the base
+:class:`GrafastExecutionContext`'s config to ``inline_relations=True`` for the run.
 
-This module is the dedicated, always-on companion to that CI job. It does two things:
+This module is the dedicated, always-on companion to that suite-wide oracle. It does two
+things:
 
-1. META — it proves the CI switch MECHANISM works: the autouse fixture is a no-op by default
-   (so a plain ``uv run pytest`` and the conformance run are untouched), and flips the base
-   config on under the env var. This is what lets a single CI job turn the entire suite into
-   an inlining oracle.
+1. META — it proves the suite-wide switch MECHANISM works: the autouse fixture is a no-op by
+   default (so a plain ``uv run pytest`` and the conformance run are untouched), and flips the
+   base config on under the env var. This is what lets a single suite run turn the entire
+   suite into an inlining oracle.
 
-2. DATA ORACLE — it runs a matrix of operations drawn from across the existing pg suite
-   (including the model-DERIVED resource path and the deep O(depth) datasource query that the
+2. DATA ORACLE — it runs a matrix of operations drawn from across the pg suite (including the
+   model-DERIVED resource path and the deep O(depth) datasource query that the
    count-characterization tests pin to the batched baseline) TWICE, once batched and once
    inlined, asserting (a) ``result.data`` / ``result.errors`` are byte-identical and (b) the
    inlined run issues STRICTLY FEWER statements where a fold is expected — so the DATA of the
-   ``inline_off``-pinned count tests is still proven equivalent under inlining here, even
+   count tests pinned to inlining-off is still proven equivalent under inlining here, even
    though those tests themselves stay on the batched path to keep their count assertion exact.
 
 Marked ``pg`` (DB-backed) and touches ONLY the ``grafast_demo`` schema of
@@ -51,7 +52,7 @@ def context_class(inline: bool):
     A SUBCLASS (not a mutation of the base) so this module's explicit batched-vs-inlined
     comparison is independent of the suite-wide ``GRAFAST_INLINE_RELATIONS`` switch: the
     subclass attribute shadows whatever the autouse fixture did to the base class, so each
-    case here always runs BOTH flag states regardless of how CI invoked the suite.
+    case here always runs BOTH flag states regardless of how the suite was invoked.
     """
 
     class _Ctx(GrafastExecutionContext):
@@ -99,14 +100,14 @@ async def assert_inlined_equivalent(schema, query, *, min_saving: int, variables
     return batched, batched_count, inlined_count
 
 
-# ============================================================ META: the CI switch mechanism
+# ============================================================ META: the suite-toggle mechanism
 
-# the shipped default config is OFF — inlining ships dark, so a plain run and the conformance
-# run (which never sets the env var) are untouched. This is a property of the SHIPPED default,
-# independent of whatever the autouse suite-toggle did to the base class under a CI inline-on
+# the default config is OFF — inlining is off by default, so a plain run and the conformance
+# run (which never sets the env var) are untouched. This is a property of the default config,
+# independent of whatever the autouse suite-toggle did to the base class under an inline-on
 # run, so it holds in both run modes.
 def test_default_config_ships_inlining_off():
-    """The shipped ``DEFAULT_CONFIG`` has inlining OFF — the dark-ship guarantee."""
+    """The default ``DEFAULT_CONFIG`` has inlining OFF — the off-by-default guarantee."""
     assert DEFAULT_CONFIG.inline_relations is False
 
 
@@ -118,19 +119,19 @@ def test_default_config_ships_inlining_off():
         ("0", False),
         ("false", False),
         ("False", False),
-        ("1", True),  # any truthy value arms the suite-wide inline-on switch
+        ("1", True),  # any truthy value arms the suite-wide inline-on switch (off by default)
         ("true", True),
         ("True", True),
         ("yes", True),
     ],
 )
 def test_inline_switch_reads_env(monkeypatch, value, expected):
-    """``inline_relations_enabled`` (the CI switch predicate) is driven purely by the env var.
+    """``inline_relations_enabled`` (the suite-toggle predicate) is driven purely by the env var.
 
     This is the gate the autouse ``inline_relations_suite_toggle`` reads: unset/falsey leaves
-    the suite on the batched baseline (dark ship), any truthy value flips the whole suite to
-    inline-on. Testing the predicate directly keeps the META check independent of the ambient
-    base-config the autouse fixture legitimately mutates under a CI inline-on run.
+    the suite on the batched baseline (off by default), any truthy value flips the whole suite
+    to inline-on. Testing the predicate directly keeps the META check independent of the ambient
+    base-config the autouse fixture legitimately mutates under an inline-on run.
     """
     if value is None:
         monkeypatch.delenv("GRAFAST_INLINE_RELATIONS", raising=False)
@@ -155,8 +156,8 @@ async def model_demo_schema():
 
     Mirrors ``tests/test_from_sqlalchemy.py``: a registry derived from the SQLAlchemy models
     feeds ``build_demo_schema``, so inlining is exercised over model-derived resources, not
-    only hand-declared ones. The count-characterization test for this path is pinned
-    ``inline_off``; this fixture lets us prove its DATA is byte-identical under inlining here.
+    only hand-declared ones. The count-characterization test for this path is pinned to
+    inlining-off; this fixture lets us prove its DATA is byte-identical under inlining here.
     """
     await dispose_engine()
     await setup_demo_schema()
@@ -166,9 +167,9 @@ async def model_demo_schema():
     await dispose_engine()
 
 
-# the broad oracle matrix: operations drawn from across the existing pg suite that the
-# inline_off-pinned count tests assert, plus the standard fold/skip shapes. ``min_saving`` is
-# the minimum number of folds that must fire (0 = a pure-SKIP shape that must stay identical).
+# the broad oracle matrix: operations drawn from across the pg suite that the count tests
+# pinned to inlining-off assert, plus the standard fold/skip shapes. ``min_saving`` is the
+# minimum number of folds that must fire (0 = a pure-SKIP shape that must stay identical).
 SUITE_MATRIX = [
     # from test_pg_datasource / test_pg_settings / test_bench_nplus1 — the deep O(depth) query
     # those tests pin to the batched baseline; here we prove its DATA is identical inlined.
@@ -196,9 +197,9 @@ SUITE_MATRIX = [
     ids=[name for name, _q, _s in SUITE_MATRIX],
 )
 async def test_suite_queries_byte_identical_under_toggle(demo_schema, query, min_saving):
-    """Every existing-suite shape is byte-identical inlined vs batched (the broad oracle).
+    """Every suite shape is byte-identical inlined vs batched (the broad oracle).
 
-    These are the exact operations the ``inline_off``-pinned count tests assert. They pin
+    These are the exact operations the inlining-off-pinned count tests assert. They pin
     OFF to keep their count assertion exact; this oracle proves their DATA is unchanged when
     inlining is on — closing the loop so nothing the suite asserts is left unproven inlined.
     """
@@ -209,7 +210,7 @@ async def test_suite_queries_byte_identical_under_toggle(demo_schema, query, min
 async def test_model_derived_deep_query_byte_identical_under_toggle(model_demo_schema):
     """The model-DERIVED schema's deep query is byte-identical inlined vs batched.
 
-    ``test_from_sqlalchemy``'s O(depth) parity gate is pinned ``inline_off`` (it asserts the
+    ``test_from_sqlalchemy``'s O(depth) parity gate is pinned to inlining-off (it asserts the
     exact batched count). Inlining operates on the same ``PgSelectStep`` / ``PgSelectSingleStep``
     regardless of how the resource was built, so this proves the model-derived construction
     path folds to byte-identical data — the only construction path the demo matrix above did

@@ -1,12 +1,12 @@
 """Cross-request plan cache: a bounded-LRU process cache of finalized plans.
 
-Planning is per-request today (``plan.plan_operation`` builds the ObjectPlan tree + the
-step DAG fresh every request and stashes them on the context). When two requests run the
-SAME document, the plan they produce is identical EXCEPT for the per-request values that
-plan-time inlining baked into the SQL — and once the host expresses those values as
-value-agnostic PLACEHOLDERS (Wave 4), the plan is value-INDEPENDENT and reusable: the
-cached SQL is shared and only the bound VALUES are re-pointed per request. This module is
-that reuse layer.
+Planning is per-request by default (``plan.plan_operation`` builds the ObjectPlan tree +
+the step DAG fresh every request and stashes them on the context). When two requests run
+the SAME document, the plan they produce is identical EXCEPT for the per-request values
+that plan-time inlining baked into the SQL — and when those values are expressed as
+value-agnostic PLACEHOLDERS, the plan is value-INDEPENDENT and reusable: the cached SQL is
+shared and only the bound VALUES are re-pointed per request. This module is that reuse
+layer.
 
 Design (sqlalchemy-free — the core engine never imports the pg stack)
 ---------------------------------------------------------------------
@@ -58,15 +58,15 @@ each step's :meth:`~grafast_py.step_model.Step.rebind_placeholders` hook (a no-o
 non-placeholder steps). The dedup key is value-agnostic, so the SQL is shared; only the bound
 values move. The per-request COPY is what keeps the cache immutable and CONCURRENCY-SAFE: two
 requests of the same document with DIFFERENT variables each rebind+execute their OWN copy, so
-one can never observe the other's bound value (the cross-request value-bleed the shared-mutation
-design risked). The shared cached entry is never mutated, so no request-level serialization is
-needed.
+one can never observe the other's bound value (the cross-request value-bleed a shared-mutation
+approach would risk). The shared cached entry is never mutated, so no request-level
+serialization is needed.
 
 EVICTION. A bounded LRU (``max_entries``, default 1000) evicts the least-recently-used
 entry so an adversarial stream of unique documents cannot grow the cache without bound.
 
 OPT-IN. The cache is consulted ONLY when ``GrafastConfig.cache_plans`` is on; the default
-(off) never touches it, so the engine plans per-request exactly as before — byte-identical.
+(off) never touches it, so the engine plans per-request and produces byte-identical output.
 """
 
 import copy
