@@ -22,11 +22,22 @@ This module provides three attachment surfaces:
 
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from graphql import GraphQLField, GraphQLObjectType, GraphQLSchema
+from graphql import (
+    GraphQLAbstractType,
+    GraphQLField,
+    GraphQLObjectType,
+    GraphQLSchema,
+)
 from graphql.utilities import build_schema
 
 # the plan-resolver callable signature: ($parent_step, field_args, info) -> Step
 PlanResolver = Callable[..., Any]
+
+# the resolve_type bridge signature graphql-core's completion calls per value:
+# (value, info, abstract_type) -> the runtime concrete object type NAME (a str), the
+# value being a plain row dict here. graphql-core validates that name against the
+# schema's possible types, so an unknown/non-member name fails loud at completion.
+TypeResolver = Callable[..., Optional[str]]
 
 
 class FieldArgs:
@@ -109,18 +120,101 @@ def attach_plans(schema: GraphQLSchema, plans: PlanMap) -> GraphQLSchema:
     return schema
 
 
+def resolve_type_from_discriminator(
+    column: str, mapping: Mapping[Any, str]
+) -> TypeResolver:
+    """A resolve_type bridge that maps a row's discriminator column to a typename.
+
+    ``column`` is the key on the (row dict) value carrying the discriminator — e.g. a
+    ``kind`` column holding ``"image"`` / ``"video"`` — and ``mapping`` maps each raw
+    discriminator value to the GraphQL concrete type NAME (``{"image": "Image"}``). The
+    returned callable has the ``(value, info, abstract_type)`` signature graphql-core's
+    completion calls; it reads ``value[column]`` and returns the mapped typename.
+
+    An unmapped discriminator value fails loud (``KeyError``) rather than returning
+    ``None`` and bubbling a generic "must resolve to an Object type" error far from the
+    cause — a value the host did not enumerate is a wiring bug. Reads nothing but dict
+    keys, so this module stays free of any pg/sqlalchemy dependency.
+    """
+
+    def resolve_type(value: Any, info: Any, abstract_type: Any) -> str:
+        discriminator = value[column]
+        try:
+            return mapping[discriminator]
+        except KeyError:
+            raise KeyError(
+                f"discriminator value {discriminator!r} (column {column!r}) is not in "
+                f"the type mapping {sorted(map(repr, mapping))}"
+            ) from None
+
+    return resolve_type
+
+
+def resolve_type_from_tag(column: str) -> TypeResolver:
+    """A resolve_type bridge that reads the concrete typename DIRECTLY off a tag column.
+
+    For the common pgUnionAll shape where each member branch already tags its rows with
+    its own GraphQL typename (a ``__typename`` / ``type`` column built into the union
+    SQL), so no separate value->name mapping is needed: ``value[column]`` IS the
+    typename. graphql-core then validates that name against the abstract type's possible
+    types, so a bogus tag still fails loud at completion. Reads only dict keys.
+    """
+
+    def resolve_type(value: Any, info: Any, abstract_type: Any) -> str:
+        return value[column]
+
+    return resolve_type
+
+
+TypeResolverMap = Mapping[str, TypeResolver]
+
+
+def attach_type_resolvers(
+    schema: GraphQLSchema, type_resolvers: TypeResolverMap
+) -> GraphQLSchema:
+    """Wire each ``{abstract_type_name: bridge}`` onto that type's ``resolve_type``.
+
+    The completion engine reads ``abstract_type.resolve_type`` first (falling back to the
+    context ``type_resolver``), so attaching the bridge here is all the wiring a
+    Postgres-backed interface/union needs — the existing completion-time abstract
+    dispatch does the per-concrete-type grouping and sub-selection planning unchanged.
+
+    Mirrors :func:`attach_plans`'s fail-loud style: a name that is not an abstract
+    (interface/union) type in the schema raises ``KeyError`` rather than silently
+    no-op'ing, so a typo surfaces immediately.
+    """
+    for type_name, bridge in type_resolvers.items():
+        type_ = schema.type_map.get(type_name)
+        if not isinstance(type_, GraphQLAbstractType):
+            raise KeyError(
+                f"type_resolvers references type {type_name!r} which is not an "
+                "interface or union type in the schema"
+            )
+        type_.resolve_type = bridge
+    return schema
+
+
 def make_grafast_schema(
-    type_defs: str, plans: Optional[PlanMap] = None
+    type_defs: str,
+    plans: Optional[PlanMap] = None,
+    type_resolvers: Optional[TypeResolverMap] = None,
 ) -> GraphQLSchema:
     """Build a schema from SDL and attach plan resolvers from a plan map.
 
     ``type_defs`` is GraphQL SDL; ``plans`` is ``{"Type": {"field": plan}}``. The
     result is a plain ``GraphQLSchema`` whose plan fields carry their resolver in
     ``extensions['grafast']['plan']`` — ready for the planner to pick up.
+
+    ``type_resolvers`` is the optional ``{abstract_type_name: bridge}`` map for
+    Postgres-backed interfaces/unions: each bridge is wired onto the abstract type's
+    ``resolve_type`` so completion-time dispatch resolves each row's concrete type. Left
+    ``None`` (the default) the signature is unchanged for existing callers.
     """
     schema = build_schema(type_defs)
     if plans:
         attach_plans(schema, plans)
+    if type_resolvers:
+        attach_type_resolvers(schema, type_resolvers)
     return schema
 
 
@@ -147,4 +241,9 @@ __all__ = [
     "attach_plans",
     "make_grafast_schema",
     "GrafastSchemaBindable",
+    # resolve_type bridges for Postgres-backed interfaces/unions (completion-time dispatch)
+    "TypeResolver",
+    "resolve_type_from_discriminator",
+    "resolve_type_from_tag",
+    "attach_type_resolvers",
 ]

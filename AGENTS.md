@@ -18,9 +18,14 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        load_one, load_many, RootStep
   dag.py               step-DAG ordering + cross-step deduplication
   execute.py           bucket executor (batched layer-by-layer; serial mutation path)
-  completion.py        wrapping-type completers (leaf/object/list/non-null/abstract) + null-bubbling
+  completion.py        wrapping-type completers (leaf/object/list/non-null/abstract) + null-bubbling;
+                       abstract dispatch groups values by concrete type and plans each group as a
+                       self-contained step subtree (its own RootStep), so pg interfaces/unions ride
+                       the normal object-field machinery (no plan-time polymorphism)
   bubble.py            null-bubble sentinel
-  schema.py            plan-resolver API: set_field_plan, make_grafast_schema, FieldArgs
+  schema.py            plan-resolver API: set_field_plan, make_grafast_schema, FieldArgs;
+                       resolve_type bridges for pg interfaces/unions (resolve_type_from_discriminator /
+                       resolve_type_from_tag, attach_type_resolvers) — host wiring, no pg import
   config.py            GrafastConfig (execution timeout, concurrency, logging, tracing) + error class
                        (query cost/depth limiting is a validation-layer concern, not here)
   pg/                  Postgres data source — the optional `[pg]` extra (SQLAlchemy/asyncpg):
@@ -28,6 +33,9 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                          single- OR composite-column match keys; decode_row/decode_value),
                        steps.py (pg_select / pg_select_single / PgSelectAllStep, batched = ANY($1)
                          / composite tuple-IN),
+                       union.py (pgUnionAll: keyset Relay connection over N member tables via
+                         UNION ALL — NULL-padded shared projection + __typename tag, root + per-parent
+                         modes; the cross-table polymorphism shape),
                        connection.py (keyset Relay connection: forward+reverse, separate totalCount,
                          connection aggregates sum/avg/min/max/count(distinct) + GROUP BY),
                        cursor.py (keyset/seek cursors + the NULL-aware keyset WHERE comparator),
@@ -42,7 +50,7 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                          opt-in shared_txn REPEATABLE READ mode),
                        from_sqlalchemy.py (derive PgResource descriptors from ORM models).
                        Deferred: runtime from_step placeholders + plan caching, query inlining/LATERAL,
-                       Postgres-backed interfaces/unions (polymorphism), HAVING on aggregates.
+                       HAVING on aggregates.
 
 tests/                 our own pytest suite (fast, pure-Python; run in CI)
 tests/differential/    parity vs reference Node Grafast (on-demand; needs Node) — see its README

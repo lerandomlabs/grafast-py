@@ -132,6 +132,14 @@ That O(depth) batching property holds across the full feature set:
   list-transform steps (core, source-agnostic — no SQLAlchemy).
 - **CRUD mutations** — `pg_insert_single` / `pg_update_single` / `pg_delete_single` on
   the serial mutation seam, fully param-bound, `RETURNING` a projectable row.
+- **GraphQL interfaces / unions over Postgres** — two flavours, both resolved at
+  **completion time** (see below): **single-table inheritance**, where one table's rows
+  carry a discriminator column and a `resolve_type` bridge maps that column to the concrete
+  type (`resolve_type_from_discriminator("kind", {...})`); and **cross-table `pgUnionAll`**,
+  where the concrete types live in separate tables and one batched `UNION ALL` (a shared
+  NULL-padded projection + a `__typename` tag per branch, `resolve_type_from_tag`) fetches
+  all members, keyset-paged as a Relay connection (forward + reverse, separate `totalCount`)
+  — at most **two** statements per union layer regardless of member count.
 - **Per-request `pgSettings` / RLS** and **bring-your-own-pool** (the production path) —
   see below.
 
@@ -155,6 +163,29 @@ uv run python examples/pg_blog.py
 
 `grafast_py.pg` is the canonical import path for the data source; the most-used
 symbols are also re-exported at the top level for convenience.
+
+### Interfaces / unions: the completion-time-dispatch model
+
+Polymorphism is **not** a plan-time bucket system. The engine already dispatches
+interfaces and unions at **completion** time: for an abstract field it resolves each
+value's concrete type (via the abstract type's `resolve_type`, falling back to a
+context `type_resolver`), **groups** the values by concrete type, and for each group
+plans + executes that concrete type's sub-selection exactly like a normal object field.
+So a Postgres-backed interface/union is just **(a)** a pg step/field that produces
+type-tagged **row values** (the discriminator column, or the `pgUnionAll` `__typename`
+tag), and **(b)** a `resolve_type(row, info, abstract_type) -> typename` bridge wired
+onto the abstract type. Each concrete-type group becomes its own batched bucket, so a
+member's type-specific fields **and its nested pg relations batch per concrete-type
+group** — with no plan-time polymorphism. The only engine support this needs is that the
+per-concrete-type child plan is built as a **self-contained step subtree** (its own
+`RootStep`, deduplicated and remapped, mirroring the operation root) so plan-resolver
+subfields under an abstract type actually plan into steps; that one minimal change lives
+in the completion dispatch and leaves graphql-core's interface/union conformance green.
+
+Wire the bridges with `make_grafast_schema(SDL, plans, type_resolvers={...})` (or
+`attach_type_resolvers`); a name that is not an abstract type fails loud, mirroring
+`attach_plans`. Runnable: [`examples/poly_demo.py`](examples/poly_demo.py) (single-table
+discriminator + cross-table `pgUnionAll`, on the `grafast_demo` scratch DB).
 
 ### Define resources from your SQLAlchemy models
 
@@ -315,15 +346,18 @@ in this engine — do it in your validation layer (see above).
 
 **Deferred in the `grafast_py.pg` data source**: runtime `from_step` placeholders (a
 relation's match value comes from the parent row's column, not an arbitrary upstream step;
-filter values inline at plan time) and the **plan caching** that builds on them; query
+filter values inline at plan time) and the **plan caching** that builds on them; and query
 inlining / `LATERAL` (each resource layer is its own batched `= ANY($1)` round-trip, not
-folded into the parent's query); and GraphQL **interfaces / unions** backed by Postgres
-(column-discriminator single-table inheritance / cross-table `UNION ALL`). `HAVING` on
-aggregates is not yet exposed.
+folded into the parent's query). `HAVING` on aggregates is not yet exposed.
 
 Previously deferred, now built: multi-column (composite) relation keys, the
-single-shared-request-transaction mode, connection `GROUP BY` / aggregates, and a codec
-type library (recursive arrays / ranges / enums / composites).
+single-shared-request-transaction mode, connection `GROUP BY` / aggregates, a codec
+type library (recursive arrays / ranges / enums / composites), and GraphQL **interfaces /
+unions** backed by Postgres — column-discriminator single-table inheritance (a `resolve_type`
+bridge on the discriminator column) and cross-table `UNION ALL` (`pgUnionAll`: a keyset-paged
+Relay connection over N member tables, each tagged with its concrete type). Both compose with
+the engine's completion-time abstract dispatch, so a concrete type's nested relations batch
+per concrete-type group with no plan-time polymorphism.
 
 ## More
 
