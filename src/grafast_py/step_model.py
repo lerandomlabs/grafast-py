@@ -17,7 +17,10 @@ single place steps are run.
 """
 
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from .dag import Plan
 
 
 class Step:
@@ -93,8 +96,16 @@ class Step:
     def deduplicated_with(self, winner: "Step") -> None:
         """Called on the losing step when merged into `winner` (default: no-op)."""
 
-    def optimize(self) -> "Step":
-        """Inline / simplify; return `self` to keep or a replacement step."""
+    def optimize(self, plan: "Plan") -> "Step":
+        """Self-rewrite during the optimize pass: return `self` to keep, or a
+        replacement `Step` to be wired in for `self`. Default: identity.
+
+        Passed the owning `Plan` so a dependent-absorbing optimizer (the future
+        query-inlining step) can find ITS dependents via `plan.dependents_of(self)`
+        and register a freshly built replacement step. A replacement returned here is
+        re-wired into the DAG by the pass; per the class contract above, an optimizer
+        must NOT stash `Step` references for execute time — only dependency indices.
+        """
         return self
 
     def finalize(self) -> None:

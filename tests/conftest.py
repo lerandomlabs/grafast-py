@@ -12,7 +12,6 @@ import os
 import sys
 from pathlib import Path
 
-import pytest
 
 # repo root (parent of tests/) on sys.path so `import examples.*` resolves.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

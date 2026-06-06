@@ -31,10 +31,9 @@ constructs its own connection URL; all DDL/DML is confined to ``grafast_demo``.
 
 import asyncio
 import os
-import statistics
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from graphql import GraphQLSchema, graphql
 from sqlalchemy import text

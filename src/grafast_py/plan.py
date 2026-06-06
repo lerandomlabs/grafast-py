@@ -27,7 +27,7 @@ from .completion import (
     build_completer,
     find_object_completer,
 )
-from .dag import Plan
+from .dag import Plan, _compose_remaps, order_steps
 from .schema import FieldArgs, get_field_plan
 from .step_model import Step
 
@@ -67,14 +67,21 @@ class ObjectPlan(NamedTuple):
     objects (the operation `RootStep` at the root; an enclosing plan field's step for
     a nested object; `None` for a bucket reached purely under legacy resolver fields,
     where no plan-resolver steps run). The executor seeds `parent_step.id` with the
-    live parents and runs this bucket's plan-field steps from there. `step_ids` are
-    those plan-field step ids — kept so abstract / re-planned child buckets that share
-    no plan steps stay a no-op.
+    live parents and runs this bucket's plan-field steps from there.
+
+    `effect_steps` are side-effecting steps (`dedupable=False`, e.g. a pg mutation)
+    that this bucket must run FOR EFFECT even though no `FieldPlan.step` consumes
+    them — the case where an optimizer absorbed a mutation's return value (inlined it)
+    and orphaned the write. tree-shake force-keeps such a step in the plan DAG, but the
+    executor only runs steps reachable from `fields`, so the orphan needs a run target;
+    `effect_steps` IS that target. With the default identity optimize nothing is ever
+    orphaned, so this list is always empty and the executor path is byte-identical.
     """
 
     parent_type: GraphQLObjectType
     fields: List[FieldPlan]
     parent_step: Optional[Step] = None
+    effect_steps: List[Step] = []
 
 
 def plan_object(
@@ -203,12 +210,157 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
         context, root_type, root_fields, parent_step=root_step, plan=plan
     )
 
-    remap = plan.deduplicate()
-    object_plan = remap_object_plan(object_plan, remap)
+    object_plan = finalize_plan(plan, object_plan)
 
     context._grafast_plan = plan
     context._grafast_root_step = root_step
     return object_plan
+
+
+def finalize_plan(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:
+    """Optimize → dedup → tree-shake the plan, then remap the ObjectPlan to survivors.
+
+    The single finalize path shared by the operation root (`plan_operation`) and every
+    abstract/object child subtree (`completion.abstract_child_plan`), so abstract
+    subtrees optimize identically to the operation root.
+
+    Order, with reasons:
+      * `optimize` FIRST — its rewrites may produce structurally identical steps, which
+        dedup then merges; running dedup first would not see them.
+      * `deduplicate` SECOND — operates on the post-rewrite DAG (it fixpoints internally).
+      * `tree_shake` LAST — an absorbed dependent can leave its old dependency unconsumed;
+        only after optimize+dedup is the consumed set final, so shaking last drops exactly
+        the now-orphaned, non-side-effecting steps and nothing a later pass still needed.
+
+    The two remaps are composed so the ObjectPlan tree is rewritten to its FINAL survivor
+    in one `remap_object_plan` pass. Consumption roots are collected from the *remapped*
+    tree (post-survivor) so tree-shake measures reachability against the steps the
+    executor will actually consume.
+
+    With the shipped default identity `Step.optimize`, `optimize` returns an empty remap,
+    `deduplicate` behaves exactly as before, every step stays reachable from a
+    `FieldPlan.step`, and tree-shake keeps everything — a byte-identical no-op.
+    """
+    opt_remap = plan.optimize()
+    dedup_remap = plan.deduplicate()
+    remap = _compose_remaps(opt_remap, dedup_remap)
+    object_plan = remap_object_plan(object_plan, remap)
+    roots = collect_consumption_root_steps(object_plan)
+    orphaned_effects = plan.tree_shake(roots)
+    if orphaned_effects:
+        object_plan = attach_effect_steps(object_plan, orphaned_effects)
+    return object_plan
+
+
+def collect_consumption_root_steps(object_plan: ObjectPlan) -> List[Step]:
+    """Collect every step the executor consumes from a finalized ObjectPlan tree.
+
+    The executor derives each bucket's run targets from `fp.step for fp in plan.fields`
+    and seeds the bucket's `parent_step`; the union of all (transitively nested) buckets'
+    targets and boundaries IS the plan's consumption surface. This walks the tree exactly
+    as `remap_object_plan` does — recursing into child plans via `find_object_completer`
+    — and returns the consumed steps (deduplicated by id) for `Plan.tree_shake`.
+    """
+    seen: Dict[int, Step] = {}
+
+    def visit(op: ObjectPlan) -> None:
+        if op.parent_step is not None:
+            seen[op.parent_step.id] = op.parent_step
+        for fp in op.fields:
+            if fp.step is not None:
+                seen[fp.step.id] = fp.step
+            child = find_object_completer(fp.completer)
+            if child is not None and child.child_plan is not None:
+                visit(child.child_plan)
+
+    visit(object_plan)
+    return list(seen.values())
+
+
+def attach_effect_steps(
+    object_plan: ObjectPlan, orphaned_effects: List[Step]
+) -> ObjectPlan:
+    """Attach each orphaned side-effecting step to the bucket that must RUN it.
+
+    An optimizer that inlines a mutation's return value leaves the write `dedupable=False`
+    step in the plan DAG but unconsumed by any `FieldPlan.step`; tree-shake force-keeps it
+    (a write runs for effect), yet the executor only runs steps reachable from a bucket's
+    fields, so the orphan needs an explicit run target. Each such step descends from
+    exactly one bucket's `parent_step` (the planner built it from that bucket's parent),
+    so its owner is the DEEPEST ObjectPlan whose `parent_step` is in the step's transitive
+    dependency set — the same bucket whose boundary the executor seeds. We rebuild that
+    ObjectPlan with the step appended to `effect_steps`; the executor then runs it for
+    effect alongside the bucket's consumed fields.
+
+    With the default identity optimize nothing is ever orphaned, so `orphaned_effects`
+    is empty and this function is never called — a no-op for the conformance path.
+    """
+    owner_id_for: Dict[int, int] = {}
+    for effect in orphaned_effects:
+        boundary_ids = {dep.id for dep in order_steps([effect])}
+        owner_id_for[effect.id] = _deepest_owner_parent_id(object_plan, boundary_ids)
+
+    def rebuild(op: ObjectPlan, depth: int) -> ObjectPlan:
+        new_fields: List[FieldPlan] = []
+        for fp in op.fields:
+            new_completer = fp.completer
+            child = find_object_completer(new_completer)
+            if child is not None and child.child_plan is not None:
+                rebuilt_child = rebuild(child.child_plan, depth + 1)
+                new_completer = attach_child_plan(new_completer, rebuilt_child)
+            new_fields.append(fp._replace(completer=new_completer))
+        mine = [
+            effect
+            for effect in orphaned_effects
+            if op.parent_step is not None
+            and owner_id_for[effect.id] == op.parent_step.id
+        ]
+        return op._replace(
+            fields=new_fields, effect_steps=[*op.effect_steps, *mine] if mine else op.effect_steps
+        )
+
+    return rebuild(object_plan, 0)
+
+
+def _deepest_owner_parent_id(object_plan: ObjectPlan, boundary_ids: set) -> int:
+    """Find the parent_step id of the deepest bucket the orphaned step descends from.
+
+    Walks the ObjectPlan tree; a bucket owns the step when its `parent_step` is among the
+    step's transitive dependency ids (`boundary_ids`). Nested buckets all qualify (a child's
+    parent_step descends from its parent's), so the DEEPEST match wins — that is the bucket
+    whose boundary the executor seeds with the parents the write actually keys off.
+
+    A step that depends on NO bucket boundary (a 0-dependency write, or one keyed only off
+    constants) has no parent column to key off; it belongs to the ROOT bucket, where it runs
+    once over the operation's single root entry. We fall back to the root `parent_step` for
+    that case.
+    """
+    best_id = -1
+    best_depth = -1
+
+    def visit(op: ObjectPlan, depth: int) -> None:
+        nonlocal best_id, best_depth
+        if (
+            op.parent_step is not None
+            and op.parent_step.id in boundary_ids
+            and depth > best_depth
+        ):
+            best_id = op.parent_step.id
+            best_depth = depth
+        for fp in op.fields:
+            child = find_object_completer(fp.completer)
+            if child is not None and child.child_plan is not None:
+                visit(child.child_plan, depth + 1)
+
+    visit(object_plan, 0)
+    if best_id >= 0:
+        return best_id
+    if object_plan.parent_step is not None:
+        return object_plan.parent_step.id  # boundary-less write → the root bucket runs it
+    raise AssertionError(
+        "orphaned side-effecting step has no bucket to run it for effect "
+        "(the root ObjectPlan has no parent_step)"
+    )
 
 
 def remap_object_plan(object_plan: ObjectPlan, remap: Dict[int, Step]) -> ObjectPlan:

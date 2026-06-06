@@ -8,9 +8,8 @@ step as the new `$parent`. Fields WITHOUT a plan resolver must contribute no ste
 (legacy resolver-adapter path), which keeps the conformance suite green.
 """
 
-from typing import Any, List
 
-from graphql import GraphQLObjectType, build_schema, parse
+from graphql import build_schema, parse
 from graphql.execution.collect_fields import collect_fields
 
 from grafast_py import GrafastExecutionContext

@@ -62,10 +62,17 @@ def run_bucket_steps(context, plan: ObjectPlan, parents: List[Any]):
     Returns a dict `step.id -> output column` (or a coroutine resolving to it when an
     async load is in the sub-DAG), or `None` when the bucket has no plan-field steps
     (the pure legacy-resolver path, unchanged).
+
+    `plan.effect_steps` are side-effecting steps an optimizer orphaned (a mutation whose
+    return value was inlined): no field consumes them, so they are added to the run
+    targets here to RUN FOR EFFECT in this bucket — their output column is discarded but
+    the write executes. With the default identity optimize `effect_steps` is empty, so
+    the targets (and the run) are byte-identical to before.
     """
     if plan.parent_step is None:
         return None
     targets = [fp.step for fp in plan.fields if fp.step is not None]
+    targets.extend(plan.effect_steps)
     if not targets:
         return None
 
@@ -186,9 +193,43 @@ def execute_object_plan_serially(
 
     Returns the same per-parent dict / `Bubble` list (or a coroutine) as the
     parallel executor.
+
+    `plan.effect_steps` (side-effecting steps an optimizer orphaned by inlining their
+    return value) are run FOR EFFECT up front: a mutation whose result is not selected
+    still must write. If that run is async the whole serial pass becomes a coroutine that
+    awaits the effects before completing any field. With the default identity optimize
+    `effect_steps` is empty, so this is skipped and the path is byte-identical.
     """
     state = FieldCompletion(len(parents))
 
+    if plan.effect_steps:
+        effects = run_effect_steps(context, plan, parents)
+        if context.is_awaitable(effects):
+
+            async def after_effects():
+                await effects
+                later = execute_object_plan_serially_fields(
+                    context, plan, parents, parent_paths, state
+                )
+                if context.is_awaitable(later):
+                    return await later
+                return later
+
+            return after_effects()
+
+    return execute_object_plan_serially_fields(
+        context, plan, parents, parent_paths, state
+    )
+
+
+def execute_object_plan_serially_fields(
+    context,
+    plan: ObjectPlan,
+    parents: List[Any],
+    parent_paths: List[Path],
+    state: "FieldCompletion",
+):
+    """Drive a mutation bucket's fields serially (the field loop of the serial path)."""
     # if any field is async the whole pass must become a coroutine so each field
     # awaits before the next begins; detect by completing the first field and
     # seeing whether it returned a coroutine, then continue accordingly
@@ -302,6 +343,35 @@ def complete_field(
         scatter(context, field_plan, await completed, live_idx, outcome.paths, state)
 
     return finish()
+
+
+def run_effect_steps(context, plan: ObjectPlan, parents: List[Any]):
+    """Run a bucket's orphaned side-effecting steps FOR EFFECT, discarding outputs.
+
+    A mutation whose return value an optimizer inlined is orphaned (no `FieldPlan.step`
+    consumes it) yet must still write; `plan.effect_steps` holds those steps. We seed the
+    bucket's `parent_step` boundary with `parents` and run the effect steps' reachable
+    sub-DAG once — the `execute` is the write. The result columns are intentionally
+    dropped (no field reads them). Returns a coroutine when an effect step is async (a pg
+    mutation), else None. Only called when `effect_steps` is non-empty.
+    """
+    boundary = {plan.parent_step.id}
+    ordered = order_steps_within(plan.effect_steps, boundary)
+    seed = {plan.parent_step.id: parents}
+    columns = run_steps(
+        len(parents),
+        ordered,
+        context.is_awaitable,
+        seed=seed,
+        on_step_batch=getattr(context, "_grafast_on_step_batch", None),
+    )
+    if context.is_awaitable(columns):
+
+        async def finish():
+            await columns
+
+        return finish()
+    return None
 
 
 def run_serial_plan_field(context, field_plan, live_parents, live_paths, parent_step):

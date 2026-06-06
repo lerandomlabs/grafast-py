@@ -349,9 +349,6 @@ def test_each_loadone_relation_matches_plain():
     def r_coauthors(o, info):
         return [AUTHORS[i] for i in coauthor_ids[o["id"]]]
 
-    plain_post = GraphQLObjectType(
-        "P", {"id": GraphQLField(GraphQLNonNull(GraphQLInt), resolve=lambda o, i: o["id"])}
-    )
     plain_author = GraphQLObjectType(
         "A",
         lambda: {

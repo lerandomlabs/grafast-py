@@ -23,7 +23,7 @@ tiny `ParentStep -> ResolveStep` DAG through the shared `run_steps` executor, so
 even the legacy path flows through the real step model.
 """
 
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, NamedTuple
 
 from graphql.execution.execute import GraphQLResolveInfo
 from graphql.pyutils import Path
