@@ -453,6 +453,51 @@ def test_connection_rejects_ambiguous_forward_and_reverse_pagination():
         )
 
 
+def test_add_order_term_revalidates_cursor_against_new_order():
+    """Mutating the order after construction RE-DECODES the cursor against the new order.
+
+    A host that builds a connection with an after cursor and then calls
+    ``add_order_term`` changes the order the cursor must match. Before the re-decode the
+    stale cursor was seeked against the new order — a longer order raised an IndexError, a
+    same-length order change SILENTLY seeked the wrong page. Now ``add_order_term``
+    re-decodes (digest-validated), so the incompatible cursor is REJECTED LOUDLY instead.
+    """
+    posts = PgResource(
+        "posts", "grafast_demo", "posts", ["id", "author_id", "title"],
+        registry=PgRegistry(),
+    )
+    # mint the cursor under the order the connection is constructed with (id only).
+    after = encode_keyset_cursor((OrderTerm("id"),), {"id": 5})
+    step = PgConnectionStep(
+        posts, constant(None), "author_id", order_by=["id"], first=2, after=after
+    )
+    # the construction-time decode succeeded against the matching order.
+    assert step.after_values == [5]
+    # appending a term changes the order the cursor must match; the stale cursor's digest
+    # no longer matches, so the re-decode rejects it loudly rather than mis-seek.
+    with pytest.raises(ValueError, match="different ordering"):
+        step.add_order_term("title")
+
+
+def test_add_order_term_keeps_cursorless_construction_unchanged():
+    """A connection WITHOUT a cursor mutates its order with no decode error.
+
+    The normal (no after/before) construction path is unaffected by the re-validation:
+    add_order_term just extends the order.
+    """
+    posts = PgResource(
+        "posts", "grafast_demo", "posts", ["id", "author_id", "title"],
+        registry=PgRegistry(),
+    )
+    step = PgConnectionStep(
+        posts, constant(None), "author_id", order_by=["id"], first=2
+    )
+    assert step.after_values is None
+    step.add_order_term("title")
+    assert step.after_values is None
+    assert [t.column for t in step.order_by] == ["id", "title"]
+
+
 def test_encode_keyset_cursor_missing_order_column_raises_loudly():
     """Ordering by a column NOT projected into the row raises a clear named error.
 

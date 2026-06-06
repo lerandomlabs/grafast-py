@@ -85,6 +85,11 @@ class PgUnionMember:
     branch's WHERE only (so one member can be scoped — e.g. a soft-delete filter — without
     touching its peers).
 
+    NOTE: a member resource's ``select_customizer`` is NOT auto-applied by the union (only
+    PgSelect auto-applies its resource's auth scope; pgUnionAll requires host-supplied member
+    scoping — upstream pgUnionAll parity). A scoped member (soft-delete / tenant / visibility)
+    must RESTATE that predicate here via ``where=``; the union will not add it for you.
+
     Frozen + hashable so the member tuple folds straight into the union step's dedup key;
     ``where`` is excluded from the dataclass identity (Core predicates have no stable hash —
     they are value-discriminated via :func:`predicate_key` in the step's signature instead)
@@ -266,19 +271,49 @@ class PgUnionAllStep(Step):
                 )
 
     def assert_members_have_match(self) -> None:
-        """Per-parent mode: every member needs a match key of the SAME arity."""
-        arity = len(self.members[0].match_columns)
-        if arity == 0:
+        """Per-parent mode: every member needs the SAME match key, drawn from shared columns.
+
+        The step keeps a SINGLE set of match columns (the first member's) and uses those
+        names for the page-window PARTITION/ORDER, the Python SCATTER (``grouping_key``) and
+        the COUNT projection — a ONE-window design (we deliberately do NOT port upstream's
+        per-identifier LATERAL machinery). So a member whose match columns differ in NAME or
+        ORDER from the first member's would be partitioned/grouped/counted under columns it
+        does not project: its rows would group under ``None`` and be silently dropped from
+        the page, and the count leg would project a column that member lacks (a Postgres
+        ``column ... does not exist`` error). Likewise a match column that is not SHARED is
+        NULL-padded in the peers that lack it, so the partition/scatter key is ``None`` there.
+        Require, fail-loud at construction, that every member declares the IDENTICAL match
+        columns and that each match column is a shared (real, identically-named, non-NULL)
+        projection in every branch.
+        """
+        expected = self.members[0].match_columns
+        if not expected:
             raise ValueError(
                 "per-parent pgUnionAll (a key_step was supplied) needs each member to "
                 "declare a match column; the first member has none"
             )
+        shared = set(self.shared_columns)
+        for col in expected:
+            if col not in shared:
+                raise ValueError(
+                    f"pgUnionAll match column {col!r} is not a shared column "
+                    f"(shared: {sorted(shared)}); the match key partitions/scatters/counts "
+                    "the whole union, so it must be a shared column projected by every member"
+                )
         for member in self.members:
-            if len(member.match_columns) != arity:
+            if len(member.match_columns) != len(expected):
                 raise ValueError(
                     f"pgUnionAll members disagree on match arity: {member.type_name!r} "
-                    f"has {len(member.match_columns)} match column(s), expected {arity}; "
-                    "every member must match the same number of key columns"
+                    f"has {len(member.match_columns)} match column(s), expected "
+                    f"{len(expected)}; every member must match the same number of key columns"
+                )
+            if member.match_columns != expected:
+                raise ValueError(
+                    f"pgUnionAll members disagree on match columns: {member.type_name!r} "
+                    f"matches {list(member.match_columns)}, expected {list(expected)}; "
+                    "every member must match the SAME key column(s) (same names, same order) "
+                    "— the step partitions/scatters/counts under one shared match key, so a "
+                    "divergent name would silently drop that member's rows"
                 )
 
     def assert_members_have_no_match(self) -> None:

@@ -701,8 +701,10 @@ class FilterStep(Step):
 
     One dependency: the list-producing step (dep 0). ``execute`` filters each entry's
     list in one pass; a ``None`` entry stays ``None`` and an upstream Exception is
-    passed through. Dedup is by predicate identity (a captured closure is unique), like
-    :class:`LambdaStep`.
+    passed through. A predicate that RAISES for an item is caught PER ENTRY and carried
+    as that entry's value (the completer locates it at the field's path), so one bad
+    entry never poisons the whole bucket — mirroring :class:`LambdaStep`. Dedup is by
+    predicate identity (a captured closure is unique), like :class:`LambdaStep`.
     """
 
     is_sync_and_safe = True
@@ -721,7 +723,10 @@ class FilterStep(Step):
             if entry is None or isinstance(entry, Exception):
                 out.append(entry)
                 continue
-            out.append([item for item in entry if predicate(item)])
+            try:
+                out.append([item for item in entry if predicate(item)])
+            except Exception as raw_error:  # predicate raised → carry as THIS entry's value
+                out.append(raw_error)
         return out
 
     @property
