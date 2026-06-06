@@ -311,9 +311,12 @@ def find_inline_candidates(
 
     1. TOGGLE: ``plan.inline_relations`` is True AND neither P's nor C's resource opted out
        (``opt_out_inline``).
-    2. SAME SCHEMA/EXECUTOR: P and C share a schema binding (the request executor is
-       request-scoped and identical for every step, so the only cross-executor risk is a
-       resource in a different schema/database — not foldable).
+    2. SAME SCHEMA/EXECUTOR, DISTINCT TABLE: P and C share a schema binding (the request
+       executor is request-scoped and identical for every step, so the only cross-executor
+       risk is a resource in a different schema/database — not foldable), AND C is not the
+       SAME table as P (a SELF-referential relation: the flat ``build_lateral`` cannot alias
+       the inner table apart from the outer parent, so its correlation would collapse — SKIP
+       and keep the batched path until the per-select alias subsystem lands).
     3. FK-CORRELATABLE: C is a relation select whose dep 0 is a single-column
        :class:`AccessStep` reading ONE column off P's rows (the local FK), with C's
        ``match_columns`` the remote columns — the textbook ``parent.local = child.remote``.
@@ -420,6 +423,21 @@ def inline_candidate_for(
     if child.resource.schema != parent.resource.schema:
         log.debug(
             "inline skip", reason="cross_schema",
+            parent=parent.resource.name, child=child.resource.name,
+        )
+        return None
+
+    # 2b. SAME TABLE (self-referential relation) — the child's resource is the SAME
+    # schema+table as the parent's (e.g. employees.has_many("reports", employees, ...)).
+    # build_lateral emits the LATERAL child as a bare `table(spec.resource.table)` with the
+    # SAME unaliased name as the outer parent, so the `parent_table.c[local]` correlation
+    # would resolve to the INNER table inside the subquery — collapsing the outer
+    # correlation into a within-row comparison so EVERY parent silently gets [] / None. Until
+    # the per-select alias subsystem exists, SKIP a self-relation and keep the proven batched
+    # `= ANY($1)` path (one extra statement), matching the limited/filtered/composite skips.
+    if child.resource.table == parent.resource.table:
+        log.debug(
+            "inline skip", reason="self_relation",
             parent=parent.resource.name, child=child.resource.name,
         )
         return None
