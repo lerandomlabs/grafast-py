@@ -28,7 +28,7 @@ from .completion import (
     build_completer,
     find_object_completer,
 )
-from .dag import Plan, _compose_remaps, order_steps
+from .dag import Plan, _compose_remaps, order_steps, order_steps_within
 from .schema import FieldArgs, get_field_plan
 from .step_model import Step
 
@@ -97,11 +97,22 @@ class LayerPlan(NamedTuple):
     runs steps reachable from `fields`, so the orphan needs a run target; `effect_steps`
     IS that target. With the default identity optimize nothing is ever orphaned, so this
     list is always empty and the executor path is byte-identical.
+
+    `run_steps` are the steps this bucket runs once over its parents — the field value
+    steps PLUS `effect_steps` — and `ordered_steps` is their dependency-ordered form
+    (`order_steps_within(run_steps, {parent_step.id})`). Both are materialised by
+    `finalize_plan` (`populate_layers`). Holding them on the layer is what DE-FUSES
+    execution from serialization: `run_layer` runs a bucket from its LayerPlan ALONE and
+    never reads the output shape (`fields`/completers) to decide what to run. They are
+    empty/None until finalize; every executed plan is finalized, so the executor always
+    sees them populated.
     """
 
     reason: LayerReason
     parent_step: Optional[Step] = None
     effect_steps: List[Step] = []
+    run_steps: List[Step] = []
+    ordered_steps: Optional[List[Step]] = None
 
 
 class ObjectPlan(NamedTuple):
@@ -490,7 +501,41 @@ def finalize_plan(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:
     orphaned_effects = plan.tree_shake(roots)
     if orphaned_effects:
         object_plan = attach_effect_steps(object_plan, orphaned_effects)
+    # materialise each bucket's self-contained run set onto its LayerPlan, LAST — after
+    # every step is final (post optimize/dedup/tree-shake/effect-attach) — so the executor
+    # runs a bucket from its layer alone, never reading the output shape.
+    object_plan = populate_layers(object_plan)
     return object_plan
+
+
+def populate_layers(object_plan: ObjectPlan) -> ObjectPlan:
+    """Fill each bucket's `LayerPlan.run_steps`/`ordered_steps` across the OutputPlan tree.
+
+    This is the single place the "fields → execution targets" coupling is turned into DATA
+    on the layer: `run_steps` is the bucket's field value steps plus its `effect_steps`, and
+    `ordered_steps` is their dependency order from the boundary — exactly what the executor
+    used to derive per-bucket at run time from `plan.fields`. Computing it once here lets
+    `run_layer` read the LayerPlan alone (the de-fusion). Walks the tree like
+    `remap_object_plan`, rebuilding child completers so nested layers are populated too.
+    """
+    new_fields: List[FieldPlan] = []
+    for fp in object_plan.fields:
+        new_completer = fp.completer
+        child = find_object_completer(new_completer)
+        if child is not None and child.child_plan is not None:
+            rebuilt_child = populate_layers(child.child_plan)
+            new_completer = attach_child_plan(new_completer, rebuilt_child)
+        new_fields.append(fp._replace(completer=new_completer))
+    layer = object_plan.layer
+    run_steps = [fp.step for fp in new_fields if fp.step is not None]
+    run_steps.extend(layer.effect_steps)
+    ordered_steps = (
+        order_steps_within(run_steps, {layer.parent_step.id})
+        if layer.parent_step is not None and run_steps
+        else None
+    )
+    new_layer = layer._replace(run_steps=run_steps, ordered_steps=ordered_steps)
+    return object_plan._replace(fields=new_fields, layer=new_layer)
 
 
 def collect_consumption_root_steps(object_plan: ObjectPlan) -> List[Step]:
