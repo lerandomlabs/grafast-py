@@ -24,20 +24,25 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
   config.py            GrafastConfig (execution timeout, concurrency, logging, tracing) + error class
                        (query cost/depth limiting is a validation-layer concern, not here)
   pg/                  Postgres data source — the optional `[pg]` extra (SQLAlchemy/asyncpg):
-                       resource.py (PgResource: attributes/codecs/relations, select_customizer),
-                       steps.py (pg_select / pg_select_single / PgSelectAllStep, batched = ANY($1)),
-                       connection.py (keyset Relay connection: forward+reverse, separate totalCount),
+                       resource.py (PgResource: attributes/codecs/relations, select_customizer,
+                         single- OR composite-column match keys; decode_row/decode_value),
+                       steps.py (pg_select / pg_select_single / PgSelectAllStep, batched = ANY($1)
+                         / composite tuple-IN),
+                       connection.py (keyset Relay connection: forward+reverse, separate totalCount,
+                         connection aggregates sum/avg/min/max/count(distinct) + GROUP BY),
                        cursor.py (keyset/seek cursors + the NULL-aware keyset WHERE comparator),
                        ordering.py (OrderTerm → structured ORDER BY, direction/nulls/multi-column),
                        pagination.py (per-parent first/offset window slice),
-                       customize.py (host WHERE: select_customizer + per-plan .where()/.apply()),
+                       customize.py (host WHERE: select_customizer + per-plan .where()/.apply()/.where_tree()),
+                       conditions.py (filter Condition AST: And/Or/Not + Compare → Core predicate),
+                       codecs.py (codec type library: scalars + recursive arrays/ranges/enums/composites),
                        mutations.py (pg_insert/update/delete_single on the serial seam),
                        engine.py (async engine, configure_engine, count_sql),
-                       executor.py (request-scoped PgExecutor + pg_request_context, pgSettings/RLS),
+                       executor.py (request-scoped PgExecutor + pg_request_context[_async], pgSettings/RLS,
+                         opt-in shared_txn REPEATABLE READ mode),
                        from_sqlalchemy.py (derive PgResource descriptors from ORM models).
-                       Deferred: multi-column relation keys, runtime from_step placeholders,
-                       single-shared-request-transaction mode, query inlining/LATERAL,
-                       GROUP BY/HAVING/aggregates, a full codec types table.
+                       Deferred: runtime from_step placeholders + plan caching, query inlining/LATERAL,
+                       Postgres-backed interfaces/unions (polymorphism), HAVING on aggregates.
 
 tests/                 our own pytest suite (fast, pure-Python; run in CI)
 tests/differential/    parity vs reference Node Grafast (on-demand; needs Node) — see its README

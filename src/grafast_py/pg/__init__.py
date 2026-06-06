@@ -6,7 +6,24 @@ statement per bucket), and a batched Relay :class:`PgConnectionStep`. Built on t
 step model, so a depth-D nested query issues ~D batched SQL statements total.
 """
 
-from .connection import PgConnectionStep, connection, connection_needs_total
+from .codecs import (
+    apply_to_py,
+    array_codec,
+    codec_for,
+    composite_codec,
+    enum_codec,
+    range_codec,
+    scalar_codecs,
+)
+from .conditions import And, Compare, Condition, Not, Or, compile_condition
+from .connection import (
+    AGGREGATE_FUNCTIONS,
+    PgAggregate,
+    PgConnectionStep,
+    connection,
+    connection_aggregates,
+    connection_needs_total,
+)
 from .cursor import (
     decode_keyset_cursor,
     encode_keyset_cursor,
@@ -28,6 +45,7 @@ from .executor import (
     SQLAlchemyExecutor,
     current_pg_request,
     pg_request_context,
+    pg_request_context_async,
 )
 from .from_sqlalchemy import (
     columns_from_table,
@@ -43,7 +61,17 @@ from .mutations import (
     pg_update_single,
 )
 from .ordering import OrderTerm, normalize_order, order_clauses
-from .resource import PgCodec, PgColumn, PgRegistry, PgRelation, PgResource, as_column
+from .resource import (
+    PgCodec,
+    PgColumn,
+    PgRegistry,
+    PgRelation,
+    PgResource,
+    as_column,
+    match_columns_tuple,
+    relation_columns_pair,
+    relation_key_step,
+)
 from .steps import (
     PgSelectAllStep,
     PgSelectSingleStep,
@@ -59,12 +87,20 @@ __all__ = [
     "PgColumn",
     "PgCodec",
     "as_column",
+    # composite keys: single match_column generalised to a match_columns tuple
+    "match_columns_tuple",
+    "relation_columns_pair",
+    "relation_key_step",
     "PgSelectStep",
     "PgSelectSingleStep",
     "PgSelectAllStep",
     "PgConnectionStep",
     "connection",
     "connection_needs_total",
+    # connection domain aggregates: a separate batched sum/avg/min/max/count statement
+    "PgAggregate",
+    "AGGREGATE_FUNCTIONS",
+    "connection_aggregates",
     # keyset cursors: seek-cursor encode/decode + the keyset WHERE comparator
     "encode_keyset_cursor",
     "decode_keyset_cursor",
@@ -88,6 +124,8 @@ __all__ = [
     "SQLAlchemyExecutor",
     "RawExecutor",
     "pg_request_context",
+    # shared_txn: opt-in single-connection / single REPEATABLE READ transaction per request
+    "pg_request_context_async",
     "current_pg_request",
     "resource_from_model",
     "resources_from_models",
@@ -101,4 +139,19 @@ __all__ = [
     "check_predicate",
     "predicate_key",
     "resolve_customizer_predicates",
+    # codec registry: PgCodec lookup by pg type name + recursive array/range/composite/enum
+    "codec_for",
+    "array_codec",
+    "range_codec",
+    "composite_codec",
+    "enum_codec",
+    "apply_to_py",
+    "scalar_codecs",
+    # structured filter AST: a Condition tree compiling to a Core boolean WHERE predicate
+    "Condition",
+    "Compare",
+    "And",
+    "Or",
+    "Not",
+    "compile_condition",
 ]
