@@ -20,7 +20,12 @@ from graphql import GraphQLSchema
 
 from grafast_py.core_steps import access, constant
 from grafast_py.schema import make_grafast_schema
-from grafast_py.pg.connection import connection
+from grafast_py.pg.connection import connection, connection_needs_total
+from grafast_py.pg.mutations import (
+    pg_delete_single,
+    pg_insert_single,
+    pg_update_single,
+)
 from grafast_py.pg.resource import PgRegistry, PgResource
 from grafast_py.pg.steps import pg_select, pg_select_single
 
@@ -31,11 +36,29 @@ type Query {
   posts: [Post!]!
 }
 
+type Mutation {
+  createPost(input: CreatePostInput!): Post
+  updatePost(id: Int!, input: UpdatePostInput!): Post
+  deletePost(id: Int!): Post
+}
+
+input CreatePostInput {
+  id: Int!
+  authorId: Int!
+  title: String!
+}
+
+input UpdatePostInput {
+  title: String
+}
+
 type Author {
   id: Int!
   name: String!
   posts: [Post!]!
-  postsConnection(first: Int, after: String): PostConnection!
+  postsConnection(
+    first: Int, after: String, last: Int, before: String
+  ): PostConnection!
 }
 
 type Post {
@@ -125,6 +148,11 @@ def build_demo_schema(registry: Optional[PgRegistry] = None) -> GraphQLSchema:
             "posts": _plan_all_rows(posts),
             "author": _plan_author_by_id(authors),
         },
+        "Mutation": {
+            "createPost": _plan_create_post(posts),
+            "updatePost": _plan_update_post(posts),
+            "deletePost": _plan_delete_post(posts),
+        },
         "Author": {
             "id": _leaf("id"),
             "name": _leaf("name"),
@@ -206,10 +234,55 @@ def _plan_related_many(resource: PgResource, relation_name: str):
     return plan
 
 
+def _plan_create_post(posts: PgResource):
+    """A mutation plan: INSERT one post from the input, RETURNING the row.
+
+    The input's ``authorId`` maps to the ``author_id`` column; the returned step is the
+    inserted row dict, so the Post sub-selection (id/title, and relations) reads it like
+    a normal row.
+    """
+
+    def plan(parent_step, args, info):
+        data = args.get("input") or {}
+        return pg_insert_single(
+            posts,
+            {
+                "id": data["id"],
+                "author_id": data["authorId"],
+                "title": data["title"],
+            },
+        )
+
+    return plan
+
+
+def _plan_update_post(posts: PgResource):
+    """A mutation plan: UPDATE the PK-keyed post's supplied columns, RETURNING the row."""
+
+    def plan(parent_step, args, info):
+        data = args.get("input") or {}
+        values = {}
+        if "title" in data:
+            values["title"] = data["title"]
+        return pg_update_single(posts, args.get("id"), values)
+
+    return plan
+
+
+def _plan_delete_post(posts: PgResource):
+    """A mutation plan: DELETE the PK-keyed post, RETURNING the deleted row."""
+
+    def plan(parent_step, args, info):
+        return pg_delete_single(posts, args.get("id"))
+
+    return plan
+
+
 def _plan_posts_connection(authors: PgResource):
     def plan(parent_step, args, info):
         relation = authors.get_relation("posts")
         key = access(parent_step, (relation.local_column,))
+        # the count aggregate is issued ONLY when the selection set asks for totalCount.
         return connection(
             relation.target,
             key,
@@ -217,6 +290,9 @@ def _plan_posts_connection(authors: PgResource):
             order_by=[relation.target.primary_key],
             first=args.get("first"),
             after=args.get("after"),
+            last=args.get("last"),
+            before=args.get("before"),
+            needs_total=connection_needs_total(info),
         )
 
     return plan

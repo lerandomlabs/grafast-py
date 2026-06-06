@@ -7,10 +7,17 @@ connection pool); see :func:`get_engine` for the URL resolution, the pool knobs,
 the single-engine caveat.
 
 ``count_sql`` is a diagnostic helper (also used by the O(depth) batching tests): it
-attaches a ``before_cursor_execute`` listener to the engine's underlying sync engine
-and counts every statement executed while it is open. It is process-global (it counts
-all SQL on the shared engine during the block), so it is for single-flow diagnostics /
-tests, not per-request metering under concurrency.
+attaches a ``before_cursor_execute`` listener to a GIVEN engine's underlying sync
+engine and counts every statement executed while it is open. The engine must be the
+SAME instance the steps run against — the tests build ``SQLAlchemyExecutor(engine)``
+and pass that engine here. It is engine-global (it counts all SQL on that engine during
+the block), so it is for single-flow diagnostics / tests, not per-request metering
+under concurrency.
+
+NOTE: steps no longer call :func:`get_engine` directly — they run their statements via
+the request-scoped executor (:mod:`grafast_py.pg.executor`). ``configure_engine`` /
+``get_engine`` / ``dispose_engine`` remain a convenience for building an engine from a
+URL (which the demo + tests then wrap in a ``SQLAlchemyExecutor``).
 """
 
 import os
@@ -125,16 +132,20 @@ class SqlCounter:
 
 
 @contextmanager
-def count_sql() -> Iterator[SqlCounter]:
-    """Count SQL statements executed on the shared engine while open.
+def count_sql(engine: Optional[AsyncEngine] = None) -> Iterator[SqlCounter]:
+    """Count SQL statements executed on ``engine`` while open.
 
-    Attaches a ``before_cursor_execute`` listener to the engine's sync engine (the
+    Attaches a ``before_cursor_execute`` listener to ``engine``'s sync engine (the
     asyncpg dialect still drives the sync event hooks under the hood) and removes it
-    on exit. Use to prove that a nested GraphQL operation issues one batched query
-    per resource-layer.
+    on exit. Use to prove that a nested GraphQL operation issues one batched query per
+    resource-layer.
+
+    Pass the SAME engine the steps run against — i.e. the one wrapped in the
+    ``SQLAlchemyExecutor`` bound for the request. ``engine`` defaults to the convenience
+    :func:`get_engine` for callers (demo + benchmarks) that drive the global engine.
     """
     counter = SqlCounter()
-    sync_engine = get_engine().sync_engine
+    sync_engine = (engine or get_engine()).sync_engine
 
     def on_execute(conn, cursor, statement, parameters, context, executemany):
         counter.record(statement)

@@ -17,13 +17,13 @@ Two entry points:
   independent of how the resources are named.
 """
 
-from typing import Dict, Iterable, Optional, Sequence, Type
+from typing import Dict, Iterable, List, Optional, Sequence, Type, Union
 
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import RelationshipProperty
 
 from ..config import log
-from .resource import PgRegistry, PgResource
+from .resource import PgColumn, PgRegistry, PgResource
 
 
 def resource_from_model(
@@ -52,9 +52,16 @@ def resource_from_model(
 
     resource_name = name or model.__tablename__
     resource_schema = schema or table.schema or "public"
-    resource_columns = (
-        list(columns) if columns is not None else [c.name for c in table.columns]
-    )
+    # Derive PgColumn descriptors carrying nullability/default metadata (used by
+    # mutations later); a `columns` override stays a plain name list. NO codec / type
+    # mapping is derived here — that is the declined schema-generation scope. The derived
+    # descriptors keep the SAME column NAMES (and order), so resource.columns compares
+    # equal to a hand-declared name list (the parity gate).
+    resource_columns: Sequence[Union[str, PgColumn]]
+    if columns is not None:
+        resource_columns = list(columns)
+    else:
+        resource_columns = columns_from_table(table)
     resource_pk = primary_key or derive_primary_key(model, table)
 
     return PgResource(
@@ -65,6 +72,26 @@ def resource_from_model(
         primary_key=resource_pk,
         registry=registry,
     )
+
+
+def columns_from_table(table) -> List[PgColumn]:
+    """Build :class:`PgColumn` descriptors from a mapped table's columns.
+
+    Each descriptor takes the column NAME (so the ordered name list is unchanged) plus
+    ``not_null`` (the column is NOT NULL) and ``has_default`` (a server/column default or
+    autoincrement is present) — metadata for the mutation side. No codec/type mapping.
+    """
+    descriptors: List[PgColumn] = []
+    for col in table.columns:
+        has_default = col.default is not None or col.server_default is not None
+        descriptors.append(
+            PgColumn(
+                name=col.name,
+                not_null=not col.nullable,
+                has_default=has_default,
+            )
+        )
+    return descriptors
 
 
 def derive_primary_key(model: Type, table) -> str:
@@ -209,4 +236,4 @@ def add_relation(
         )
 
 
-__all__ = ["resource_from_model", "resources_from_models"]
+__all__ = ["resource_from_model", "resources_from_models", "columns_from_table"]

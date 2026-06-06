@@ -10,6 +10,11 @@ CI guards the four PASS gates without a multi-minute full run:
 
 The full 5000-op @ concurrency 32 run is the bench script. Marked ``pg`` — touches
 only ``grafast_demo`` in ``grafast_py_test`` (the engine hard-codes the URL).
+
+This is a concurrency stress test that assumes EXCLUSIVE DB access: it reseeds the
+shared ``grafast_demo`` schema and asserts exact per-author counts, so a SECOND pytest
+process reseeding the same local DB mid-run would corrupt the snapshot. Run it in a
+SINGLE process — do NOT launch overlapping pytest runs against the same database.
 """
 
 import sys
@@ -37,21 +42,32 @@ CI_RSS_THRESHOLD_MB = 50.0
 async def test_concurrent_soak_no_errors_no_leak_bounded_rss():
     """1000 mixed ops at concurrency 16: zero errors, no pool leak, bounded RSS."""
     await dispose_engine()  # fresh engine bound to THIS test's loop
-    await scale_seed(CI_N_AUTHORS)
+    # scale_seed commits AND verifies the author count is visible over a fresh connection
+    # before returning, so the soak never starts against a stale/half-seeded schema; drive
+    # the soak's expectations off the VERIFIED committed count, not the constant.
+    seeded = await scale_seed(CI_N_AUTHORS)
+    assert seeded == CI_N_AUTHORS
     try:
         res: SoakResult = await run_soak(
             total_ops=CI_TOTAL_OPS,
             concurrency=CI_CONCURRENCY,
-            n_authors=CI_N_AUTHORS,
+            n_authors=seeded,
             warmup_ops=CI_WARMUP_OPS,
             rss_threshold_mb=CI_RSS_THRESHOLD_MB,
         )
     finally:
         await dispose_engine()
 
-    # (a) zero errors / 100% correct
-    assert res.errors == 0, res.error_messages[:5]
-    assert res.correct == res.total_ops, (res.correct, res.total_ops)
+    # (a) zero errors / 100% correct. Surface the first failures (which carry the
+    # observed-vs-expected author count) prominently so a real failure is not lost in
+    # the rest of the SoakResult debug output.
+    assert res.errors == 0, (
+        f"{res.errors} soak op(s) failed; first messages: {res.error_messages[:5]}"
+    )
+    assert res.correct == res.total_ops, (
+        f"only {res.correct}/{res.total_ops} ops correct; "
+        f"first failures: {res.error_messages[:5]}"
+    )
 
     # (b) no pool leak — concurrency exceeded the pool, so checkouts spiked under
     # contention (a background monitor observed the peak), stayed within the bound,

@@ -39,6 +39,12 @@ class Step:
     # assigned by the planner when the step is added to the plan; -1 until then.
     id: int
 
+    # whether the dedup pass may MERGE this step into a structurally-identical peer.
+    # True for pure value/read steps (merging is a safe optimization — the same value
+    # computed/loaded twice is computed once). SIDE-EFFECTING steps (e.g. mutations) set
+    # this False so two distinct writes are never collapsed into one.
+    dedupable: bool = True
+
     def __init__(self) -> None:
         self.dependencies: List["Step"] = []
         self.id = -1

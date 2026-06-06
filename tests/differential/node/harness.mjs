@@ -1,4 +1,4 @@
-// Phase C — reference Node harness.
+// Reference Node harness.
 //
 // For each fixture in corpus.mjs: install a per-fixture fetch counter around every
 // named batch loader, build a grafast schema via makeGrafastSchema, run

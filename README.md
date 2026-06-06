@@ -99,6 +99,40 @@ total — **O(depth), not O(rows)**:
 authors { posts { author, comments { author } } }   ->  exactly 5 SQL statements
 ```
 
+That O(depth) batching property holds across the full feature set:
+
+- **Structured `ORDER BY`** — per-term direction + `NULLS FIRST/LAST`, multi-column,
+  with a primary-key tie-break appended for a stable non-unique order.
+- **Filtering** — a resource `select_customizer(context)` (the selectAuth analogue for
+  soft-delete / tenant scoping) AND per-plan `.where(<Core predicate>)`, AND-combined
+  onto the batched `WHERE` before paging.
+- **Per-parent paging** — `first` / `offset` slice **each parent's** rows in SQL via a
+  `row_number()` window partitioned by the match column (never a bucket-wide `LIMIT`).
+- **Keyset Relay connections** — forward (`first`/`after`) **and** reverse
+  (`last`/`before`), sliced in SQL by a seek predicate (not an offset), with opaque
+  digest-validated cursors (a cursor minted under a different ordering is rejected, not
+  misapplied) and a **separate** batched `totalCount` aggregate issued only when selected.
+- **Computed columns + minimal codecs** — a host-authored Core SQL expression projected
+  as an extra labelled column in the same select, and a per-attribute `to_py` / `to_pg`
+  codec applied uniformly on read / write. Computed columns are **projection-only** in v1:
+  to order or filter, use a stored column or inline the SQL expression (ordering by a
+  computed column raises a clear error; orderable/filterable computed columns are deferred).
+- **CRUD mutations** — `pg_insert_single` / `pg_update_single` / `pg_delete_single` on
+  the serial mutation seam, fully param-bound, `RETURNING` a projectable row.
+- **Per-request `pgSettings` / RLS** and **bring-your-own-pool** (the production path) —
+  see below.
+
+```python
+from grafast_py.pg import OrderTerm, connection
+
+# a forward keyset Relay connection over Author.posts, newest first, with totalCount:
+connection(
+    posts, key_step=author_id, match_column="author_id",
+    order_by=[OrderTerm("created", descending=True), OrderTerm("id")],
+    first=20, after=cursor, needs_total=True,
+)
+```
+
 Runnable: [`examples/pg_blog.py`](examples/pg_blog.py) (uses the scratch DB
 `grafast_py_test`, schema `grafast_demo`):
 
@@ -170,6 +204,48 @@ concurrency. `max_step_concurrency` is a secondary throttle on the engine's own 
 fan-out, not the DB bound — the pool is. For per-statement bounds, set a server-side
 `statement_timeout` via `connect_args`.
 
+### Bring your own pool (the production path)
+
+`get_engine` / `configure_engine` are a **demo/test convenience** (one process-global
+engine the examples and the test suite drive). In production you inject a **host
+executor** per request — nothing on the hot path calls `get_engine`; the pg steps run
+their statements through the request-scoped executor. Wrap **your** engine/pool and bind
+it around `await graphql(...)`:
+
+```python
+from grafast_py.pg import SQLAlchemyExecutor, pg_request_context
+
+with pg_request_context(SQLAlchemyExecutor(my_async_engine)):
+    result = await graphql(schema, query, execution_context_class=GrafastExecutionContext)
+```
+
+`SQLAlchemyExecutor(engine)` runs the built Core statement on **your** `AsyncEngine`.
+To run on a non-SQLAlchemy pool instead, supply a `RawExecutor(run_callable)`: it
+compiles the statement to `$1` positional SQL and hands it to your callback to run on
+your raw pool (the `= ANY(:keys)` batch stays a single `$1` array param). (A
+single-shared-request-transaction executor mode — one txn spanning every step of a
+request — is a future addition, not built yet.)
+
+### Per-request `pgSettings` / RLS
+
+Pass `settings={...}` to `pg_request_context` to apply Postgres GUCs for the request.
+`SQLAlchemyExecutor` opens a transaction, applies all settings with
+`set_config(key, value, true)` (transaction-local, so they auto-clear at commit and
+never leak onto a pooled connection), and runs the query in that **same** transaction —
+so a row-level-security policy referencing `current_setting('app.owner', true)` sees the
+per-request value:
+
+```python
+with pg_request_context(SQLAlchemyExecutor(engine), settings={"app.owner": str(viewer_id)}):
+    result = await graphql(schema, query, execution_context_class=GrafastExecutionContext)
+```
+
+grafast-py's responsibility ends at injecting the GUCs into the query's transaction;
+enforcement is your `CREATE POLICY` + `ENABLE ROW LEVEL SECURITY` and a database role
+that does **not** bypass RLS (a superuser/`BYPASSRLS` role is never subject to a policy).
+With `settings=None` the executor takes the plain no-transaction path, so the O(depth)
+batching profile is unchanged.
+
 ### Query cost / depth limiting — use your validation layer
 
 grafast-py is a drop-in `ExecutionContext`, and **validation runs before execution**,
@@ -207,6 +283,16 @@ databases in one process (one engine per URL — dispose+reconfigure to switch);
 execution timeout bounds the caller but does not itself cancel in-flight SQL (pair it
 with a server-side `statement_timeout`). Query cost/depth limiting is by design **not**
 in this engine — do it in your validation layer (see above).
+
+**Deferred in the `grafast_py.pg` data source** (single-column / single-statement paths
+are built; these are not): multi-column relation keys (relations match on a single FK
+column); runtime `from_step` placeholders (a relation's match value comes from the parent
+row's column, not an arbitrary upstream step); a single-shared-request-transaction
+executor mode (one txn spanning every step of a request); query inlining / `LATERAL`
+(each resource layer is its own batched `= ANY($1)` round-trip, not folded into the
+parent's query); `GROUP BY` / `HAVING` / aggregates beyond the connection's own
+`totalCount`; and a full codec **types** table (codecs are minimal `to_py` / `to_pg`
+hooks plus an optional cast `sql_type` for the keyset path, not a complete PG type registry).
 
 ## More
 

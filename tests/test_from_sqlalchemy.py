@@ -20,7 +20,8 @@ from sqlalchemy import ForeignKey, Integer, Table, Column, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from grafast_py.context import GrafastExecutionContext
-from grafast_py.pg.engine import count_sql, dispose_engine
+from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
+from grafast_py.pg.executor import SQLAlchemyExecutor, pg_request_context
 from grafast_py.pg.from_sqlalchemy import resource_from_model, resources_from_models
 from examples.demo_schema import build_demo_schema, build_registry
 from examples.models import Author, Comment, Post
@@ -187,13 +188,18 @@ def test_out_of_batch_relation_target_skipped_and_strict_raises():
 
 
 async def run(schema, query, variables=None):
-    """Run a query through our engine (not the stock executor)."""
-    return await graphql(
-        schema,
-        query,
-        variable_values=variables,
-        execution_context_class=GrafastExecutionContext,
-    )
+    """Run a query through our engine (not the stock executor).
+
+    Binds a :class:`SQLAlchemyExecutor` over the convenience engine for the request so
+    the pg steps execute their statements via the request-scoped executor.
+    """
+    with pg_request_context(SQLAlchemyExecutor(get_engine())):
+        return await graphql(
+            schema,
+            query,
+            variable_values=variables,
+            execution_context_class=GrafastExecutionContext,
+        )
 
 
 @pytest_asyncio.fixture
@@ -234,7 +240,7 @@ async def test_model_derived_schema_nested_query_matches_o_depth(model_demo_sche
       }
     }
     """
-    with count_sql() as counter:
+    with count_sql(get_engine()) as counter:
         result = await run(model_demo_schema, query)
 
     assert result.errors is None
@@ -256,7 +262,7 @@ async def test_model_derived_schema_nested_query_matches_o_depth(model_demo_sche
 @pytest.mark.pg
 @pytest.mark.asyncio
 async def test_model_derived_schema_connection_matches(model_demo_schema):
-    """The connection query returns the SAME data and SAME statement count (2)."""
+    """The connection query returns the SAME data and SAME statement count (3)."""
     query = """
     {
       authors {
@@ -269,10 +275,11 @@ async def test_model_derived_schema_connection_matches(model_demo_schema):
       }
     }
     """
-    with count_sql() as counter:
+    with count_sql(get_engine()) as counter:
         result = await run(model_demo_schema, query)
     assert result.errors is None
-    assert counter.count == 2  # authors + ONE window query for all authors' posts
+    # authors (1) + connection page + separate totalCount aggregate = 3 (O(depth)).
+    assert counter.count == 3
 
     grace = result.data["authors"][2]
     conn = grace["postsConnection"]

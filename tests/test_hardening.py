@@ -1,4 +1,4 @@
-"""Phase E hardening gtests: opt-in limits, tracing hooks, and pg pool config.
+"""Hardening tests: opt-in limits, tracing hooks, and pg pool config.
 
 Each control is OPT-IN via a `GrafastConfig` attached to a *subclass* of
 `GrafastExecutionContext` (never the shared base class, so the conformance harness's

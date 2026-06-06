@@ -1,4 +1,4 @@
-"""DB-backed tests for the Postgres data source (Phase B).
+"""DB-backed tests for the Postgres data source.
 
 These create/drop ONLY within the ``grafast_demo`` schema of ``grafast_py_test``
 (the single permitted database) via :func:`setup_demo_schema`, then run live GraphQL
@@ -14,9 +14,9 @@ import pytest_asyncio
 from graphql import graphql
 
 from grafast_py.context import GrafastExecutionContext
-from grafast_py.pg.connection import encode_cursor
 from examples.demo_schema import build_demo_schema
-from grafast_py.pg.engine import count_sql, dispose_engine
+from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
+from grafast_py.pg.executor import RawExecutor, SQLAlchemyExecutor, pg_request_context
 from grafast_py.pg.resource import PgRegistry, PgResource
 from examples.seed import setup_demo_schema
 from grafast_py.pg.steps import PgSelectSingleStep, PgSelectStep
@@ -25,13 +25,18 @@ pytestmark = pytest.mark.pg
 
 
 async def run(schema, query, variables=None):
-    """Run a query through our engine (not the stock executor)."""
-    return await graphql(
-        schema,
-        query,
-        variable_values=variables,
-        execution_context_class=GrafastExecutionContext,
-    )
+    """Run a query through our engine (not the stock executor).
+
+    Binds a :class:`SQLAlchemyExecutor` over the convenience engine for the request so
+    the pg steps execute their statements via the request-scoped executor.
+    """
+    with pg_request_context(SQLAlchemyExecutor(get_engine())):
+        return await graphql(
+            schema,
+            query,
+            variable_values=variables,
+            execution_context_class=GrafastExecutionContext,
+        )
 
 
 @pytest_asyncio.fixture
@@ -64,9 +69,11 @@ async def test_pg_select_batches_all_keys_into_one_statement():
     from grafast_py.core_steps import constant
 
     step = PgSelectStep(posts, constant(None), "author_id", order_by=["id"])
-    with count_sql() as counter:
-        out = step.execute(3, [[1, 2, 3]])
-        out = await out
+    engine = get_engine()
+    with count_sql(engine) as counter:
+        with pg_request_context(SQLAlchemyExecutor(engine)):
+            out = step.execute(3, [[1, 2, 3]])
+            out = await out
     assert counter.count == 1
     # author i has i+1 posts in the seed
     assert [len(out[0]), len(out[1]), len(out[2])] == [2, 3, 4]
@@ -85,7 +92,8 @@ async def test_pg_select_single_missing_key_is_null():
     from grafast_py.core_steps import constant
 
     step = PgSelectSingleStep(authors, constant(None), "id")
-    out = await step.execute(3, [[1, 999, 2]])
+    with pg_request_context(SQLAlchemyExecutor(get_engine())):
+        out = await step.execute(3, [[1, 999, 2]])
     assert out[0]["name"] == "Ada Lovelace"
     assert out[1] is None
     assert out[2]["name"] == "Alan Turing"
@@ -117,7 +125,7 @@ async def test_nested_query_is_o_depth_not_o_rows(demo_schema):
       }
     }
     """
-    with count_sql() as counter:
+    with count_sql(get_engine()) as counter:
         result = await run(demo_schema, query)
 
     assert result.errors is None
@@ -137,13 +145,13 @@ async def test_nested_query_is_o_depth_not_o_rows(demo_schema):
 async def test_deep_query_statement_count_independent_of_rows(demo_schema):
     """Adding more rows-per-layer does not add statements: count stays at depth."""
     shallow = "{ authors { id posts { id } } }"
-    with count_sql() as counter_shallow:
+    with count_sql(get_engine()) as counter_shallow:
         r1 = await run(demo_schema, shallow)
     assert r1.errors is None
     assert counter_shallow.count == 2  # authors + posts, regardless of 9 posts
 
     deep = "{ authors { id posts { id comments { id } } } }"
-    with count_sql() as counter_deep:
+    with count_sql(get_engine()) as counter_deep:
         r2 = await run(demo_schema, deep)
     assert r2.errors is None
     assert counter_deep.count == 3  # authors + posts + comments
@@ -153,7 +161,7 @@ async def test_deep_query_statement_count_independent_of_rows(demo_schema):
 async def test_hasone_relation_resolves_single_parent(demo_schema):
     """Post.author (hasOne) returns the single owning author row."""
     query = "{ posts { id author { id name } } }"
-    with count_sql() as counter:
+    with count_sql(get_engine()) as counter:
         result = await run(demo_schema, query)
     assert result.errors is None
     assert counter.count == 2  # posts + authors
@@ -193,10 +201,12 @@ async def test_connection_paging_batched_across_parents(demo_schema):
       }
     }
     """
-    with count_sql() as counter:
+    with count_sql(get_engine()) as counter:
         result = await run(demo_schema, query)
     assert result.errors is None
-    assert counter.count == 2  # authors + ONE window query for all authors' posts
+    # authors (1) + the connection LAYER (page + the separate totalCount aggregate, since
+    # totalCount is selected) = 3 statements, still O(depth) across ALL authors.
+    assert counter.count == 3
 
     grace = result.data["authors"][2]
     conn = grace["postsConnection"]
@@ -213,8 +223,23 @@ async def test_connection_paging_batched_across_parents(demo_schema):
 
 @pytest.mark.asyncio
 async def test_connection_after_cursor(demo_schema):
-    """An `after` cursor advances the page; hasNextPage flips at the end."""
-    after = encode_cursor(2)
+    """An `after` (keyset) cursor advances the page; hasNextPage flips at the end."""
+    first_page = await run(
+        demo_schema,
+        """
+        {
+          author(id: 3) {
+            postsConnection(first: 2) {
+              edges { node { id } cursor }
+              pageInfo { endCursor }
+            }
+          }
+        }
+        """,
+    )
+    assert first_page.errors is None
+    end_cursor = first_page.data["author"]["postsConnection"]["pageInfo"]["endCursor"]
+
     query = """
     query Page($after: String!) {
       author(id: 3) {
@@ -225,9 +250,87 @@ async def test_connection_after_cursor(demo_schema):
       }
     }
     """
-    result = await run(demo_schema, query, {"after": after})
+    result = await run(demo_schema, query, {"after": end_cursor})
     assert result.errors is None
     conn = result.data["author"]["postsConnection"]
+    # author 3 owns posts 6,7,8,9; first page is 6,7, so after its endCursor -> 8,9.
     assert [e["node"]["id"] for e in conn["edges"]] == [8, 9]
     assert conn["pageInfo"]["hasNextPage"] is False
     assert conn["pageInfo"]["hasPreviousPage"] is True
+
+
+# ------------------------------------------------------------- executor decoupling
+
+
+@pytest.mark.asyncio
+async def test_raw_executor_runs_core_statement_on_host_pool():
+    """A PgSelectStep's Core statement runs through a host RawExecutor returning dicts.
+
+    Proves build (SQLAlchemy Core) and execute (the host's raw SQL pool) are decoupled:
+    the step BUILDS the ``= ANY(:keys)`` statement, RawExecutor COMPILES it to ``$1``
+    positional SQL (asyncpg numeric_dollar), and the host's run_callable runs it on the
+    raw asyncpg connection underneath the convenience engine. The ``= ANY`` clause must
+    compile to a SINGLE ``$1`` array param, not inlined per-element literals.
+    """
+    await dispose_engine()
+    await setup_demo_schema()
+    registry = PgRegistry()
+    posts = PgResource(
+        "posts", "grafast_demo", "posts", ["id", "author_id", "title"], registry=registry
+    )
+    from grafast_py.core_steps import constant
+
+    step = PgSelectStep(posts, constant(None), "author_id", order_by=["id"])
+    engine = get_engine()
+
+    seen_sql: list[str] = []
+
+    async def run_on_raw_pool(sql_text, positional_params, settings, commit):
+        """Run host-supplied `$1` SQL on the raw asyncpg connection; return dicts."""
+        seen_sql.append(sql_text)
+        raw = await engine.raw_connection()
+        try:
+            asyncpg_conn = raw.driver_connection
+            records = await asyncpg_conn.fetch(sql_text, *positional_params)
+            return [dict(r) for r in records]
+        finally:
+            raw.close()
+
+    executor = RawExecutor(run_on_raw_pool)
+    with pg_request_context(executor):
+        out = step.execute(3, [[1, 2, 3]])
+        out = await out
+
+    # exactly one `$1` array param, never `$2`/inlined literals (single batched query).
+    assert seen_sql[0].count("$1") == 1
+    assert "$2" not in seen_sql[0]
+    assert "ANY" in seen_sql[0].upper()
+    # author i has i+1 posts in the seed
+    assert [len(out[0]), len(out[1]), len(out[2])] == [2, 3, 4]
+    assert out[0][0]["author_id"] == 1
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_raw_executor_forwards_commit_flag_to_host_callback():
+    """RawExecutor passes ``commit`` as the 4th host-callback arg so writes are distinct.
+
+    The host owns the txn lifecycle but must be able to tell a committing mutation
+    (``commit=True``) from a read (``commit=False``); RawExecutor forwards the flag rather
+    than dropping it. Records the flag a minimal callback receives on each path; no DB.
+    """
+    from sqlalchemy import column, select, table
+
+    seen_commit: list[bool] = []
+
+    async def record_commit(sql_text, positional_params, settings, commit):
+        seen_commit.append(commit)
+        return []
+
+    executor = RawExecutor(record_commit)
+    stmt = select(column("id")).select_from(table("posts", column("id")))
+
+    await executor.run(stmt, {}, settings=None, commit=True)
+    await executor.run(stmt, {}, settings=None, commit=False)
+
+    assert seen_commit == [True, False]

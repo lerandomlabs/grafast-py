@@ -1,4 +1,4 @@
-"""Shared concurrent-soak core for the Phase D load harness.
+"""Shared concurrent-soak core for the concurrent-soak load harness.
 
 Drives many GraphQL operations concurrently through
 :class:`grafast_py.GrafastExecutionContext` against the ``grafast_demo`` schema,
@@ -19,6 +19,11 @@ this is also the only shape that actually exercises a pool leak. CONCURRENCY
 intentionally exceeds the pool size so checkouts queue rather than open unbounded
 connections; that contention is what surfaces checkout/leak bugs.
 
+The soak assumes EXCLUSIVE DB access: it reseeds the shared ``grafast_demo`` schema and
+then asserts exact per-author counts, so a SECOND pytest process reseeding the same local
+DB mid-run would corrupt its snapshot and trip the author-count assertion. Run it in a
+SINGLE process — never overlap pytest runs against the same database.
+
 SAFETY: the only database touched is ``grafast_py_test`` and the only schema is
 ``grafast_demo``. The seeder imports the shared engine (``get_engine``) and never
 constructs its own connection URL; all DDL/DML is confined to ``grafast_demo``.
@@ -37,6 +42,7 @@ from sqlalchemy import text
 from grafast_py import GrafastExecutionContext
 from examples.demo_schema import build_demo_schema
 from grafast_py.pg.engine import get_engine
+from grafast_py.pg.executor import SQLAlchemyExecutor, pg_request_context
 from examples.seed import DEMO_SCHEMA
 
 try:  # current-RSS sampling; psutil is the dev dep for this (preferred over rusage).
@@ -63,12 +69,20 @@ POSTS_PER_AUTHOR = 5
 COMMENTS_PER_POST = 4
 
 
-async def scale_seed(n: int) -> None:
+async def scale_seed(n: int) -> int:
     """Idempotently (re)seed ``grafast_demo`` with N authors + fixed fan-out.
 
-    Drops and recreates the schema, then bulk-inserts deterministic rows. Confined
-    strictly to ``grafast_demo`` in ``grafast_py_test`` via the shared engine — no
-    other database is reachable.
+    Drops and recreates the schema, then bulk-inserts deterministic rows, all in ONE
+    committing transaction (``engine.begin()`` commits on exit). Confined strictly to
+    ``grafast_demo`` in ``grafast_py_test`` via the shared engine — no other database is
+    reachable.
+
+    Before returning, it RE-READS the committed author count over a FRESH connection and
+    asserts it equals ``n``: the soak reads must never start against a half-seeded or
+    stale-count schema, so the seed is proven committed + visible here rather than racing
+    the first concurrent read (a query once saw 3 authors — the ``setup_demo_schema``
+    count — instead of the scaled N). Returns the verified committed count so the caller
+    drives its expectations off what is actually in the table, not a hoped-for constant.
     """
     engine = get_engine()
     async with engine.begin() as conn:
@@ -143,6 +157,22 @@ async def scale_seed(n: int) -> None:
             comments,
         )
 
+    # the transaction above has COMMITTED; re-read the author count over a FRESH
+    # connection (not the seeding one) to prove the commit is visible to the very
+    # connections the soak's concurrent reads will check out from the pool. Fail loud if
+    # the table does not hold exactly n — the soak must not run against a stale count.
+    async with engine.connect() as conn:
+        result = await conn.execute(
+            text(f"SELECT count(*) FROM {DEMO_SCHEMA}.authors")
+        )
+        seeded = result.scalar_one()
+    if seeded != n:
+        raise AssertionError(
+            f"scale_seed({n}) committed but a fresh read saw {seeded} authors; "
+            "the seed is not visible — refusing to start the soak against a stale count"
+        )
+    return seeded
+
 
 async def _insert_chunked(conn, sql: str, rows: List[dict], chunk: int = 1000) -> None:
     stmt = text(sql)
@@ -164,13 +194,19 @@ def make_shapes(n_authors: int) -> List[Tuple[str, str, Callable[[dict], None]]]
 
     def v_flat(data: dict) -> None:
         authors = data["authors"]
-        assert len(authors) == n_authors, (len(authors), n_authors)
+        assert len(authors) == n_authors, (
+            f"author count mismatch: observed {len(authors)}, expected {n_authors} "
+            "(a cross-process reseed likely corrupted the shared grafast_demo snapshot)"
+        )
         a0 = authors[0]
         assert isinstance(a0["id"], int) and isinstance(a0["name"], str)
 
     def v_nested(data: dict) -> None:
         authors = data["authors"]
-        assert len(authors) == n_authors
+        assert len(authors) == n_authors, (
+            f"author count mismatch: observed {len(authors)}, expected {n_authors} "
+            "(a cross-process reseed likely corrupted the shared grafast_demo snapshot)"
+        )
         first = authors[0]
         assert len(first["posts"]) == POSTS_PER_AUTHOR
         assert len(first["posts"][0]["comments"]) == COMMENTS_PER_POST
@@ -306,9 +342,10 @@ async def run_soak(
         name, query, validator = shapes[op_index % len(shapes)]
         t0 = time.perf_counter()
         try:
-            result = await graphql(
-                schema, query, execution_context_class=GrafastExecutionContext
-            )
+            with pg_request_context(SQLAlchemyExecutor(engine)):
+                result = await graphql(
+                    schema, query, execution_context_class=GrafastExecutionContext
+                )
         except (asyncio.TimeoutError, OSError, RuntimeError) as exc:
             async with lock:
                 res.errors += 1
