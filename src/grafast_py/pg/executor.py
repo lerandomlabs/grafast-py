@@ -303,16 +303,17 @@ class SQLAlchemyExecutor:
 class RawExecutor:
     """A :class:`PgExecutor` that compiles to ``$1`` SQL and runs it on a host callback.
 
-    ``run_callable(text, positional_params, settings)`` is the host's "run raw SQL on
-    my pool" function; it returns ``list[dict]``. The Core statement is compiled with
-    the asyncpg dialect (paramstyle ``numeric_dollar`` → ``$1, $2, …``) and
-    ``render_postcompile=True`` so ``col = ANY(:keys)`` stays a SINGLE ``$1`` array
-    param rather than expanding to inlined per-element literals.
+    ``run_callable(sql_text, positional_params, settings, commit)`` is the host's "run raw
+    SQL on my pool" function (a 4-arg contract); it returns ``list[dict]``. The Core
+    statement is compiled with the asyncpg dialect (paramstyle ``numeric_dollar`` → ``$1,
+    $2, …``) and ``render_postcompile=True`` so ``col = ANY(:keys)`` stays a SINGLE ``$1``
+    array param rather than expanding to inlined per-element literals.
 
-    ``commit`` is accepted on :meth:`run` for protocol uniformity but the commit
-    decision rests with the host callback: a :class:`RawExecutor` owns no engine, so the
-    host's pool function controls the connection/transaction lifecycle (and thus whether a
-    mutation's RETURNING-bearing DML persists).
+    ``commit`` is forwarded as the 4th callback arg, but the commit decision rests with the
+    host callback: a :class:`RawExecutor` owns no engine, so the host's pool function
+    controls the connection/transaction lifecycle (and thus whether a mutation's
+    RETURNING-bearing DML persists). Forwarding ``commit`` lets the host tell a committing
+    write apart from a read.
     """
 
     def __init__(
@@ -336,8 +337,8 @@ class RawExecutor:
     ) -> List[dict]:
         """Compile ``statement`` to ``$1`` SQL + positional params, then run it.
 
-        ``commit`` is forwarded to the host callback so it can run a mutation's DML in a
-        committing transaction on its own pool (the host owns the connection lifecycle).
+        ``commit`` is passed as the 4th host-callback arg so it can run a mutation's DML in
+        a committing transaction on its own pool (the host owns the connection lifecycle).
         """
         if isinstance(statement, ClauseElement):
             compiled = statement.compile(
@@ -355,8 +356,10 @@ class RawExecutor:
             # already a (text, positional_params) pair.
             sql_text, positional_params = statement
 
-        log.debug("pg raw execute", params=len(positional_params))
-        rows = await self._run_callable(sql_text, positional_params, settings)
+        log.debug("pg raw execute", params=len(positional_params), commit=commit)
+        rows = await self._run_callable(
+            sql_text, positional_params, settings, commit
+        )
         return [dict(row) for row in rows]
 
 

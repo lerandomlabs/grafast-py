@@ -288,7 +288,7 @@ async def test_raw_executor_runs_core_statement_on_host_pool():
 
     seen_sql: list[str] = []
 
-    async def run_on_raw_pool(sql_text, positional_params, settings):
+    async def run_on_raw_pool(sql_text, positional_params, settings, commit):
         """Run host-supplied `$1` SQL on the raw asyncpg connection; return dicts."""
         seen_sql.append(sql_text)
         raw = await engine.raw_connection()
@@ -312,3 +312,28 @@ async def test_raw_executor_runs_core_statement_on_host_pool():
     assert [len(out[0]), len(out[1]), len(out[2])] == [2, 3, 4]
     assert out[0][0]["author_id"] == 1
     await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_raw_executor_forwards_commit_flag_to_host_callback():
+    """RawExecutor passes ``commit`` as the 4th host-callback arg so writes are distinct.
+
+    The host owns the txn lifecycle but must be able to tell a committing mutation
+    (``commit=True``) from a read (``commit=False``); RawExecutor forwards the flag rather
+    than dropping it. Records the flag a minimal callback receives on each path; no DB.
+    """
+    from sqlalchemy import column, select, table
+
+    seen_commit: list[bool] = []
+
+    async def record_commit(sql_text, positional_params, settings, commit):
+        seen_commit.append(commit)
+        return []
+
+    executor = RawExecutor(record_commit)
+    stmt = select(column("id")).select_from(table("posts", column("id")))
+
+    await executor.run(stmt, {}, settings=None, commit=True)
+    await executor.run(stmt, {}, settings=None, commit=False)
+
+    assert seen_commit == [True, False]

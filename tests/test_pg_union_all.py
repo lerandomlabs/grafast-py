@@ -232,6 +232,43 @@ def test_members_disagree_on_match_arity_fails_loud():
         )
 
 
+def test_members_disagree_on_match_columns_fails_loud():
+    """Per-parent members must match the SAME key column NAMES (one shared partition key).
+
+    The step partitions/scatters/counts under a single set of match columns (the first
+    member's), so a member whose FK is named differently (``writer_id`` vs ``owner_id``)
+    would project that column under a name the window never sees — its rows group under
+    ``None`` and are silently dropped, and the count leg references a column the member
+    lacks. Reject it at construction, naming the divergent member and column.
+    """
+    snippets_writer = PgResource(
+        "snippets",
+        "grafast_demo",
+        "snippets",
+        ["id", "writer_id", "created", "body"],
+        registry=PgRegistry(),
+        column_types=CREATED_TYPE,
+    )
+    with pytest.raises(ValueError, match="disagree on match columns"):
+        PgUnionAllStep(
+            [
+                PgUnionMember(make_articles(), "Article", match="owner_id"),
+                PgUnionMember(snippets_writer, "Snippet", match="writer_id"),
+            ],
+            # writer_id is NOT shared (only owner_id is), so the divergent column is also
+            # NULL-padded in the peer leg — the substantive failure mode.
+            shared_columns=["id", "owner_id", "created"],
+            order_by=["created"],
+            key_step=constant(None),
+        )
+
+
+def test_same_name_match_columns_still_constructs():
+    """The well-formed case (every member matches the SAME shared column) still builds."""
+    step = make_union(key_step=constant(None), first=2)
+    assert step.match_columns == ("owner_id",)
+
+
 def test_forward_and_reverse_paging_both_fails_loud():
     with pytest.raises(ValueError, match="forward XOR reverse"):
         make_union(first=3, last=3)

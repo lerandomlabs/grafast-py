@@ -1041,6 +1041,128 @@ async def test_json_stable_override_non_native_column_folds(jsonb_docs_schema):
     assert by_id[3]["docs"] == []
 
 
+# ============================================================ SKIP: self-referential relation
+
+
+@pytest_asyncio.fixture
+async def self_relation_schema():
+    """A SELF-referential ``employees`` table: reports (hasMany) + manager (hasOne) on itself.
+
+    ``employees(id, manager_id, name)`` with a self-FK ``manager_id -> id``. A self-relation
+    folds the SAME table into itself, which the flat ``build_lateral`` cannot alias apart from
+    the outer parent (the inner child would carry the SAME unaliased table name, collapsing the
+    correlation so every parent silently gets ``[]`` / ``null``). So the predicate must SKIP it
+    and keep the batched ``= ANY($1)`` path — this fixture proves the SKIP returns CORRECT,
+    NON-EMPTY children byte-identically under both flag states, with NO statement saving.
+    """
+    await dispose_engine()
+    await setup_demo_schema()
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.employees"))
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE {DEMO_SCHEMA}.employees (
+                    id         integer PRIMARY KEY,
+                    manager_id integer NULL REFERENCES {DEMO_SCHEMA}.employees (id),
+                    name       text NOT NULL
+                )
+                """
+            )
+        )
+        # employee 1 is the top manager; 2 and 3 report to 1; 4 reports to 2. So manager 1 has
+        # two reports, manager 2 has one, employees 3 and 4 have none (the empty-hasMany case),
+        # and employee 1's manager FK is NULL (the null-hasOne case).
+        await conn.execute(
+            text(
+                f"INSERT INTO {DEMO_SCHEMA}.employees (id, manager_id, name) VALUES"
+                " (1, NULL, 'Root'), (2, 1, 'Mid A'), (3, 1, 'Mid B'), (4, 2, 'Leaf')"
+            )
+        )
+
+    registry = PgRegistry()
+    employees = PgResource(
+        "employees", DEMO_SCHEMA, "employees",
+        [
+            PgColumn("id", sql_type=Integer()),
+            PgColumn("manager_id", sql_type=Integer()),
+            PgColumn("name", sql_type=Text()),
+        ],
+        registry=registry,
+    )
+    # the self-FK both ways: a manager's reports (hasMany) and a report's manager (hasOne).
+    employees.has_many(
+        "reports", employees, local_column="id", remote_column="manager_id"
+    )
+    employees.has_one(
+        "manager", employees, local_column="manager_id", remote_column="id"
+    )
+
+    from grafast_py.pg.steps import PgSelectAllStep
+
+    sdl = """
+    type Query { employees: [Employee!]! }
+    type Employee {
+      id: Int!
+      name: String!
+      reports: [Employee!]!
+      manager: Employee
+    }
+    """
+
+    def leaf(key):
+        def plan(parent, args, info):
+            return access(parent, (key,))
+
+        return plan
+
+    schema = make_grafast_schema(
+        sdl,
+        {
+            "Query": {
+                "employees": lambda p, a, i: PgSelectAllStep(
+                    employees, order_by=["id"]
+                ).for_parent(p)
+            },
+            "Employee": {
+                "id": leaf("id"),
+                "name": leaf("name"),
+                "reports": lambda p, a, i: employees.related_many(p, "reports"),
+                "manager": lambda p, a, i: employees.related_single(p, "manager"),
+            },
+        },
+    )
+    yield schema
+    async with engine.begin() as conn:
+        await conn.execute(text(f"DROP TABLE IF EXISTS {DEMO_SCHEMA}.employees"))
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_self_relation_skips_but_identical(self_relation_schema):
+    """A self-referential relation is SKIPPED (no fold); children are CORRECT, byte-identical.
+
+    The regression for the self-relation bug: without the same-table guard the fold collapses
+    the correlation so EVERY manager gets ``reports: []`` (and every employee ``manager: null``)
+    — silently wrong. With the SKIP, both the hasMany ``reports`` and the hasOne ``manager``
+    fall back to the batched path, returning the IDENTICAL non-empty children under both flag
+    states, and the count is UNCHANGED (no statement saved — the fold did not fire).
+    """
+    query = "{ employees { id name reports { id name } manager { id name } } }"
+    batched, _bc, _ic = await assert_inlined_equivalent(
+        self_relation_schema, query, expected_saving=0
+    )
+    by_id = {e["id"]: e for e in batched.data["employees"]}
+    # the children are genuinely present (a collapsed correlation would give [] / null) —
+    # manager 1 has reports 2 and 3; employee 2's manager is employee 1.
+    assert [r["id"] for r in by_id[1]["reports"]] == [2, 3]
+    assert by_id[1]["manager"] is None
+    assert by_id[2]["manager"] == {"id": 1, "name": "Root"}
+    assert [r["id"] for r in by_id[2]["reports"]] == [4]
+    assert by_id[3]["reports"] == []  # a leaf with no reports
+
+
 # ============================================================ SKIP: composite key
 
 

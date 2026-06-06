@@ -257,27 +257,14 @@ class PgConnectionStep(PgCustomizable):
         # reverse paging when last/before is in play; otherwise forward. The guard above
         # ensures the two are mutually exclusive here.
         self.reverse = reverse_arg
-        # decode the cursor LOUDLY against the current order (digest-validated); a cursor
-        # minted under a different ordering — or a garbage cursor — raises at plan time
-        # rather than being silently misapplied. The decoded VALUES drive the keyset SQL
-        # (bound as params). They discriminate the dedup key ONLY for a LITERAL cursor; a
-        # variable-derived cursor (a ``Placeholder``) keys off its source tag instead (see
-        # ``after_source`` / ``before_source``), so the value is unwrapped before decode.
-        after_cursor = unwrap_placeholder(after)
-        before_cursor = unwrap_placeholder(before)
-        self.after_values: Optional[List[Any]] = (
-            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
-        )
-        self.before_values: Optional[List[Any]] = (
-            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
-        )
-        # keep the raw after/before (a literal cursor str or a ``Placeholder``) so the
-        # plan-cache rebind can RE-DECODE a variable-derived cursor for the next request —
-        # the decoded ``after_values`` / ``before_values`` above carry THIS request's value,
-        # which a cache hit must replace. A literal cursor is kept verbatim (its rebind is a
-        # no-op); ``None`` when the arg was absent.
+        # keep the raw after/before (a literal cursor str or a ``Placeholder``) so the decode
+        # can be RE-RUN whenever the order mutates (add_order_term) OR a variable-derived cursor
+        # is re-bound for the next cached request (rebind_placeholders) — decoding only at
+        # construction would seek with stale values against a changed order or value. A literal
+        # cursor's rebind is a no-op; ``None`` when the arg was absent.
         self.after = after
         self.before = before
+        self._decode_cursors()
         # dep 0 is the key step; values[0] is the key column at execute time.
         self.add_dependency(key_step)
         self.seed_resource_customization(resource)
@@ -314,6 +301,28 @@ class PgConnectionStep(PgCustomizable):
             bindparam("keys", value=unique_keys or [], expanding=True)
         )
 
+    def _decode_cursors(self) -> None:
+        """Decode the after/before cursors LOUDLY against the CURRENT order and bound values.
+
+        Run at construction, whenever the order is mutated (add_order_term), AND whenever a
+        variable-derived cursor is re-bound for a cached request (rebind_placeholders), so the
+        seek values are always validated against the order actually emitted and the value
+        actually bound. A ``Placeholder`` cursor is unwrapped to its current value first. The
+        decode is digest-validated: a cursor minted under a different ordering — or a garbage
+        cursor — raises a clear "minted for a different ordering" ``ValueError`` at plan time
+        rather than seeking with stale values (an IndexError, or worse a SILENT mis-seek for a
+        same-length order change). The decoded VALUES discriminate the dedup key ONLY for a
+        LITERAL cursor; a variable-derived cursor keys off its source tag instead.
+        """
+        after_cursor = unwrap_placeholder(self.after)
+        before_cursor = unwrap_placeholder(self.before)
+        self.after_values: Optional[List[Any]] = (
+            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
+        )
+        self.before_values: Optional[List[Any]] = (
+            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
+        )
+
     def add_order_term(self, term: Union[str, OrderTerm]) -> None:
         """Append a UNIFORM ordering term (re-normalised with the PK tie-break)."""
         existing = list(self.order_by)
@@ -324,6 +333,10 @@ class PgConnectionStep(PgCustomizable):
             order_is_unique=self.order_is_unique,
         )
         self.resource.assert_order_terms_stored(self.order_by)
+        # the order just changed, so any after/before cursor decoded under the OLD order is
+        # now invalid; re-decode against the new order. A now-incompatible cursor (different
+        # digest) is rejected LOUDLY here instead of silently seeking the wrong page.
+        self._decode_cursors()
 
     def set_first(self, first: Optional[Union[int, Placeholder]]) -> None:
         """Set the structured per-parent forward page size (literal int or ``Placeholder``)."""
@@ -348,14 +361,10 @@ class PgConnectionStep(PgCustomizable):
         self.last = rebind_pagination_value(self.last, values_by_source)
         self.after = rebind_pagination_value(self.after, values_by_source)
         self.before = rebind_pagination_value(self.before, values_by_source)
-        after_cursor = unwrap_placeholder(self.after)
-        before_cursor = unwrap_placeholder(self.before)
-        self.after_values = (
-            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
-        )
-        self.before_values = (
-            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
-        )
+        # re-decode the (possibly re-pointed) cursors against the current order — the shared
+        # helper unwraps the new placeholder value and digest-validates, so a cursor from a
+        # different ordering still fails loud.
+        self._decode_cursors()
 
     # ------------------------------------------------------------------ SQL build
 

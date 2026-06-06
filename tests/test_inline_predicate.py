@@ -404,6 +404,50 @@ def test_skip_cross_schema_child():
     assert parent.inline_candidates(plan) == []
 
 
+def test_skip_self_referential_relation():
+    """A SELF-referential relation (child resource is the SAME table as the parent) — SKIP.
+
+    employees.has_many("reports", employees, ...) folds the SAME table into itself: the flat
+    build_lateral emits the inner child as a bare table with the SAME unaliased name as the
+    outer parent, so the `parent.local = child.remote` correlation would resolve to the INNER
+    table and collapse into a within-row comparison (every parent silently gets []). Until the
+    per-select alias subsystem exists, the predicate must NOT fold a self-relation — it keeps
+    the correct batched `= ANY($1)` path. Covers BOTH the hasMany and hasOne self-relations.
+    """
+    registry = PgRegistry()
+    employees = PgResource(
+        "employees", "grafast_demo", "employees",
+        [
+            PgColumn("id", sql_type=Integer()),
+            PgColumn("manager_id", sql_type=Integer()),
+            PgColumn("name", sql_type=Text()),
+        ],
+        registry=registry,
+    )
+    # the self-FK both ways: a manager's reports (hasMany) and a report's manager (hasOne).
+    employees.has_many(
+        "reports", employees, local_column="id", remote_column="manager_id"
+    )
+    employees.has_one(
+        "manager", employees, local_column="manager_id", remote_column="id"
+    )
+
+    # hasMany self-relation off a root collection.
+    plan, parent = root_authors_plan(employees)
+    plan.add_step(employees.related_many(parent, "reports"))
+    assert parent.inline_candidates(plan) == []
+
+    # hasOne self-relation off a keyed select.
+    from grafast_py.core_steps import constant
+
+    plan2 = Plan()
+    plan2.inline_relations = True
+    parent2 = PgSelectStep(employees, constant(None), "id", order_by=["id"])
+    plan2.add_step(parent2)
+    plan2.add_step(employees.related_single(parent2, "manager"))
+    assert parent2.inline_candidates(plan2) == []
+
+
 def test_skip_mutation_child():
     """A side-effecting (dedupable=False) child is NEVER inlined.
 
