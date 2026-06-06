@@ -15,6 +15,46 @@ experimental Python re-implementation of the core ideas of Graphile's Grafast.
 3. Batching — the DataLoader N+1 problem — becomes **automatic**: a `loadMany` over N
    parents sees all N keys in a single call and fires its loader exactly once.
 
+## The core design choice (and its trade-off)
+
+grafast-py is a **drop-in `graphql-core` `ExecutionContext`** — a batching layer that
+slots *on top of* graphql-core, **not** a replacement engine. (Upstream Grafast, by
+contrast, owns the entire execution pipeline and uses graphql-js only for the type
+system.) That single decision defines what this library is and isn't — read it before
+adopting:
+
+**What it buys you**
+
+- **Adoption is a one-liner** (`execution_context_class=GrafastExecutionContext`): no new
+  server, no rewrite, and planned fields coexist with ordinary graphql-core resolvers in
+  the *same* schema.
+- **A small, legible core** (~1.5k lines vs upstream's ~26k): one tree-shaped plan, not a
+  separate layer-plan / output-plan machinery.
+- **Correctness largely for free**: graphql-core's own execution conformance suite is the
+  oracle, so a plain-resolver schema behaves byte-identically to stock graphql-core.
+- **The asymptotic win equals upstream**: O(depth) batched SQL, not O(rows) — the N+1 fix
+  is fully here.
+
+**What it costs**
+
+- Execution is **fused with graphql-core's field-by-field, tree-shaped completion.**
+  Optimizations upstream gets from its separate `LayerPlan` / `OutputPlan` substrate are
+  therefore harder here, and are deliberately **scoped or opt-in**: query inlining
+  (`LATERAL`) covers the common relation shapes and *falls back* to the batched path
+  otherwise; cross-request plan caching is opt-in and conservative; step **hoisting** and
+  **`@defer`/`@stream`** are not implemented (incremental delivery is the one feature this
+  model genuinely fights — it would require owning output planning).
+- So the gap vs upstream is **constant-factor** (round-trips, a few redundant step runs),
+  **not asymptotic** — and our optimizers intentionally cover fewer cases.
+- We are **coupled to graphql-core's execution semantics and release cadence** (e.g.
+  incremental delivery would track graphql-core 3.3).
+
+**In one line:** if you want pragmatic Grafast-style batching for an *existing* graphql-core
+/ Ariadne app, this is the right tool and the trade-off is the whole point. If you need
+upstream-class *optimization power*, that is a different design — one that owns execution
+on top of graphql-core's type-system / parser / validation (≈ upstream's size) — which this
+library deliberately is **not**.
+
 ## Install
 
 ```bash
