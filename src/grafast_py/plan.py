@@ -14,6 +14,7 @@ resolver-adapter (`ResolveStep`) route, which the planner wires into the same st
 DAG so plain-resolver schemas run unchanged.
 """
 
+from enum import Enum
 from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 from graphql.execution.execute import get_field_def
@@ -60,28 +61,59 @@ class FieldPlan(NamedTuple):
     step: Optional[Step] = None
 
 
-class ObjectPlan(NamedTuple):
-    """An output plan for one object selection set.
+class LayerReason(Enum):
+    """Why a bucket is a batch boundary (a *layer*).
+
+    P1 enumerates only the reasons that have a real, distinct construction site in the
+    planner TODAY: the operation root (and the structurally-identical abstract
+    concrete-type subtree, which is its own ``RootStep``-seeded bucket), and a nested
+    object field's bucket. Reasons that exist only at execution time (a mutation field
+    runs the root layer serially) or only at completion time (a list item) are NOT
+    distinct plan-time layers yet, so they get no member here — they arrive with the
+    later phases that give them their own layer. Nothing branches on ``reason`` in P1;
+    it only records what used to be implicit.
+    """
+
+    ROOT = "root"
+    NESTED = "nested"
+
+
+class LayerPlan(NamedTuple):
+    """The reason-tagged batch boundary for one bucket (execution-only state).
+
+    Owns what `ObjectPlan` used to carry as bucket-boundary state, split out from its
+    output shape so the two can diverge in later phases (the OutputPlan/LayerPlan port).
 
     `parent_step` is the step whose per-bucket output column IS this bucket's parent
-    objects (the operation `RootStep` at the root; an enclosing plan field's step for
-    a nested object; `None` for a bucket reached purely under legacy resolver fields,
-    where no plan-resolver steps run). The executor seeds `parent_step.id` with the
-    live parents and runs this bucket's plan-field steps from there.
+    objects (the operation `RootStep` at the root; an enclosing plan field's step for a
+    nested object; `None` for a bucket reached purely under legacy resolver fields, where
+    no plan-resolver steps run). The executor seeds `parent_step.id` with the live parents
+    and runs this bucket's plan-field steps from there.
 
-    `effect_steps` are side-effecting steps (`dedupable=False`, e.g. a pg mutation)
-    that this bucket must run FOR EFFECT even though no `FieldPlan.step` consumes
-    them — the case where an optimizer absorbed a mutation's return value (inlined it)
-    and orphaned the write. tree-shake force-keeps such a step in the plan DAG, but the
-    executor only runs steps reachable from `fields`, so the orphan needs a run target;
-    `effect_steps` IS that target. With the default identity optimize nothing is ever
-    orphaned, so this list is always empty and the executor path is byte-identical.
+    `effect_steps` are side-effecting steps (`dedupable=False`, e.g. a pg mutation) that
+    this bucket must run FOR EFFECT even though no `FieldPlan.step` consumes them — the
+    case where an optimizer absorbed a mutation's return value (inlined it) and orphaned
+    the write. tree-shake force-keeps such a step in the plan DAG, but the executor only
+    runs steps reachable from `fields`, so the orphan needs a run target; `effect_steps`
+    IS that target. With the default identity optimize nothing is ever orphaned, so this
+    list is always empty and the executor path is byte-identical.
+    """
+
+    reason: LayerReason
+    parent_step: Optional[Step] = None
+    effect_steps: List[Step] = []
+
+
+class ObjectPlan(NamedTuple):
+    """An output plan for one object selection set, paired with its batch boundary.
+
+    `parent_type` and `fields` are the output shape; `layer` is the reason-tagged batch
+    boundary (`parent_step`/`effect_steps`) the executor seeds and runs this bucket from.
     """
 
     parent_type: GraphQLObjectType
     fields: List[FieldPlan]
-    parent_step: Optional[Step] = None
-    effect_steps: List[Step] = []
+    layer: LayerPlan
 
 
 def plan_object(
@@ -90,6 +122,7 @@ def plan_object(
     fields: Dict[str, List[FieldNode]],
     parent_step: Optional[Step] = None,
     plan: Optional[Plan] = None,
+    reason: LayerReason = LayerReason.NESTED,
 ) -> ObjectPlan:
     """Plan one object selection set into an ObjectPlan.
 
@@ -205,7 +238,9 @@ def plan_object(
             )
         )
     return ObjectPlan(
-        parent_type=parent_type, fields=field_plans, parent_step=parent_step
+        parent_type=parent_type,
+        fields=field_plans,
+        layer=LayerPlan(reason=reason, parent_step=parent_step),
     )
 
 
@@ -295,7 +330,12 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     plan.add_step(root_step)
 
     object_plan = plan_object(
-        context, root_type, root_fields, parent_step=root_step, plan=plan
+        context,
+        root_type,
+        root_fields,
+        parent_step=root_step,
+        plan=plan,
+        reason=LayerReason.ROOT,
     )
 
     object_plan = finalize_plan(plan, object_plan)
@@ -465,8 +505,8 @@ def collect_consumption_root_steps(object_plan: ObjectPlan) -> List[Step]:
     seen: Dict[int, Step] = {}
 
     def visit(op: ObjectPlan) -> None:
-        if op.parent_step is not None:
-            seen[op.parent_step.id] = op.parent_step
+        if op.layer.parent_step is not None:
+            seen[op.layer.parent_step.id] = op.layer.parent_step
         for fp in op.fields:
             if fp.step is not None:
                 seen[fp.step.id] = fp.step
@@ -513,12 +553,15 @@ def attach_effect_steps(
         mine = [
             effect
             for effect in orphaned_effects
-            if op.parent_step is not None
-            and owner_id_for[effect.id] == op.parent_step.id
+            if op.layer.parent_step is not None
+            and owner_id_for[effect.id] == op.layer.parent_step.id
         ]
-        return op._replace(
-            fields=new_fields, effect_steps=[*op.effect_steps, *mine] if mine else op.effect_steps
+        new_layer = (
+            op.layer._replace(effect_steps=[*op.layer.effect_steps, *mine])
+            if mine
+            else op.layer
         )
+        return op._replace(fields=new_fields, layer=new_layer)
 
     return rebuild(object_plan, 0)
 
@@ -542,11 +585,11 @@ def _deepest_owner_parent_id(object_plan: ObjectPlan, boundary_ids: set) -> int:
     def visit(op: ObjectPlan, depth: int) -> None:
         nonlocal best_id, best_depth
         if (
-            op.parent_step is not None
-            and op.parent_step.id in boundary_ids
+            op.layer.parent_step is not None
+            and op.layer.parent_step.id in boundary_ids
             and depth > best_depth
         ):
-            best_id = op.parent_step.id
+            best_id = op.layer.parent_step.id
             best_depth = depth
         for fp in op.fields:
             child = find_object_completer(fp.completer)
@@ -556,8 +599,9 @@ def _deepest_owner_parent_id(object_plan: ObjectPlan, boundary_ids: set) -> int:
     visit(object_plan, 0)
     if best_id >= 0:
         return best_id
-    if object_plan.parent_step is not None:
-        return object_plan.parent_step.id  # boundary-less write → the root bucket runs it
+    if object_plan.layer.parent_step is not None:
+        # boundary-less write → the root bucket runs it
+        return object_plan.layer.parent_step.id
     raise AssertionError(
         "orphaned side-effecting step has no bucket to run it for effect "
         "(the root ObjectPlan has no parent_step)"
@@ -581,7 +625,8 @@ def remap_object_plan(object_plan: ObjectPlan, remap: Dict[int, Step]) -> Object
             remapped_child = remap_object_plan(child.child_plan, remap)
             new_completer = attach_child_plan(new_completer, remapped_child)
         new_fields.append(fp._replace(step=new_step, completer=new_completer))
-    new_parent_step = object_plan.parent_step
+    new_parent_step = object_plan.layer.parent_step
     if new_parent_step is not None:
         new_parent_step = remap.get(new_parent_step.id, new_parent_step)
-    return object_plan._replace(fields=new_fields, parent_step=new_parent_step)
+    new_layer = object_plan.layer._replace(parent_step=new_parent_step)
+    return object_plan._replace(fields=new_fields, layer=new_layer)

@@ -51,7 +51,7 @@ def is_live(state: "FieldCompletion", i: int) -> bool:
 def run_bucket_steps(context, plan: ObjectPlan, parents: List[Any]):
     """Run this bucket's plan-resolver step sub-DAG ONCE, seeded by `parents`.
 
-    The bucket's parent column is `plan.parent_step`'s output (the operation root, or
+    The bucket's parent column is `plan.layer.parent_step`'s output (the operation root, or
     the enclosing plan field's step). We seed that step id with `parents` and run
     every plan-field step reachable from it (access / lambda / load / object steps)
     in dependency order via `run_steps`, pruning the walk at the parent_step boundary
@@ -63,22 +63,22 @@ def run_bucket_steps(context, plan: ObjectPlan, parents: List[Any]):
     async load is in the sub-DAG), or `None` when the bucket has no plan-field steps
     (the pure legacy-resolver path, unchanged).
 
-    `plan.effect_steps` are side-effecting steps an optimizer orphaned (a mutation whose
+    `plan.layer.effect_steps` are side-effecting steps an optimizer orphaned (a mutation whose
     return value was inlined): no field consumes them, so they are added to the run
     targets here to RUN FOR EFFECT in this bucket — their output column is discarded but
     the write executes. With the default identity optimize `effect_steps` is empty, so
     the targets (and the run) are byte-identical to before.
     """
-    if plan.parent_step is None:
+    if plan.layer.parent_step is None:
         return None
     targets = [fp.step for fp in plan.fields if fp.step is not None]
-    targets.extend(plan.effect_steps)
+    targets.extend(plan.layer.effect_steps)
     if not targets:
         return None
 
-    boundary = {plan.parent_step.id}
+    boundary = {plan.layer.parent_step.id}
     ordered = order_steps_within(targets, boundary)
-    seed = {plan.parent_step.id: parents}
+    seed = {plan.layer.parent_step.id: parents}
     return run_steps(
         len(parents),
         ordered,
@@ -194,7 +194,7 @@ def execute_object_plan_serially(
     Returns the same per-parent dict / `Bubble` list (or a coroutine) as the
     parallel executor.
 
-    `plan.effect_steps` (side-effecting steps an optimizer orphaned by inlining their
+    `plan.layer.effect_steps` (side-effecting steps an optimizer orphaned by inlining their
     return value) are run FOR EFFECT up front: a mutation whose result is not selected
     still must write. If that run is async the whole serial pass becomes a coroutine that
     awaits the effects before completing any field. With the default identity optimize
@@ -202,7 +202,7 @@ def execute_object_plan_serially(
     """
     state = FieldCompletion(len(parents))
 
-    if plan.effect_steps:
+    if plan.layer.effect_steps:
         effects = run_effect_steps(context, plan, parents)
         if context.is_awaitable(effects):
 
@@ -235,7 +235,13 @@ def execute_object_plan_serially_fields(
     # seeing whether it returned a coroutine, then continue accordingly
     for index, field_plan in enumerate(plan.fields):
         maybe = complete_field(
-            context, field_plan, parents, parent_paths, state, None, plan.parent_step
+            context,
+            field_plan,
+            parents,
+            parent_paths,
+            state,
+            None,
+            plan.layer.parent_step,
         )
         if maybe is not None:
             # this field is async: finish it, then drive the rest one-by-one
@@ -249,7 +255,7 @@ def execute_object_plan_serially_fields(
                         parent_paths,
                         state,
                         None,
-                        plan.parent_step,
+                        plan.layer.parent_step,
                     )
                     if later is not None:
                         await later
@@ -349,15 +355,15 @@ def run_effect_steps(context, plan: ObjectPlan, parents: List[Any]):
     """Run a bucket's orphaned side-effecting steps FOR EFFECT, discarding outputs.
 
     A mutation whose return value an optimizer inlined is orphaned (no `FieldPlan.step`
-    consumes it) yet must still write; `plan.effect_steps` holds those steps. We seed the
+    consumes it) yet must still write; `plan.layer.effect_steps` holds those steps. We seed the
     bucket's `parent_step` boundary with `parents` and run the effect steps' reachable
     sub-DAG once — the `execute` is the write. The result columns are intentionally
     dropped (no field reads them). Returns a coroutine when an effect step is async (a pg
     mutation), else None. Only called when `effect_steps` is non-empty.
     """
-    boundary = {plan.parent_step.id}
-    ordered = order_steps_within(plan.effect_steps, boundary)
-    seed = {plan.parent_step.id: parents}
+    boundary = {plan.layer.parent_step.id}
+    ordered = order_steps_within(plan.layer.effect_steps, boundary)
+    seed = {plan.layer.parent_step.id: parents}
     columns = run_steps(
         len(parents),
         ordered,

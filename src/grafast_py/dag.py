@@ -174,7 +174,7 @@ class Plan:
         """Drop steps unreachable from `consumption_roots` AND not side-effecting.
 
         `consumption_roots` is the executor's consumption surface for the finalized
-        plan — every `FieldPlan.step` plus each `ObjectPlan.parent_step`, across the
+        plan — every `FieldPlan.step` plus each `ObjectPlan.layer.parent_step`, across the
         whole (transitively nested) ObjectPlan tree — computed by the caller, which
         holds the ObjectPlan (`dag.py` stays ObjectPlan-free). From those roots, the
         transitively-needed step ids are exactly `order_steps`' reachable set over
