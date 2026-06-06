@@ -67,9 +67,7 @@ from .placeholders import (
     Placeholder,
     placeholder_source,
     placeholder_source_tag,
-    rebind_pagination_value,
-    rebind_placeholder_value,
-    unwrap_placeholder,
+    resolve_placeholder,
 )
 from .resource import PgResource
 from .steps import as_match_columns, grouping_key, normalize_lookup_key
@@ -80,6 +78,10 @@ from .steps import as_match_columns, grouping_key, normalize_lookup_key
 # column. Named with the GraphQL meta-field spelling so a host wiring the tag bridge uses
 # the obvious key.
 TYPENAME_COLUMN = "__typename"
+
+# sentinel distinguishing "caller omitted the resolved cursor values" (default to the step's
+# plan-time literal decode) from "caller passed None" (genuinely no cursor on that side).
+_UNSET: Any = object()
 
 
 @dataclass(frozen=True)
@@ -161,6 +163,10 @@ class PgUnionAllStep(Step):
     """
 
     is_sync_and_safe = False
+    # needs the per-request source-tag -> value map (BucketExtra.source_values) to resolve its
+    # page-size / cursor / per-member WHERE placeholders into the compiled statement's params at
+    # render time (and to digest-validate a variable cursor per request).
+    wants_extra = True
 
     def __init__(
         self,
@@ -235,26 +241,18 @@ class PgUnionAllStep(Step):
                 "reverse — pass only one direction"
             )
         self.reverse = reverse_arg
-        # decode the cursor LOUDLY against the current order (digest-validated); a cursor
-        # minted under a different ordering — or garbage — raises at plan time. The decoded
-        # VALUES drive the keyset SQL (bound as params); they discriminate the dedup key only
-        # for a LITERAL cursor — a variable cursor keys off its source tag (above). Unwrap a
-        # ``Placeholder`` to the cursor string before decode.
-        after_cursor = unwrap_placeholder(after)
-        before_cursor = unwrap_placeholder(before)
-        self.after_values: Optional[List[Any]] = (
-            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
-        )
-        self.before_values: Optional[List[Any]] = (
-            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
-        )
-        # keep the raw after/before (a literal cursor str or a ``Placeholder``) AND the page
-        # sizes so the plan-cache rebind can re-point a variable-derived page/cursor for the
-        # next request — the decoded ``after_values`` / ``before_values`` above carry THIS
-        # request's value, which a cache hit must replace (mirrors PgConnectionStep). A literal
-        # cursor / size is kept verbatim (its rebind is a no-op); ``None`` when the arg was absent.
+        # keep the raw after/before (a literal cursor str or a ``Placeholder``) so a LITERAL
+        # cursor can be re-decoded on an order mutation and a VARIABLE cursor resolved + decoded
+        # per request at render. ``None`` when the arg was absent.
         self.after = after
         self.before = before
+        # decode LITERAL cursors at plan time (request-stable, and the dedup key reads their
+        # decoded VALUES); a VARIABLE (``Placeholder``) cursor stores no decoded values on the
+        # shared step — it is resolved against this request's source map and decoded at render
+        # (see :meth:`resolve_cursor_values`), keying value-agnostically off its source tag.
+        # The decode is digest-validated: a literal cursor minted under a different ordering —
+        # or garbage — raises a clear "minted for a different ordering" ``ValueError``.
+        self.after_values, self.before_values = self.decode_literal_cursors()
         # PER-PARENT mode iff a key step is wired. Every member then needs a match key, and
         # all members must agree on the match arity (the window partitions by ONE shared
         # set of match columns across the union). ROOT mode has no key match.
@@ -366,50 +364,79 @@ class PgUnionAllStep(Step):
         """Whether the per-parent match key spans more than one column."""
         return len(self.match_columns) > 1
 
-    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
-        """Re-point this union's page-size, CURSOR and per-member WHERE placeholders to a cached request.
+    def decode_literal_cursors(self) -> Tuple[Optional[List[Any]], Optional[List[Any]]]:
+        """Decode the LITERAL after/before cursors against the current order (plan time).
 
-        The plan-cache rebind hook for a pgUnionAll (Wave 4): unlike a plain select the union
-        subclasses :class:`~grafast_py.step_model.Step` directly (not ``PgCustomizable``), so it
-        does not inherit the WHERE rebind — it re-points all three placeholder surfaces itself,
-        mirroring :meth:`PgConnectionStep.rebind_placeholders`:
-
-        * ``first`` / ``last`` page sizes — a variable-derived size is a :class:`Placeholder`
-          re-pointed by source (a literal int is a no-op);
-        * ``after`` / ``before`` cursors — a variable-derived cursor is a :class:`Placeholder`
-          carrying the FIRST request's cursor string; the cached step decoded it into
-          ``after_values`` / ``before_values`` at build, so on a HIT we re-point the sentinel AND
-          RE-DECODE the new cursor against the current order (digest-validated, so a cursor from a
-          different ordering still fails loud);
-        * each member's per-branch WHERE ``pg_placeholder`` bind — re-pointed in place by its
-          source tag (the member dataclass is frozen, but its predicate bindparams are mutable
-          objects, so we set the bound VALUE on each placeholder bind without rebuilding the
-          member). The dedup key is value-agnostic and source-keyed, so the SQL shape is shared;
-          only the bound values move.
-
-        A union whose page/cursor/member-WHERE are all plan-time literals has nothing to
-        re-point, so every branch below is a no-op — as for any non-placeholder step.
+        A LITERAL cursor (a bare str) is request-stable and its decoded VALUES discriminate the
+        dedup key, so it is decoded here at construction. A VARIABLE (``Placeholder``) cursor is
+        NOT decoded here — its value is resolved + decoded per request at RENDER time (see
+        :meth:`resolve_cursor_values`), keying value-agnostically off its source tag. The decode
+        is digest-validated: a literal cursor minted under a different ordering — or garbage —
+        raises a clear ``ValueError`` rather than seeking with stale values.
         """
-        self.first = rebind_pagination_value(self.first, values_by_source)
-        self.last = rebind_pagination_value(self.last, values_by_source)
-        self.after = rebind_pagination_value(self.after, values_by_source)
-        self.before = rebind_pagination_value(self.before, values_by_source)
-        after_cursor = unwrap_placeholder(self.after)
-        before_cursor = unwrap_placeholder(self.before)
-        self.after_values = (
-            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
+        after_values = (
+            decode_keyset_cursor(self.after, self.order_by)
+            if isinstance(self.after, str) and self.after
+            else None
         )
-        self.before_values = (
-            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
+        before_values = (
+            decode_keyset_cursor(self.before, self.order_by)
+            if isinstance(self.before, str) and self.before
+            else None
         )
+        return after_values, before_values
+
+    def resolve_cursor_values(
+        self, source_values: Mapping[str, Any]
+    ) -> Tuple[Optional[List[Any]], Optional[List[Any]]]:
+        """The decoded after/before seek values for THIS request (digest-validated at render).
+
+        A LITERAL cursor's values were decoded at plan time; a VARIABLE (``Placeholder``)
+        cursor is resolved to THIS request's cursor string from ``source_values`` and decoded
+        HERE — never stored on the shared step, so two concurrent cache HITs decode their OWN
+        cursor with no bleed. The decode is digest-validated per request (a variable cursor
+        minted under a different ordering still fails loud, at render time).
+        """
+        after_values = self.after_values
+        before_values = self.before_values
+        if isinstance(self.after, Placeholder):
+            after_cursor = resolve_placeholder(self.after, source_values)
+            after_values = (
+                decode_keyset_cursor(after_cursor, self.order_by)
+                if after_cursor
+                else None
+            )
+        if isinstance(self.before, Placeholder):
+            before_cursor = resolve_placeholder(self.before, source_values)
+            before_values = (
+                decode_keyset_cursor(before_cursor, self.order_by)
+                if before_cursor
+                else None
+            )
+        return after_values, before_values
+
+    def member_where_params(self, source_values: Mapping[str, Any]) -> Dict[str, Any]:
+        """The execute-time params for every member branch's WHERE placeholder binds.
+
+        Unlike a plain select the union subclasses :class:`~grafast_py.step_model.Step` directly
+        (not ``PgCustomizable``), so it gathers its own placeholder params: each member's
+        per-branch ``where`` predicate may carry value-LESS ``pg_placeholder`` binds, whose
+        runtime value is supplied per request in the compiled statement's ``params`` (keyed by
+        the bind name, resolved by its source tag against ``source_values``) rather than baked
+        on the SHARED bind. A union with only literal member predicates returns ``{}``. The same
+        bind names appear in BOTH the page leg and the count leg (the union rebuilds the same
+        member predicates each render), so these params serve both.
+        """
+        params: Dict[str, Any] = {}
         for member in self.members:
             for predicate in member.where:
                 for bind in visitors.iterate(predicate):
                     if not isinstance(bind, BindParameter):
                         continue
                     source = placeholder_source(bind)
-                    if source is not None and source in values_by_source:
-                        rebind_placeholder_value(bind, values_by_source[source])
+                    if source is not None:
+                        params[bind.key] = source_values.get(source)
+        return params
 
     # ------------------------------------------------------------------ SQL build
 
@@ -427,22 +454,27 @@ class PgUnionAllStep(Step):
             for t in self.order_by
         )
 
-    def page_size(self) -> Optional[int]:
-        """The active page size as a runtime int, unwrapping a variable-derived ``Placeholder``.
+    def page_size(self, source_values: Mapping[str, Any] = {}) -> Optional[int]:
+        """The active page size as a runtime int, resolving a variable-derived ``Placeholder``.
 
         ``last`` for reverse, ``first`` for forward; a ``Placeholder`` yields its request
-        value. The page arithmetic (``page_limit`` + the one-extra-row probe in
-        ``build_connection``) reads THIS, so a placeholder page size pages exactly like a
-        literal — only the dedup key (which keeps the sentinel) differs.
+        value from ``source_values``. The page arithmetic (``page_limit`` + the one-extra-row
+        probe in ``build_connection``) reads THIS, so a placeholder page size pages exactly
+        like a literal — only the dedup key (which keeps the sentinel) differs.
         """
-        return unwrap_placeholder(self.last if self.reverse else self.first)
+        return resolve_placeholder(self.last if self.reverse else self.first, source_values)
 
-    def page_limit(self) -> Optional[int]:
+    def page_limit(self, source_values: Mapping[str, Any] = {}) -> Optional[int]:
         """The per-partition row cap: the page size PLUS ONE extra (for hasNextPage)."""
-        size = self.page_size()
+        size = self.page_size(source_values)
         return None if size is None else size + 1
 
-    def cursor_predicate(self, member: PgUnionMember) -> Optional[ColumnElement]:
+    def cursor_predicate(
+        self,
+        member: PgUnionMember,
+        after_values: Optional[List[Any]],
+        before_values: Optional[List[Any]],
+    ) -> Optional[ColumnElement]:
         """The keyset WHERE predicate for ``member``'s branch, or ``None`` when unpaged.
 
         Built over the SHARED order columns PLUS the ``__typename`` discriminator, so it
@@ -451,27 +483,28 @@ class PgUnionAllStep(Step):
         rather than a non-existent ``__typename`` column — that final tie-break is what
         makes the seek total across the union, so a cross-branch ``(order, id)`` collision
         no longer drops or duplicates a tied row). Forward selects rows strictly AFTER
-        ``after``; reverse strictly BEFORE ``before``. The cursor column types come from the
-        FIRST member's resource (the order columns are shared, so their type is the same in
-        every member's source).
+        ``after``; reverse strictly BEFORE ``before``. The seek values are passed in (resolved
+        per request via :meth:`resolve_cursor_values`), never read off the shared step. The
+        cursor column types come from the FIRST member's resource (the order columns are
+        shared, so their type is the same in every member's source).
         """
         column_types = self.members[0].resource.column_types
         column_exprs = {TYPENAME_COLUMN: literal(member.type_name)}
         if self.reverse:
-            if self.before_values is None:
+            if before_values is None:
                 return None
             return keyset_where(
                 self.order_by,
-                self.before_values,
+                before_values,
                 after=False,
                 column_types=column_types,
                 column_exprs=column_exprs,
             )
-        if self.after_values is None:
+        if after_values is None:
             return None
         return keyset_where(
             self.order_by,
-            self.after_values,
+            after_values,
             after=True,
             column_types=column_types,
             column_exprs=column_exprs,
@@ -493,14 +526,21 @@ class PgUnionAllStep(Step):
             bindparam("keys", value=unique_keys or [], expanding=True)
         )
 
-    def branch_select(self, member: PgUnionMember, unique_keys: Optional[List[Any]]):
+    def branch_select(
+        self,
+        member: PgUnionMember,
+        unique_keys: Optional[List[Any]],
+        after_values: Optional[List[Any]] = None,
+        before_values: Optional[List[Any]] = None,
+    ):
         """Build ONE member's ``SELECT`` leg of the union (shared + NULL-padded + tag).
 
         Projects the shared columns by name, the union-wide member columns (its own where
         present else ``NULL AS <col>``), and ``literal(type_name) AS __typename`` — so every
         leg has the identical column list and tags its concrete type. The keyset cursor
-        predicate and the per-parent key match (per-parent mode) AND onto this branch's
-        WHERE alongside the member's own per-branch predicates.
+        predicate (built from this request's resolved seek values) and the per-parent key
+        match (per-parent mode) AND onto this branch's WHERE alongside the member's own
+        per-branch predicates.
         """
         own = set(member.resource.columns)
         shared_proj: List[ColumnElement] = [column(c) for c in self.shared_columns]
@@ -519,23 +559,37 @@ class PgUnionAllStep(Step):
         ).select_from(tbl)
         if self.is_per_parent:
             stmt = stmt.where(self.match_predicate(member, unique_keys))
-        cursor = self.cursor_predicate(member)
+        cursor = self.cursor_predicate(member, after_values, before_values)
         if cursor is not None:
             stmt = stmt.where(cursor)
         for predicate in member.where:
             stmt = stmt.where(predicate)
         return stmt
 
-    def union_subquery(self, unique_keys: Optional[List[Any]]):
+    def union_subquery(
+        self,
+        unique_keys: Optional[List[Any]],
+        after_values: Optional[List[Any]] = None,
+        before_values: Optional[List[Any]] = None,
+    ):
         """The ``UNION ALL`` of every member's leg, as a subquery to window/order over."""
-        legs = [self.branch_select(m, unique_keys) for m in self.members]
+        legs = [
+            self.branch_select(m, unique_keys, after_values, before_values)
+            for m in self.members
+        ]
         return union_all(*legs).subquery()
 
     def projected_columns(self) -> List[str]:
         """The full union row column list (shared + member-specific + the typename tag)."""
         return list(self.shared_columns) + list(self.member_columns) + [TYPENAME_COLUMN]
 
-    def build_page_query(self, unique_keys: Optional[List[Any]] = None):
+    def build_page_query(
+        self,
+        unique_keys: Optional[List[Any]] = None,
+        source_values: Mapping[str, Any] = {},
+        after_values: Any = _UNSET,
+        before_values: Any = _UNSET,
+    ):
         """Build the batched keyset-sliced PAGE SELECT over the union (ONE statement).
 
         Per-parent: numbers each parent's union rows ``row_number() OVER (PARTITION BY
@@ -544,15 +598,24 @@ class PgUnionAllStep(Step):
         parent's page is contiguous and in window order. Root: a plain ``ORDER BY <order>``
         over the union with a plain ``LIMIT :page_limit`` (one synthetic bucket entry — no
         partition to corrupt). The keyset cursor predicate lives on each branch's WHERE
-        (see :meth:`branch_select`), so the slice is fully IN SQL.
+        (see :meth:`branch_select`), built from this request's resolved seek values, so the
+        slice is fully IN SQL.
+
+        ``after_values`` / ``before_values`` are this request's decoded seek values; when
+        omitted (a direct build call) they default to the step's plan-time-decoded LITERAL
+        values, so a literal cursor still seeks.
         """
-        union = self.union_subquery(unique_keys)
+        if after_values is _UNSET:
+            after_values = self.after_values
+        if before_values is _UNSET:
+            before_values = self.before_values
+        union = self.union_subquery(unique_keys, after_values, before_values)
         projected = self.projected_columns()
         order = order_clauses_over(union, self.effective_order())
 
         if not self.is_per_parent:
             stmt = select(*[union.c[c] for c in projected]).order_by(*order)
-            if self.page_limit() is not None:
+            if self.page_limit(source_values) is not None:
                 stmt = stmt.limit(bindparam("page_limit"))
             return stmt
 
@@ -567,7 +630,7 @@ class PgUnionAllStep(Step):
         stmt = select(*outer_cols).order_by(
             *[inner.c[c] for c in self.match_columns], inner.c["__rn"]
         )
-        if self.page_limit() is not None:
+        if self.page_limit(source_values) is not None:
             stmt = stmt.where(inner.c["__rn"] <= bindparam("page_limit"))
         return stmt
 
@@ -624,28 +687,38 @@ class PgUnionAllStep(Step):
         return grouping_key(row, self.match_columns)
 
     async def run_queries(
-        self, unique_keys: Optional[List[Any]]
+        self, unique_keys: Optional[List[Any]], source_values: Mapping[str, Any] = {}
     ) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
         """Run the page query (always) and the count (iff ``needs_total``).
 
         Returns the page rows and a per-parent ``match -> total`` map (empty when
         ``needs_total`` is unset; a single ``None`` key in root mode). The ``keys`` param
         binds the shared single-column match list at execute time; a composite match bakes
-        its IN list at build time so it passes no ``keys`` param.
+        its IN list at build time so it passes no ``keys`` param. ``source_values`` resolves
+        this request's variable-derived cursors (decoded here, never on the shared step), page
+        size, and per-member WHERE placeholder values, injected into the params so a value-LESS
+        placeholder bind executes with this request's value; the count leg AND-s the same
+        member predicates, so it carries the same member WHERE params.
         """
         request = current_pg_request()
-        params: Dict[str, Any] = {}
+        after_values, before_values = self.resolve_cursor_values(source_values)
+        member_params = self.member_where_params(source_values)
+        params: Dict[str, Any] = dict(member_params)
         if self.is_per_parent and not self.is_composite:
             params["keys"] = unique_keys
-        if self.page_limit() is not None:
-            params["page_limit"] = self.page_limit()
+        if self.page_limit(source_values) is not None:
+            params["page_limit"] = self.page_limit(source_values)
         rows = await request.executor.run(
-            self.build_page_query(unique_keys), params, settings=request.settings
+            self.build_page_query(
+                unique_keys, source_values, after_values, before_values
+            ),
+            params,
+            settings=request.settings,
         )
 
         totals: Dict[Any, int] = {}
         if self.needs_total:
-            count_params: Dict[str, Any] = {}
+            count_params: Dict[str, Any] = dict(member_params)
             if self.is_per_parent and not self.is_composite:
                 count_params["keys"] = unique_keys
             count_rows = await request.executor.run(
@@ -680,7 +753,12 @@ class PgUnionAllStep(Step):
         return member.resource.decode_row(row)
 
     def build_connection(
-        self, rows: List[Dict[str, Any]], total: int
+        self,
+        rows: List[Dict[str, Any]],
+        total: int,
+        source_values: Mapping[str, Any] = {},
+        after_values: Optional[List[Any]] = None,
+        before_values: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Assemble one parent's page rows + total into a Relay connection dict.
 
@@ -690,9 +768,13 @@ class PgUnionAllStep(Step):
         requested order. Each node is the codec-decoded tagged row (carrying ``__typename``),
         so completion-time dispatch resolves its concrete type. The cursor encodes from the
         RAW row's order-column values, so encode before decode.
+
+        ``source_values`` resolves the variable-derived page size for the one-extra-row probe;
+        ``after_values`` / ``before_values`` (this request's decoded seek values) drive the
+        ``hasNextPage``/``hasPreviousPage`` presence flags — both per request.
         """
-        # the active page size as a runtime int (unwrapping a variable-derived Placeholder).
-        size = self.page_size()
+        # the active page size as a runtime int (resolving a variable-derived Placeholder).
+        size = self.page_size(source_values)
         has_extra = size is not None and len(rows) > size
         page = rows[:size] if has_extra else rows
         if self.reverse:
@@ -709,10 +791,10 @@ class PgUnionAllStep(Step):
 
         if self.reverse:
             has_previous = has_extra
-            has_next = self.before_values is not None
+            has_next = before_values is not None
         else:
             has_next = has_extra
-            has_previous = self.after_values is not None
+            has_previous = after_values is not None
 
         return {
             "edges": edges,
@@ -731,13 +813,21 @@ class PgUnionAllStep(Step):
         """``type_name -> member`` map for decoding a tagged row through its resource."""
         return {m.type_name: m for m in self.members}
 
-    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+    def execute(self, count: int, values: List[List[Any]], extra=None) -> List[Any]:
+        # `extra` is always supplied in production; the default covers a direct execute() call
+        # in a unit test with no placeholders.
+        source_values = extra.source_values if extra is not None else {}
         if not self.is_per_parent:
             # ROOT: one statement for the whole union; the SAME connection is returned for
             # every bucket entry (a root list has one logical result, sized to the bucket).
             async def run_root():
-                rows, totals = await self.run_queries(None)
-                conn = self.build_connection(rows, totals.get(None, 0))
+                rows, totals = await self.run_queries(None, source_values)
+                after_values, before_values = self.resolve_cursor_values(source_values)
+                conn = self.build_connection(
+                    rows, totals.get(None, 0),
+                    source_values=source_values,
+                    after_values=after_values, before_values=before_values,
+                )
                 return [dict(conn) for _ in range(count)]
 
             return run_root()
@@ -746,16 +836,25 @@ class PgUnionAllStep(Step):
         keys = [normalize_lookup_key(k, composite) for k in values[0]]
         unique_keys = [k for k in dict.fromkeys(keys) if k is not None]
         if not unique_keys:
-            empty = self.build_connection([], 0)
+            after_values, before_values = self.resolve_cursor_values(source_values)
+            empty = self.build_connection(
+                [], 0, source_values=source_values,
+                after_values=after_values, before_values=before_values,
+            )
             return [dict(empty) for _ in range(count)]
 
         async def run():
-            rows, totals = await self.run_queries(unique_keys)
+            rows, totals = await self.run_queries(unique_keys, source_values)
+            after_values, before_values = self.resolve_cursor_values(source_values)
             by_key: Dict[Any, List[Dict[str, Any]]] = {}
             for row in rows:
                 by_key.setdefault(grouping_key(row, self.match_columns), []).append(row)
             return [
-                self.build_connection(by_key.get(keys[i], []), totals.get(keys[i], 0))
+                self.build_connection(
+                    by_key.get(keys[i], []), totals.get(keys[i], 0),
+                    source_values=source_values,
+                    after_values=after_values, before_values=before_values,
+                )
                 for i in range(count)
             ]
 

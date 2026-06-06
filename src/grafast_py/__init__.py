@@ -202,7 +202,7 @@ _PG_LAZY = {
     "pg_placeholder": ".pg.placeholders",
     "placeholder_source": ".pg.placeholders",
     "Placeholder": ".pg.placeholders",
-    "unwrap_placeholder": ".pg.placeholders",
+    "resolve_placeholder": ".pg.placeholders",
     "placeholder_source_tag": ".pg.placeholders",
 }
 

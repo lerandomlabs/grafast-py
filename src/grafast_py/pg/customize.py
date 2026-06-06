@@ -48,7 +48,7 @@ from ..step_model import Step
 from .conditions import Condition, compile_condition
 from .executor import current_pg_request
 from .ordering import OrderTerm
-from .placeholders import placeholder_source, rebind_placeholder_value
+from .placeholders import placeholder_source
 
 # The bind names the batched skeleton itself owns; a host predicate may not reuse them
 # (it would shadow the skeleton's own value at execute time).
@@ -332,29 +332,26 @@ class PgCustomizable(Step):
         """
         self.placeholder_binds.update(placeholder_binds_in(predicate))
 
-    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
-        """Re-point this step's WHERE placeholder binds to a cached request's variable values.
+    def where_params(self, source_values: Mapping[str, Any]) -> Dict[str, Any]:
+        """The execute-time params for this step's WHERE placeholder binds (name -> value).
 
-        The plan-cache rebind (Wave 4): a cached select's ``pg_placeholder`` binds carry the
-        FIRST request's values; on a cache HIT for a different request, re-point each to THIS
-        request's value by its stable SOURCE tag (``values_by_source["var:status"]``). Walks
-        the predicate ASTs (the binds live inside ``where_predicates``, not a flat list) and
-        sets the value on every bind whose source is supplied. A literal-only step has an empty
-        registry, so the loop body never runs — a no-op, as for any non-placeholder step.
-
-        The dedup signature is value-agnostic and source-keyed, so the bound-value change does
-        NOT invalidate the cached key; only the executed value moves. The signature cache is
-        untouched (the key never depended on the value).
+        The deepcopy-free render seam (Wave 4 / P5): a ``pg_placeholder`` bind is value-LESS,
+        so its runtime value is supplied per request in the compiled statement's ``params``
+        rather than baked on the SHARED bind. This maps each placeholder bind's NAME to THIS
+        request's value, resolved by the bind's stable SOURCE tag against ``source_values``
+        (the source-tag -> value map threaded via ``BucketExtra``). A literal-only step has an
+        empty ``placeholder_binds`` registry, so this returns ``{}`` — a byte-identical no-op
+        for the default cache-off path. A source absent from the map resolves to ``None`` (an
+        omitted no-default variable). The subclass seeds these into the ``params`` it hands
+        ``executor.run`` alongside ``keys`` / pagination params, so the value rides
+        ``compiled.params`` per request and never mutates the cached statement.
         """
         if not self.placeholder_binds:
-            return
-        for predicate in self.where_predicates:
-            for bind in visitors.iterate(predicate):
-                if not isinstance(bind, BindParameter):
-                    continue
-                source = self.placeholder_binds.get(bind.key)
-                if source is not None and source in values_by_source:
-                    rebind_placeholder_value(bind, values_by_source[source])
+            return {}
+        return {
+            name: source_values.get(source)
+            for name, source in self.placeholder_binds.items()
+        }
 
     def copy_customization_from(self, other: "PgCustomizable") -> None:
         """Copy ``other``'s already-resolved customization onto this step verbatim.

@@ -5,7 +5,8 @@ Steps 1-6 added the opt-in flags, the ``FieldArgs`` variable provenance, the pla
 threading, and the pg placeholder surfaces (WHERE + pagination). This step adds the reuse
 layer: :mod:`grafast_py.cache` — a bounded-LRU process cache keyed by ``(id(schema),
 document-text hash, operation name, variable-arg fingerprint)`` storing the finalized
-ObjectPlan + RootStep + Plan, with a per-request placeholder REBIND on a hit — wired into
+ObjectPlan + RootStep + Plan, served as the SHARED entry on a hit (DEEPCOPY-FREE, P5) with a
+per-request SOURCE MAP rendered into the compiled statement's params — wired into
 ``plan_operation`` behind ``GrafastConfig.cache_plans`` (default off).
 
 This module gates:
@@ -13,13 +14,17 @@ This module gates:
   * the cache module itself (LRU store/get/eviction, key stability/discrimination, fingerprint);
   * the CACHEABILITY guard (a plan that inlined a variable LITERAL is NOT cached — reusing it
     would serve the wrong value);
-  * the REBIND correctness through :func:`grafast_py.cache.rebind_cached_plan` (a cached step's
-    placeholder values are re-pointed by SOURCE to this request's variables);
+  * the RENDER-INJECTION correctness (a cached step's value-less placeholders resolve to THIS
+    request's value from the per-request source map at SQL-render time);
+  * the SHARED-ENTRY IDENTITY proof (a cache HIT reuses the cached plan object by identity — no
+    deepcopy is taken);
   * the NO-REGRESSION oracle (same query cached-off vs cached-on -> byte-identical result), plus
     the plan-build-SKIP proof (the second request of a document does NOT re-plan);
   * the ANTI-CORRUPTION gate end-to-end over the DB: the SAME cached value-agnostic plan, run
     with TWO different variable values, returns each its OWN correct rows (a cache hit must
-    never serve one request the value of another — the worst failure mode in the project).
+    never serve one request the value of another — the worst failure mode in the project),
+    INCLUDING an aggressive BARRIER-SYNCHRONIZED concurrent no-bleed backstop (the deepcopy-free
+    cache shares one step DAG across concurrent requests, so a missed relocation would BLEED).
 
 DB tests are marked ``pg`` (deselectable ``-m 'not pg'``); they touch ONLY the ``grafast_demo``
 ``widgets`` fixture and alter nothing else.
@@ -40,9 +45,6 @@ from grafast_py.cache import (
     config_fingerprint,
     default_cache,
     document_text,
-    isolate_cached_plan,
-    pinned_resources,
-    rebind_cached_plan,
     values_by_source,
     variable_arg_fingerprint,
 )
@@ -52,9 +54,10 @@ from grafast_py.core_steps import access, constant
 from grafast_py.dag import Plan
 from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
 from grafast_py.pg.executor import SQLAlchemyExecutor, pg_request_context
-from grafast_py.pg.placeholders import pg_placeholder
+from grafast_py.pg.placeholders import Placeholder, pg_placeholder
 from grafast_py.pg.resource import PgRegistry, PgResource
 from grafast_py.pg.steps import PgSelectAllStep, PgSelectStep
+from grafast_py.steps import BucketExtra
 from examples.seed import setup_demo_schema, setup_widgets_table
 
 
@@ -258,7 +261,7 @@ def test_values_by_source_covers_omitted_variables_as_none():
     assert mapping == {"var:s": "published", "var:n": None}
 
 
-# ------------------------------------------------- rebind correctness (no DB, pg step)
+# --------------------------------------- render-injection correctness (deepcopy-free, no DB)
 
 
 def make_widgets() -> PgResource:
@@ -272,125 +275,114 @@ def make_widgets() -> PgResource:
     )
 
 
-def test_rebind_repoints_where_placeholder_value():
-    """rebind_cached_plan re-points a cached WHERE placeholder to THIS request's value.
+def test_where_placeholder_is_value_less_and_resolves_from_source_map():
+    """A cached WHERE placeholder bind is value-LESS; its value is rendered from the source map.
 
-    The cached step carried the FIRST request's value ("draft"); after the rebind it carries
-    the new one ("published"), while the dedup key (value-agnostic, source-keyed) is unchanged.
+    The deepcopy-free model: the shared step holds NO request value (the ``pg_placeholder`` bind
+    is value-less). Two different source maps render two different param values from the SAME
+    shared step, and the dedup key (value-agnostic, source-keyed) is unchanged by either render.
     """
     step = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
     step.builder().where(column("status") == pg_placeholder("var:status", "draft"))
-    key_before = (step.peer_key, step.dedup_params())
+    key = (step.peer_key, step.dedup_params())
 
-    plan = Plan()
-    plan.add_step(step)
-    cached = CachedPlan(object_plan=None, root_step=None, plan=plan, schema=None)
-
-    rebind_cached_plan(cached, {"status": "published"})
-
-    # the bound value moved; the SQL still binds it as a :param (never inlined). The predicate
-    # is `column("status") == <placeholder bind>`, so its right operand IS the bindparam.
     ph_bind = step.where_predicates[0].right
-    assert ph_bind.value == "published"
-    # the dedup key never depended on the value, so the rebind does not invalidate it.
-    assert (step.peer_key, step.dedup_params()) == key_before
+    assert ph_bind.value is None  # value-LESS — no request value lives on the shared bind
+    name = ph_bind.key
+
+    # request A and request B render their OWN value from the SHARED step — no copy, no bleed.
+    assert step.where_params({"var:status": "draft"}) == {name: "draft"}
+    assert step.where_params({"var:status": "published"}) == {name: "published"}
+    # the dedup key never depended on the value, so neither render invalidates it.
+    assert (step.peer_key, step.dedup_params()) == key
 
 
-def test_rebind_repoints_pagination_placeholder_value():
-    """rebind_cached_plan re-points a cached ``first`` Placeholder to THIS request's value."""
-    from grafast_py.pg.placeholders import Placeholder
-
+def test_pagination_placeholder_is_value_less_and_resolves_from_source_map():
+    """A cached ``first`` Placeholder is value-LESS; its value resolves from the source map."""
     step = PgSelectStep(
         make_widgets(), constant(None), "owner_id", order_by=["id"],
-        first=Placeholder("var:n", 2),
+        first=Placeholder("var:n"),
     )
-    key_before = (step.peer_key, step.dedup_params())
-    plan = Plan()
-    plan.add_step(step)
-    cached = CachedPlan(object_plan=None, root_step=None, plan=plan, schema=None)
-
-    rebind_cached_plan(cached, {"n": 9})
+    key = (step.peer_key, step.dedup_params())
 
     assert isinstance(step.first, Placeholder)
     assert step.first.source == "var:n"
-    assert step.first.value == 9  # the runtime value moved...
-    assert (step.peer_key, step.dedup_params()) == key_before  # ...but the key did not.
+    assert not hasattr(step.first, "value")  # value-LESS sentinel (only the source tag lives on)
+    # the root LIMIT placeholder renders its value per request from the source map.
+    root = PgSelectAllStep(
+        make_widgets(), order_by=["id"], first=Placeholder("var:n"),
+    ).for_parent(constant(None))
+    assert root.run_params({"var:n": 9}) == {"root_first": 9}
+    assert root.run_params({"var:n": 2}) == {"root_first": 2}
+    # the dedup key is unchanged by the value-less sentinel.
+    assert (step.peer_key, step.dedup_params()) == key
 
 
-def test_rebind_is_noop_without_placeholders():
-    """A literal-only / core step ignores the rebind (the default no-op hook)."""
+def test_where_params_is_empty_without_placeholders():
+    """A literal-only step has no placeholder binds, so ``where_params`` is a byte-identical no-op."""
     step = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
     step.builder().where(column("status") == "published")  # a literal, not a placeholder
-    plan = Plan()
-    plan.add_step(step)
-    cached = CachedPlan(object_plan=None, root_step=None, plan=plan, schema=None)
-    # rebind with an unrelated variable -> nothing changes (no placeholder to re-point)
-    rebind_cached_plan(cached, {"status": "draft"})
+    assert step.where_params({"var:status": "draft"}) == {}
+    # the literal value is baked on its own auto-named bind, untouched by the source map.
     assert step.where_predicates[0].right.value == "published"
 
 
-# ------------------------------------------- per-request isolation (concurrency-safety, no DB)
+# -------------------------------- shared-entry identity (deepcopy-free, gate 9, no DB)
 
 
-def test_isolate_then_rebind_leaves_shared_entry_immutable():
-    """REGRESSION: two requests isolate+rebind their OWN copy; the shared entry never mutates.
+def test_cache_hit_returns_the_shared_plan_object(monkeypatch):
+    """A cache HIT reuses the cached plan object BY IDENTITY — proving the deepcopy is gone.
 
-    The cross-request value bleed: the rebind mutates placeholder bound values IN PLACE, so two
-    requests of the same cached plan with DIFFERENT variables, if they shared one step DAG, could
-    serve one the other's value. ``isolate_cached_plan`` deep-copies the entry per request, so each
-    rebinds its OWN copy and the shared entry stays at its first-bound value — the property that
-    makes the cache concurrency-safe WITHOUT request serialization.
+    The deepcopy-free property (gate 9): ``lookup_cached_plan`` stashes the SHARED cached triple
+    on the context (``context._grafast_plan IS cached.plan``), not a per-request copy. We capture
+    what ``store_cached_plan`` put in the cache on the MISS, then capture the second request's
+    ``context._grafast_plan`` on the HIT and assert they are the IDENTICAL objects (an ``is``
+    check no deepcopy could pass). The per-request SOURCE MAP differs, but the plan is shared.
     """
-    step = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
-    step.builder().where(column("status") == pg_placeholder("var:status", "published"))
-    plan = Plan()
-    plan.add_step(step)
-    shared = CachedPlan(object_plan="op", root_step=None, plan=plan, schema=None)
+    from grafast_py.schema import make_grafast_schema
 
-    def where_value(cached):
-        for s in cached.plan.steps:
-            preds = getattr(s, "where_predicates", None)
-            if preds:
-                return preds[0].right.value
-        return None
+    schema = make_grafast_schema(
+        SDL, {"Query": {"things": things_placeholder_plan}, "Thing": {"id": id_plan}}
+    )
+    cache = PlanCache()
+    config = GrafastConfig(placeholders=True, cache_plans=True, plan_cache=cache)
 
-    # two "concurrent" requests each isolate then rebind to their own value.
-    req_a = isolate_cached_plan(shared)
-    rebind_cached_plan(req_a, {"status": "draft"})
-    req_b = isolate_cached_plan(shared)
-    rebind_cached_plan(req_b, {"status": "archived"})
+    stored = {}
+    real_store = plan_module.store_cached_plan
 
-    assert where_value(req_a) == "draft"
-    assert where_value(req_b) == "archived"
-    # the SHARED cache entry is never touched — it still carries the first-bound value.
-    assert where_value(shared) == "published"
-    # the copies are distinct step objects (no shared mutable state between requests).
-    assert req_a.plan.steps is not req_b.plan.steps
-    assert req_a.plan.steps[-1] is not shared.plan.steps[-1]
+    def spy_store(context, operation, cfg, object_plan, root_step, plan):
+        stored["object_plan"] = object_plan
+        stored["plan"] = plan
+        stored["root_step"] = root_step
+        return real_store(context, operation, cfg, object_plan, root_step, plan)
 
+    monkeypatch.setattr(plan_module, "store_cached_plan", spy_store)
 
-def test_isolate_pins_schema_and_resource_shared():
-    """``isolate_cached_plan`` PINS the schema and pg resources shared (immutable config, not copied).
+    captured = {}
+    real_lookup = plan_module.lookup_cached_plan
 
-    The schema must stay ``is``-identical (the hit re-verifies ``entry.schema is request_schema``);
-    a pg resource is immutable shared config (table/columns/codecs) read only at execute time, so a
-    per-request copy would needlessly duplicate it. Only the steps' OWN mutable state is copied.
-    """
-    schema = object()
-    resource = make_widgets()
-    step = PgSelectStep(resource, constant(None), "owner_id", order_by=["id"])
-    step.builder().where(column("status") == pg_placeholder("var:status", "published"))
-    plan = Plan()
-    plan.add_step(step)
-    shared = CachedPlan(object_plan="op", root_step=None, plan=plan, schema=schema)
+    def spy_lookup(context, operation, cfg):
+        result = real_lookup(context, operation, cfg)
+        if result is not None:  # a HIT — capture what was stashed on the context
+            captured["object_plan"] = result
+            captured["plan"] = context._grafast_plan
+            captured["root_step"] = context._grafast_root_step
+        return result
 
-    # the resource is reachable for pinning, and the schema is pinned by identity.
-    assert resource in pinned_resources(plan)
-    copy_ = isolate_cached_plan(shared)
-    assert copy_.schema is schema  # schema pinned (stays is-identical)
-    copied_step = [s for s in copy_.plan.steps if getattr(s, "resource", None) is not None][0]
-    assert copied_step.resource is resource  # resource pinned (shared, not duplicated)
-    assert copied_step is not step  # ...but the STEP itself is a fresh copy
+    monkeypatch.setattr(plan_module, "lookup_cached_plan", spy_lookup)
+
+    query = "query Q($s: String) { things(status: $s) { id } }"
+    # request 1 MISSes and stores the shared triple; request 2 HITs and reuses it by identity.
+    graphql_sync(schema, query, variable_values={"s": "x"},
+                 execution_context_class=context_class_with(config))
+    graphql_sync(schema, query, variable_values={"s": "y"},
+                 execution_context_class=context_class_with(config))
+
+    assert cache.hits == 1 and cache.misses == 1
+    # the HIT reused the SHARED objects — no deepcopy was taken (the gate-9 identity proof).
+    assert captured["object_plan"] is stored["object_plan"]
+    assert captured["plan"] is stored["plan"]
+    assert captured["root_step"] is stored["root_step"]
 
 
 # --------------------------------------------------------------- cacheability guard
@@ -856,9 +848,68 @@ async def test_cached_plan_has_no_cross_request_bleed_under_concurrency(seeded):
         ids = sorted(w["id"] for w in result.data["widgets"])
         assert ids == expected[status], f"{status} request bled: got {ids}"
         assert {w["status"] for w in result.data["widgets"]} == {status}
-    # only the warm-up missed; all 16 concurrent requests were cache hits that isolated cleanly.
+    # only the warm-up missed; all 16 concurrent requests were cache hits over the SHARED plan.
     assert cache.misses == 1
     assert cache.hits == len(statuses)
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_deepcopy_free_cache_no_bleed_under_barrier_concurrency(seeded):
+    """BACKSTOP (gate 8): aggressive BARRIER-SYNCHRONIZED concurrent no-bleed over the SHARED plan.
+
+    The deepcopy is GONE — a cache HIT serves the SHARED step DAG, and each request renders its
+    OWN variable value into the compiled statement's params via its OWN ``BucketExtra.source_values``.
+    A single missed per-request relocation would BLEED across concurrent requests and pass a
+    single-threaded run. This is the load-bearing guard against that: warm the cache once, then run
+    MANY rounds of N requests with DIFFERENT variable values, each coroutine waiting on an
+    ``asyncio.Barrier`` IMMEDIATELY before ``graphql(...)`` so all N requests release into execution
+    TOGETHER (a genuine overlap, not a lucky schedule). Every request must get ITS OWN correct rows.
+    """
+    cache = PlanCache()
+    config = GrafastConfig(placeholders=True, cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_widgets_schema()
+    query = "query Q($s: String!) { widgets(status: $s) { id status } }"
+    expected = {"draft": [2, 5], "published": [1, 3, 4, 6]}
+
+    # warm the cache so EVERY request in the rounds below is a deepcopy-free HIT over the shared plan.
+    with pg_request_context(SQLAlchemyExecutor(get_engine())):
+        await graphql(schema, query, variable_values={"s": "published"},
+                      execution_context_class=_Ctx)
+
+    rounds = 20
+    width = 8  # 20 * 8 = 160 barrier-overlapped concurrent requests
+
+    async def one(barrier, status):
+        with pg_request_context(SQLAlchemyExecutor(get_engine())):
+            # release all `width` requests into execution together so they genuinely overlap.
+            await barrier.wait()
+            return status, await graphql(
+                schema, query, variable_values={"s": status},
+                execution_context_class=_Ctx,
+            )
+
+    total = 0
+    for _ in range(rounds):
+        barrier = asyncio.Barrier(width)
+        # interleave draft/published so adjacent overlapping requests carry DIFFERENT values.
+        statuses = [("draft" if i % 2 == 0 else "published") for i in range(width)]
+        results = await asyncio.gather(*(one(barrier, s) for s in statuses))
+        for status, result in results:
+            assert result.errors is None
+            ids = sorted(w["id"] for w in result.data["widgets"])
+            assert ids == expected[status], f"{status} request bled: got {ids}"
+            assert {w["status"] for w in result.data["widgets"]} == {status}
+        total += width
+
+    # exactly the warm-up missed; every barrier-overlapped request was a deepcopy-free HIT.
+    assert cache.misses == 1
+    assert cache.hits == total
 
 
 @pytest.mark.pg

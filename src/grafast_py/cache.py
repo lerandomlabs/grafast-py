@@ -5,8 +5,8 @@ step DAG fresh every request and stashes them on the context). When two requests
 SAME document, the plan they produce is identical EXCEPT for the per-request values that
 plan-time inlining baked into the SQL — and once the host expresses those values as
 value-agnostic PLACEHOLDERS (Wave 4), the plan is value-INDEPENDENT and reusable: the
-cached SQL is shared and only the bound VALUES are re-pointed per request. This module is
-that reuse layer.
+cached SQL is shared and the per-request VALUES are supplied at SQL-RENDER time from a
+per-request source map, never stored on the shared step. This module is that reuse layer.
 
 Design (sqlalchemy-free — the core engine never imports the pg stack)
 ---------------------------------------------------------------------
@@ -45,21 +45,25 @@ is a same-every-request literal or a source-tagged placeholder). A plan that inl
 variable as a literal is value-specific and is NEVER cached — reusing it would serve a
 later request the earlier request's value. An operation that owns an ABSTRACT (interface /
 union) field is likewise NOT cached: its per-concrete-type subtrees are planned LAZILY at
-execute time, held on the completer (not in ``plan.steps``), so the rebind below never reaches
-their placeholders — caching such an operation would serve a later request the first request's
-subtree value (``plan.owns_abstract_field`` flips ``cacheable`` False; see ``plan_operation``).
+execute time, held on the completer (not in ``plan.steps``), so the per-request value map
+never reaches their placeholders — caching such an operation would serve a later request the
+first request's subtree value (``plan.owns_abstract_field`` flips ``cacheable`` False; see
+``plan_operation``).
 
-RE-BIND ON HIT. The cached steps carry the FIRST request's placeholder values. Before
-executing a hit for a DIFFERENT request, the cached plan is ISOLATED into a per-request copy
-(:func:`isolate_cached_plan`, a single ``deepcopy`` with the schema + pg resources pinned so
-they stay shared) and :func:`rebind_cached_plan` re-points each placeholder on THAT COPY to THIS
-request's value by its stable SOURCE tag (``"var:<name>"`` -> ``variable_values[name]``), via
-each step's :meth:`~grafast_py.step_model.Step.rebind_placeholders` hook (a no-op for
-non-placeholder steps). The dedup key is value-agnostic, so the SQL is shared; only the bound
-values move. The per-request COPY is what keeps the cache immutable and CONCURRENCY-SAFE: two
-requests of the same document with DIFFERENT variables each rebind+execute their OWN copy, so
-one can never observe the other's bound value (the cross-request value-bleed the shared-mutation
-design risked). The shared cached entry is never mutated, so no request-level serialization is
+SHARED ENTRY ON HIT (deepcopy-free). The cached steps carry NO per-request value: a
+``pg_placeholder`` WHERE bind is value-LESS, a pagination ``Placeholder`` is value-LESS, and a
+variable-derived cursor is decoded per request at render — never on the shared step. So a cache
+HIT stashes the SHARED cached triple DIRECTLY on the context (``context._grafast_plan IS
+cached.plan`` — no copy) plus a per-request SOURCE MAP (``"var:<name>"`` ->
+``variable_values[name]``, via :func:`values_by_source`). The executor threads that map through
+the per-invocation ``BucketExtra.source_values`` channel into each ``wants_extra`` pg step,
+which resolves its placeholder/cursor/page values from the map and injects them into the
+compiled statement's ``params`` at render — never mutating the shared step. The dedup key is
+value-agnostic, so the SQL is shared; only the rendered ``params`` differ per request. This is
+what keeps the cache CONCURRENCY-SAFE WITHOUT a per-request copy: two concurrent requests of the
+same document with DIFFERENT variables share the identical cached step objects but each carries
+its OWN source map on its OWN ``BucketExtra``, so one can never observe the other's value. The
+shared cached entry is never mutated, so no request-level serialization (and no deepcopy) is
 needed.
 
 EVICTION. A bounded LRU (``max_entries``, default 1000) evicts the least-recently-used
@@ -69,7 +73,6 @@ OPT-IN. The cache is consulted ONLY when ``GrafastConfig.cache_plans`` is on; th
 (off) never touches it, so the engine plans per-request exactly as before — byte-identical.
 """
 
-import copy
 from collections import OrderedDict
 from threading import Lock
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple
@@ -87,7 +90,9 @@ class CachedPlan(NamedTuple):
 
     ``object_plan`` is the finalized ObjectPlan tree the executor drives; ``root_step`` is
     the operation ``RootStep`` (the root bucket boundary the executor seeds); ``plan`` is the
-    step DAG (carries ``plan.steps`` for the per-request placeholder rebind).
+    step DAG. The triple is SHARED across requests on a HIT (no copy): it carries no
+    per-request value, so two concurrent hits reuse the identical objects, each with its OWN
+    source map threaded via ``BucketExtra``.
 
     ``schema`` is the schema the plan was built against, kept so a HIT can verify ``entry.schema
     is request_schema``: ``id(schema)`` (a key component) is REUSED after a schema is
@@ -215,8 +220,9 @@ class PlanCache:
     Backed by an :class:`~collections.OrderedDict` under a lock: a GET moves the entry to the
     most-recently-used end; a PUT past ``max_entries`` evicts the least-recently-used end. The
     lock makes GET/PUT safe under the concurrent request fan-out (the entries themselves are
-    immutable plan trees — the per-request VALUES live only in the rebind, never on the cached
-    object — so two requests can share one entry without racing on its contents).
+    immutable plan trees — the per-request VALUES live only in the per-request source map
+    rendered into ``params``, never on the cached object — so two requests can share one entry
+    without racing on its contents).
     """
 
     def __init__(self, max_entries: int = 1000) -> None:
@@ -285,15 +291,17 @@ def values_by_source(
     """Map each operation variable to its placeholder SOURCE tag -> value.
 
     A placeholder's source tag is ``"var:<variable_name>"`` (see ``FieldArgs.source`` /
-    ``pg_placeholder``); the rebind keys off it, so translate the request's
-    ``{variable_name: value}`` into ``{"var:<variable_name>": value}``.
+    ``pg_placeholder``); a pg step resolves its placeholders off it, so translate the request's
+    ``{variable_name: value}`` into ``{"var:<variable_name>": value}``. This is the per-request
+    SOURCE MAP threaded via ``BucketExtra.source_values`` and rendered into the compiled
+    statement's ``params`` (the deepcopy-free hit path) — never bound onto a shared step.
 
     When ``operation`` is given, EVERY declared variable is included — a variable OMITTED this
     request (absent from ``variable_values`` with no default graphql-core folded in) maps to
-    ``None``, so a cache HIT re-points it to ``None`` rather than leaving the PRIOR request's
+    ``None``, so a cache HIT resolves it to ``None`` rather than leaving the PRIOR request's
     value stale (the omitted-no-default correctness gap). graphql-core already folds a
     variable's DEFAULT into ``variable_values`` when omitted, so a defaulted variable carries
-    its default here. Without ``operation`` (a direct rebind in a unit test) only the supplied
+    its default here. Without ``operation`` (a direct map in a unit test) only the supplied
     values are mapped.
     """
     mapping: Dict[str, Any] = {
@@ -303,90 +311,6 @@ def values_by_source(
         for definition in operation.variable_definitions:
             mapping.setdefault(f"var:{definition.variable.name.value}", None)
     return mapping
-
-
-def isolate_cached_plan(cached: CachedPlan) -> CachedPlan:
-    """Deep-copy a cache HIT into a per-request copy so the rebind never mutates the shared entry.
-
-    A single :func:`copy.deepcopy` over the whole triple at once, so the object_plan's
-    ``FieldPlan.step`` references and the ``plan.steps`` copies stay CO-REFERENTIAL (the same
-    ``memo`` maps each shared step to one copy), and the executor still matches seeded boundary
-    columns and field steps by their preserved plan-time ids. The SCHEMA and every pg RESOURCE
-    reachable from the steps are PINNED in the memo so they stay SHARED, never copied: the schema
-    must stay ``is``-identical (the hit re-verifies ``entry.schema is request_schema``), and a pg
-    :class:`~grafast_py.pg.resource.PgResource` is immutable shared config (table / columns /
-    codecs / relations) read only at execute time — a per-request copy would needlessly duplicate
-    that whole graph. Everything the rebind MUTATES — the ``pg_placeholder`` bindparams' values,
-    the pagination ``Placeholder`` sentinels, the decoded cursor values — lives in the steps' OWN
-    state (the ``where_predicates`` / ``first`` / ``after_values`` ...), not on the resource, so
-    pinning the resource leaves every mutated value freshly copied and this request owns its own.
-
-    This is what makes the cache CONCURRENCY-SAFE: each request rebinds + executes its OWN copy,
-    so two concurrent requests of the same document with DIFFERENT variables can never observe
-    each other's value. The copy is far cheaper than re-planning (it skips the whole plan build),
-    and it is taken only on a HIT for a placeholder-bearing cacheable plan (the default cache-off
-    path never reaches here).
-    """
-    memo: Dict[int, Any] = {}
-    if cached.schema is not None:
-        memo[id(cached.schema)] = cached.schema
-    for resource in pinned_resources(cached.plan):
-        memo[id(resource)] = resource
-    return copy.deepcopy(cached, memo)
-
-
-def pinned_resources(plan: Any) -> list:
-    """The pg RESOURCES reachable from a plan's steps (pinned-shared in the copy memo).
-
-    A pg step holds a ``resource`` (its table source) that is immutable shared config — copying
-    it per request would duplicate every column descriptor, codec and relation for no benefit
-    (the rebind never touches the resource; only the step's own bound values move). We pin each
-    distinct resource so :func:`copy.deepcopy` leaves it shared. A union step holds its resources
-    on its ``members`` instead, so those are pinned too. A core (non-pg) step has no resource and
-    contributes none, so a plan with no pg steps pins nothing.
-    """
-    resources: list = []
-    seen: set = set()
-
-    def add(resource: Any) -> None:
-        if resource is not None and id(resource) not in seen:
-            seen.add(id(resource))
-            resources.append(resource)
-
-    for step in plan.steps:
-        add(getattr(step, "resource", None))
-        for member in getattr(step, "members", ()):  # PgUnionAllStep members
-            add(getattr(member, "resource", None))
-    return resources
-
-
-def rebind_cached_plan(
-    cached: CachedPlan,
-    variable_values: Optional[Mapping[str, Any]],
-    operation: Optional[OperationDefinitionNode] = None,
-) -> None:
-    """Re-point a (per-request, isolated) cached plan's placeholder values to THIS request's variables.
-
-    Walks the cached step DAG and calls each step's
-    :meth:`~grafast_py.step_model.Step.rebind_placeholders` with the source-tag -> value map.
-    A step with no placeholders (every core step, and any pg step whose values are plan-time
-    literals) ignores it (the base no-op); a placeholder-bearing pg step re-points its bound
-    WHERE / pagination values. Source tags are request-stable, so the cached value-agnostic
-    SQL is unchanged — only the bound values move to this request's.
-
-    ``operation`` (when given) makes the map cover EVERY declared variable, so a variable
-    omitted this request re-points to ``None`` instead of inheriting the prior request's value.
-
-    CONCURRENCY: the rebind mutates bound values IN PLACE, so the caller must hand it a
-    per-request copy of the cached plan (:func:`isolate_cached_plan`), NOT the shared cache
-    entry — :func:`grafast_py.plan.lookup_cached_plan` does exactly that. With the shared entry
-    left immutable, two concurrent requests of the same document with different variables each
-    rebind their OWN copy and cannot bleed values into each other; no request-level serialization
-    is required. (An operation with NO placeholders rebinds to a no-op regardless.)
-    """
-    mapping = values_by_source(variable_values, operation)
-    for step in cached.plan.steps:
-        step.rebind_placeholders(mapping)
 
 
 __all__ = [
@@ -399,8 +323,5 @@ __all__ = [
     "document_text",
     "variable_arg_fingerprint",
     "values_by_source",
-    "isolate_cached_plan",
-    "pinned_resources",
-    "rebind_cached_plan",
     "default_cache",
 ]

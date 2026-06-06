@@ -76,7 +76,7 @@ from .placeholders import (
     pg_placeholder,
     placeholder_source,
     placeholder_source_tag,
-    unwrap_placeholder,
+    resolve_placeholder,
 )
 from .resource import (
     PgCodec,
@@ -177,7 +177,7 @@ __all__ = [
     "pg_placeholder",
     "placeholder_source",
     "Placeholder",
-    "unwrap_placeholder",
+    "resolve_placeholder",
     "placeholder_source_tag",
     # codec registry: PgCodec lookup by pg type name + recursive array/range/composite/enum
     "codec_for",

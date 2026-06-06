@@ -43,6 +43,7 @@ from grafast_py.pg.placeholders import (
 )
 from grafast_py.pg.resource import PgRegistry, PgResource
 from grafast_py.pg.steps import PgSelectStep
+from grafast_py.steps import BucketExtra
 from examples.seed import setup_demo_schema, setup_widgets_table
 
 
@@ -85,17 +86,29 @@ def dedup_key(step):
     return (type(step), step.peer_key, step.dedup_params())
 
 
+def extra_with(source_values):
+    """A minimal per-invocation ``BucketExtra`` carrying ``source_values`` for a step execute.
+
+    The pg select reads only ``extra.source_values`` to resolve its value-less WHERE
+    placeholders into the compiled statement's params at render; context/paths are unused here.
+    """
+    return BucketExtra(context=None, parent_paths=[], source_values=source_values)
+
+
 # --------------------------------------------------------- pg_placeholder construction
 
 
-def test_pg_placeholder_carries_value_and_source_tag():
-    """A placeholder is a bound bindparam stamped with its stable source tag."""
+def test_pg_placeholder_is_value_less_with_source_tag():
+    """A placeholder is a value-LESS bindparam stamped with its stable source tag.
+
+    Under the deepcopy-free cache the bind carries NO baked value (the value is injected into
+    the compiled statement's params per request at render, resolved by the source tag); it is
+    built ``required=False`` so ``check_predicate`` accepts a value-less bind.
+    """
     bind = pg_placeholder("var:status", "published")
-    # it carries THIS request's value, so it rides compiled.params at execute (nothing new
-    # is needed at execute time).
-    assert bind.value == "published"
+    assert bind.value is None  # value-LESS — the value rides per-request params, not the bind
     assert bind.required is False
-    # and the stable source tag, on the side attribute add_where / predicate_key read.
+    # the stable source tag is on the side attribute add_where / predicate_key read.
     assert placeholder_source(bind) == "var:status"
     assert getattr(bind, PLACEHOLDER_SOURCE_ATTR) == "var:status"
 
@@ -431,7 +444,7 @@ async def test_placeholder_result_byte_identical_to_inlined_literal(seeded):
         literal = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
         literal.builder().where(column("status") == "draft")
         with count_sql(engine) as lit_counter:
-            lit_out = await literal.execute(2, [[1, 2]])
+            lit_out = await literal.execute(2, [[1, 2]], extra_with({}))
 
     with pg_request_context(SQLAlchemyExecutor(engine)):
         placeheld = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
@@ -439,7 +452,7 @@ async def test_placeholder_result_byte_identical_to_inlined_literal(seeded):
             column("status") == pg_placeholder("var:status", "draft")
         )
         with count_sql(engine) as ph_counter:
-            ph_out = await placeheld.execute(2, [[1, 2]])
+            ph_out = await placeheld.execute(2, [[1, 2]], extra_with({"var:status": "draft"}))
 
     # byte-identical rows AND statement count.
     assert ph_counter.count == lit_counter.count == 1
@@ -465,14 +478,14 @@ async def test_same_placeholder_statement_serves_two_values_correctly(seeded):
     with pg_request_context(SQLAlchemyExecutor(engine)):
         draft = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
         draft.builder().where(column("status") == pg_placeholder("var:status", "draft"))
-        draft_out = await draft.execute(2, [[1, 2]])
+        draft_out = await draft.execute(2, [[1, 2]], extra_with({"var:status": "draft"}))
 
     with pg_request_context(SQLAlchemyExecutor(engine)):
         published = PgSelectStep(make_widgets(), constant(None), "owner_id", order_by=["id"])
         published.builder().where(
             column("status") == pg_placeholder("var:status", "published")
         )
-        pub_out = await published.execute(2, [[1, 2]])
+        pub_out = await published.execute(2, [[1, 2]], extra_with({"var:status": "published"}))
 
     # the two requests share one value-agnostic statement SHAPE (the bind NAMES are unique
     # per call — execution plumbing the dedup key normalises out — so compare the SQL with

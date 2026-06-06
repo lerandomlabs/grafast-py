@@ -51,7 +51,7 @@ from .inline import (
 )
 from .ordering import OrderTerm, normalize_order, order_clauses
 from .pagination import window_slice, window_slice_params
-from .placeholders import Placeholder, rebind_pagination_value, unwrap_placeholder
+from .placeholders import Placeholder, resolve_placeholder
 from .resource import PgResource
 
 
@@ -202,6 +202,9 @@ class PgSelectStep(PgCustomizable):
     """
 
     is_sync_and_safe = False
+    # needs the per-request source-tag -> value map (BucketExtra.source_values) to resolve its
+    # WHERE / pagination placeholders into the compiled statement's params at render time.
+    wants_extra = True
 
     def __init__(
         self,
@@ -229,7 +232,7 @@ class PgSelectStep(PgCustomizable):
         # Either a plain int/None (a plan-time literal, value-included in the dedup key) or a
         # ``Placeholder`` (a variable-derived value, source-keyed): the SQL binds first/offset
         # as params regardless, so a placeholder only changes the DEDUP KEY — the build/page
-        # math unwraps the runtime value via ``unwrap_placeholder``.
+        # math resolves the runtime value per request via ``resolve_placeholder``.
         self.first = first
         self.offset = offset
         # the inlined child relations this parent absorbed into its own statement (Wave
@@ -298,18 +301,6 @@ class PgSelectStep(PgCustomizable):
         """Set the structured per-parent page offset (literal int or ``Placeholder``)."""
         self.offset = offset
 
-    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
-        """Re-point this select's WHERE and pagination placeholders to a cached request's values.
-
-        Extends the base WHERE rebind (``super``) with the per-parent ``first`` / ``offset``
-        pagination sentinels: a variable-derived bound is a :class:`Placeholder` carrying the
-        FIRST request's value, re-pointed to THIS request's value by source. A literal bound is
-        returned unchanged, so a literal page is a no-op (as is a select with no placeholders).
-        """
-        super().rebind_placeholders(values_by_source)
-        self.first = rebind_pagination_value(self.first, values_by_source)
-        self.offset = rebind_pagination_value(self.offset, values_by_source)
-
     def match_predicate(self, unique_keys: Optional[List[Any]] = None):
         """The batched key-match predicate: ``= ANY(:keys)`` (single) or tuple-IN (composite).
 
@@ -330,7 +321,11 @@ class PgSelectStep(PgCustomizable):
             bindparam("keys", value=unique_keys or [], expanding=True)
         )
 
-    def build_query(self, unique_keys: Optional[List[Any]] = None):
+    def build_query(
+        self,
+        unique_keys: Optional[List[Any]] = None,
+        source_values: Mapping[str, Any] = {},
+    ):
         """Build the batched key-matched SELECT via SQLAlchemy Core.
 
         With no page bound (``first is None and offset == 0``) this is the plain
@@ -340,6 +335,11 @@ class PgSelectStep(PgCustomizable):
         key-match clause is single (``= ANY``) or composite (tuple-IN) per
         :meth:`match_predicate`; ``unique_keys`` is consumed only by the composite branch
         (it bakes the IN list at build time), and ignored by the single fast path.
+
+        ``source_values`` resolves a variable-derived ``first`` / ``offset`` :class:`Placeholder`
+        to its runtime value for the SQL SHAPE decision only (first is None vs int decides
+        whether the upper-bound clause is emitted); the value itself still binds as a param at
+        execute time, so the SQL stays value-agnostic.
         """
         if not self.is_limited:
             tbl = table(
@@ -375,16 +375,18 @@ class PgSelectStep(PgCustomizable):
             match_columns=self.match_columns,
             unique_keys=unique_keys,
             order_by=self.order_by,
-            # unwrap a variable-derived bound to its runtime value for the SQL shape (first
+            # resolve a variable-derived bound to its runtime value for the SQL shape (first
             # is None vs int decides whether the upper-bound clause is emitted); the value
             # itself still binds as a param at execute time, so the SQL stays value-agnostic.
-            first=unwrap_placeholder(self.first),
-            offset=unwrap_placeholder(self.offset),
+            first=resolve_placeholder(self.first, source_values),
+            offset=resolve_placeholder(self.offset, source_values),
             where_predicates=self.where_predicates,
             computed=self.resource.computed_projections(),
         )
 
-    async def run_query(self, unique_keys: List[Any]) -> List[Dict[str, Any]]:
+    async def run_query(
+        self, unique_keys: List[Any], source_values: Mapping[str, Any] = {}
+    ) -> List[Dict[str, Any]]:
         """Run the batched statement once and return the RAW (undecoded) rows.
 
         Codec decode is applied AFTER grouping (see :meth:`group_and_decode`), not here:
@@ -395,23 +397,29 @@ class PgSelectStep(PgCustomizable):
         The single-column path binds ``keys`` as the flat array param at execute time; the
         composite path already baked the list-of-tuples onto the IN bindparam at build
         time, so it passes no ``keys`` param (a re-bind would clash with the expanded
-        per-element binds).
+        per-element binds). ``source_values`` supplies THIS request's WHERE placeholder
+        values (via :meth:`where_params`) and pagination placeholder values into the params,
+        so a value-LESS placeholder bind executes with this request's value — never a value
+        baked on the shared cached statement.
         """
         request = current_pg_request()
         params: Dict[str, Any] = {}
         if not self.is_composite:
             params["keys"] = unique_keys
         if self.is_limited:
-            # bind the runtime first/offset (unwrapping a variable-derived Placeholder) — the
+            # bind the runtime first/offset (resolving a variable-derived Placeholder) — the
             # value rides compiled.params, the same as a literal bound, so a placeholder
             # changes only the dedup key, never the executed slice.
             params.update(
                 window_slice_params(
-                    unwrap_placeholder(self.first), unwrap_placeholder(self.offset)
+                    resolve_placeholder(self.first, source_values),
+                    resolve_placeholder(self.offset, source_values),
                 )
             )
+        # inject this request's WHERE placeholder values (value-less binds resolved by source).
+        params.update(self.where_params(source_values))
         rows = await request.executor.run(
-            self.build_query(unique_keys), params, settings=request.settings
+            self.build_query(unique_keys, source_values), params, settings=request.settings
         )
         log.debug(
             "pg batch select",
@@ -462,14 +470,18 @@ class PgSelectStep(PgCustomizable):
         """
         return [grouped.get(keys[i], []) for i in range(count)]
 
-    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+    def execute(self, count: int, values: List[List[Any]], extra=None) -> List[Any]:
         keys = self.normalized_keys(values[0])
         unique_keys, _slot = _coalesce_keys(keys, count)
         if not unique_keys:
             return [[] for _ in range(count)]
 
+        # `extra` is always supplied in production (run_steps passes it to every wants_extra
+        # step); the default covers a direct execute() call in a unit test with no placeholders.
+        source_values = extra.source_values if extra is not None else {}
+
         async def run():
-            rows = await self.run_query(unique_keys)
+            rows = await self.run_query(unique_keys, source_values)
             return self.scatter(self.group_and_decode(rows), keys, count)
 
         return run()
@@ -593,6 +605,9 @@ class PgSelectAllStep(PgCustomizable):
     """
 
     is_sync_and_safe = False
+    # needs the per-request source-tag -> value map (BucketExtra.source_values) to resolve its
+    # WHERE / LIMIT / OFFSET placeholders into the compiled statement's params at render time.
+    wants_extra = True
 
     def __init__(
         self,
@@ -639,17 +654,6 @@ class PgSelectAllStep(PgCustomizable):
         """Set the root page offset (plain OFFSET, or a bound param for a ``Placeholder``)."""
         self.offset = offset
 
-    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
-        """Re-point this root select's WHERE and LIMIT/OFFSET placeholders to a cached request.
-
-        Extends the base WHERE rebind with the single-root ``first`` / ``offset`` pagination
-        sentinels (a variable-derived bound is a :class:`Placeholder` re-pointed by source; a
-        literal bound is a no-op).
-        """
-        super().rebind_placeholders(values_by_source)
-        self.first = rebind_pagination_value(self.first, values_by_source)
-        self.offset = rebind_pagination_value(self.offset, values_by_source)
-
     def add_order_term(self, term: Union[str, OrderTerm]) -> None:
         """Append a UNIFORM ordering term (re-normalised with the PK tie-break)."""
         existing = list(self.order_by)
@@ -692,26 +696,35 @@ class PgSelectAllStep(PgCustomizable):
         # LIMIT/OFFSET bounds the parent rows; each LATERAL fetches that row's children.
         return apply_laterals(stmt, tbl, self.inline_specs)
 
-    def run_params(self) -> Optional[Dict[str, Any]]:
-        """Execute-time params for a ``Placeholder`` LIMIT/OFFSET, or ``None`` for literals.
+    def run_params(self, source_values: Mapping[str, Any] = {}) -> Optional[Dict[str, Any]]:
+        """Execute-time params for ``Placeholder`` LIMIT/OFFSET + WHERE binds, or ``None``.
 
-        A literal first/offset is inlined in the SQL (no param), so the default ``None`` is
-        byte-identical to before. A variable-derived ``Placeholder`` rides a value-LESS bound
-        param (``:root_first`` / ``:root_offset``); its runtime value is unwrapped here so the
+        A literal first/offset is inlined in the SQL (no param), and a literal-only WHERE has
+        no placeholder binds, so a fully-literal step returns ``None`` — byte-identical to
+        before. A variable-derived ``Placeholder`` LIMIT/OFFSET rides a value-LESS bound param
+        (``:root_first`` / ``:root_offset``) and each WHERE ``pg_placeholder`` rides its own
+        value-LESS bind; their runtime values are resolved here from ``source_values`` so the
         value lives only in the per-request params dict — the cached statement stays immutable.
         """
         params: Dict[str, Any] = {}
         if isinstance(self.first, Placeholder):
-            params["root_first"] = unwrap_placeholder(self.first)
+            params["root_first"] = resolve_placeholder(self.first, source_values)
         if isinstance(self.offset, Placeholder):
-            params["root_offset"] = unwrap_placeholder(self.offset)
+            params["root_offset"] = resolve_placeholder(self.offset, source_values)
+        params.update(self.where_params(source_values))
         return params or None
 
-    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+    def execute(self, count: int, values: List[List[Any]], extra=None) -> List[Any]:
+        # `extra` is always supplied in production; the default covers a direct execute() call
+        # in a unit test with no placeholders (an empty source map renders nothing).
+        source_values = extra.source_values if extra is not None else {}
+
         async def run():
             request = current_pg_request()
             rows = await request.executor.run(
-                self.build_query(), self.run_params(), settings=request.settings
+                self.build_query(),
+                self.run_params(source_values),
+                settings=request.settings,
             )
             # decode each row's codec-bearing attributes once; the same decoded list is
             # returned for every bucket entry (a root list has one bucket entry).
@@ -815,14 +828,18 @@ class PgSelectSingleStep(PgSelectStep):
             out.append(rows[0] if rows else None)
         return out
 
-    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+    def execute(self, count: int, values: List[List[Any]], extra=None) -> List[Any]:
         keys = self.normalized_keys(values[0])
         unique_keys, _slot = _coalesce_keys(keys, count)
         if not unique_keys:
             return [None] * count
 
+        # `extra` is always supplied in production; the default covers a direct execute() call
+        # in a unit test with no placeholders.
+        source_values = extra.source_values if extra is not None else {}
+
         async def run():
-            rows = await self.run_query(unique_keys)
+            rows = await self.run_query(unique_keys, source_values)
             return self.scatter(self.group_and_decode(rows), keys, count)
 
         return run()

@@ -1,17 +1,20 @@
-"""Value-agnostic pagination placeholders: the ``Placeholder`` sentinel for ``first`` /
-``offset`` / ``after`` / ``before`` when variable-derived (Wave 4, step 6).
+"""Value-agnostic pagination placeholders: the value-LESS ``Placeholder`` sentinel for
+``first`` / ``offset`` / ``after`` / ``before`` when variable-derived (Wave 4 / P5).
 
 A WHERE value is a Core ``ColumnElement`` the host wraps as a :func:`pg_placeholder`
 bindparam (see ``test_pg_placeholders``); a PAGINATION value is a plain Python scalar (an
 ``int`` ``first`` / ``offset``) or a cursor ``str`` (``after`` / ``before``) stored DIRECTLY
-on the step. The step already binds these as PARAMETERS at execute time (``window_slice``
-binds ``first`` / ``offset``; the keyset comparator binds the decoded cursor values), so the
-SQL is ALREADY value-agnostic — the ONLY thing that carries the literal is the DEDUP KEY.
+on the step. The step binds these as PARAMETERS at execute time (``window_slice`` binds
+``first`` / ``offset``; the keyset comparator binds the decoded cursor values), so the SQL is
+ALREADY value-agnostic — the ONLY thing that carries the literal is the DEDUP KEY.
 
-The :class:`Placeholder` sentinel makes that key value-AGNOSTIC for a variable-derived value:
-it carries the request's value (so the step unwraps it at build/execute) but its ``__eq__`` /
-``__hash__`` / ``__repr__`` key ONLY off the stable source tag (the variable name). This
-module gates the CRUX — the four placeholder dedup behaviours, both directions through
+The :class:`Placeholder` sentinel makes that key value-AGNOSTIC for a variable-derived value.
+Under the deepcopy-free cache (P5) the sentinel itself is value-LESS — it lives on the SHARED
+cached step and carries no request value; the runtime value is resolved per request from the
+``BucketExtra.source_values`` map at SQL-render time (:func:`resolve_placeholder`) and injected
+into the compiled statement's ``params``, never bound onto the shared step. Its ``__eq__`` /
+``__hash__`` / ``__repr__`` key ONLY off the stable source tag (the variable name). This module
+gates the CRUX — the four placeholder dedup behaviours, both directions through
 ``dag.Plan.deduplicate()`` with NO DB — for EACH pagination surface (select first/offset,
 connection first + after-cursor, union first + after-cursor, root-collection LIMIT/OFFSET):
 
@@ -22,8 +25,8 @@ connection first + after-cursor, union first + after-cursor, root-collection LIM
 
 Plus the NO-REGRESSION oracle (a placeholder page returns byte-identical rows + statement
 count to the inlined literal) and the ANTI-CORRUPTION gate (the same value-agnostic statement
-run with TWO different variable values returns each its OWN correct rows — the property a
-shared/cached plan depends on).
+run with TWO different variable values, supplied per request via ``source_values``, returns
+each its OWN correct rows — the property a shared/cached plan depends on).
 
 DB tests are marked ``pg`` (deselectable ``-m 'not pg'``); they touch ONLY the
 ``grafast_demo`` ``posts`` fixture and alter nothing else.
@@ -35,6 +38,7 @@ from sqlalchemy import column
 
 from grafast_py.core_steps import constant
 from grafast_py.dag import Plan
+from grafast_py.steps import BucketExtra
 from grafast_py.pg.connection import PgConnectionStep
 from grafast_py.pg.cursor import encode_keyset_cursor
 from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
@@ -44,7 +48,7 @@ from grafast_py.pg.placeholders import (
     Placeholder,
     pg_placeholder,
     placeholder_source_tag,
-    unwrap_placeholder,
+    resolve_placeholder,
 )
 from grafast_py.pg.resource import PgRegistry, PgResource
 from grafast_py.pg.steps import PgSelectAllStep, PgSelectStep
@@ -96,62 +100,71 @@ def dedup_key(step):
     return (type(step), step.peer_key, step.dedup_params())
 
 
+def extra_with(source_values):
+    """A minimal per-invocation ``BucketExtra`` carrying ``source_values`` for a step execute.
+
+    The pg value-steps read only ``extra.source_values`` (to resolve their value-less
+    placeholders into params at render); context / parent_paths are unused on this path.
+    """
+    return BucketExtra(context=None, parent_paths=[], source_values=source_values)
+
+
 # ----------------------------------------------------- the Placeholder sentinel itself
 
 
-def test_placeholder_keys_off_source_not_value():
-    """A ``Placeholder`` is equal/hashes by SOURCE tag only — never by its runtime value."""
-    a = Placeholder("var:limit", 5)
-    b = Placeholder("var:limit", 999)  # same source, DIFFERENT value
-    c = Placeholder("var:other", 5)  # different source, same value
+def test_placeholder_keys_off_source_only():
+    """A value-LESS ``Placeholder`` is equal/hashes by SOURCE tag only."""
+    a = Placeholder("var:limit")
+    b = Placeholder("var:limit")  # same source
+    c = Placeholder("var:other")  # different source
     assert a == b and hash(a) == hash(b)  # same source -> equal/merge (crux 1)
     assert a != c  # different source -> distinct (crux 2)
 
 
 def test_placeholder_never_equals_a_bare_literal():
-    """A ``Placeholder`` is never ``==`` a bare scalar of the same value (crux 3 at the unit)."""
-    ph = Placeholder("var:limit", 5)
+    """A ``Placeholder`` is never ``==`` a bare scalar (crux 3 at the unit)."""
+    ph = Placeholder("var:limit")
     assert ph != 5 and 5 != ph
     # so a placeholder page never merges with a coincidentally equal literal page.
 
 
 def test_placeholder_repr_carries_source_not_value():
-    """The repr (folded into the f-string peer_key) renders the SOURCE, never the value.
+    """The repr (folded into the f-string peer_key) renders the SOURCE only.
 
     Two same-source placeholders' keys are then byte-identical and the runtime value can
-    never leak into a plan-cache key.
+    never leak into a plan-cache key (the sentinel carries no value).
     """
-    ph = Placeholder("var:limit", 5)
+    ph = Placeholder("var:limit")
     assert repr(ph) == "Placeholder('var:limit')"
-    assert "5" not in repr(ph)
 
 
-def test_unwrap_and_source_tag_helpers():
-    """``unwrap_placeholder`` yields the runtime value; ``placeholder_source_tag`` the source.
+def test_resolve_and_source_tag_helpers():
+    """``resolve_placeholder`` yields the request value from the source map; tag the source.
 
-    A bare literal passes through ``unwrap_placeholder`` and reports ``None`` source — so it
-    stays on the value-included key path.
+    A value-less ``Placeholder`` resolves against ``source_values`` (None when absent); a bare
+    literal passes through unchanged and reports ``None`` source — the value-included key path.
     """
-    ph = Placeholder("var:n", 7)
-    assert unwrap_placeholder(ph) == 7
-    assert unwrap_placeholder(7) == 7
+    ph = Placeholder("var:n")
+    assert resolve_placeholder(ph, {"var:n": 7}) == 7
+    assert resolve_placeholder(ph, {}) is None  # omitted no-default variable -> None
+    assert resolve_placeholder(7, {}) == 7
     assert placeholder_source_tag(ph) == "var:n"
     assert placeholder_source_tag(7) is None
 
 
-# ----------------------------------------- select first/offset: the four crux behaviours
+# ----------------------------------------------------- select first/offset: the four crux behaviours
 
 
 def test_select_first_same_source_merges():
     """CRUX 1: two selects whose ``first`` is the SAME source MERGE through ``deduplicate()``.
 
-    Even with DIFFERENT runtime sizes (the value-agnostic window slice is re-bound per
-    request), so the lowest-id step wins and both references resolve to it.
+    The value-less ``Placeholder`` keys off its source, so the lowest-id step wins and both
+    references resolve to it — the value-agnostic window slice is rendered per request.
     """
     a = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"],
-                     first=Placeholder("var:n", 2))
+                     first=Placeholder("var:n"))
     b = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"],
-                     first=Placeholder("var:n", 9))
+                     first=Placeholder("var:n"))
     assert dedup_key(a) == dedup_key(b)
 
     plan = Plan()
@@ -159,16 +172,14 @@ def test_select_first_same_source_merges():
     plan.add_step(b)
     remap = plan.deduplicate()
     assert remap[a.id] is remap[b.id]  # one survivor
-    # the value never enters the key
-    assert "2" not in a.peer_key.split("Placeholder")[1][:20]
 
 
 def test_select_first_different_source_does_not_merge():
     """CRUX 2: two selects whose ``first`` is a DIFFERENT source do NOT merge."""
     a = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"],
-                     first=Placeholder("var:n", 2))
+                     first=Placeholder("var:n"))
     b = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"],
-                     first=Placeholder("var:m", 2))
+                     first=Placeholder("var:m"))
     assert dedup_key(a) != dedup_key(b)
 
     plan = Plan()
@@ -182,11 +193,11 @@ def test_select_first_placeholder_never_merges_with_literal():
     """CRUX 3: a placeholder ``first`` never merges with a literal ``first`` of equal value.
 
     ``LIMIT :first`` (a value-agnostic window slice, source-keyed) vs an inlined literal
-    page are different plans — re-binding the placeholder would otherwise serve a literal-
+    page are different plans — re-rendering the placeholder would otherwise serve a literal-
     pinned plan a runtime size it never planned for.
     """
     ph = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"],
-                      first=Placeholder("var:n", 2))
+                      first=Placeholder("var:n"))
     lit = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"], first=2)
     assert dedup_key(ph) != dedup_key(lit)
 
@@ -198,17 +209,17 @@ def test_select_first_placeholder_never_merges_with_literal():
 
 
 def test_select_offset_placeholder_keys_by_source():
-    """A placeholder ``offset`` keys by source too — even when its current value is 0.
+    """A placeholder ``offset`` keys by source too — and is always limited (value-agnostic).
 
-    A variable-derived offset is value-agnostic, so the plan cannot know it is 0 this
+    A variable-derived offset is value-agnostic, so the plan cannot know its value this
     request: it rides the window slice unconditionally and keys distinctly from a literal
     ``offset=0`` plain select (different SQL — paginated vs plain). Two same-source offsets
     merge regardless of value.
     """
     a = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"],
-                     offset=Placeholder("var:o", 0))
+                     offset=Placeholder("var:o"))
     b = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"],
-                     offset=Placeholder("var:o", 5))
+                     offset=Placeholder("var:o"))
     plain = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"])
     assert a.is_limited is True  # a Placeholder offset is always limited (value-agnostic)
     assert dedup_key(a) == dedup_key(b)  # same source merges
@@ -242,15 +253,15 @@ def test_root_collection_placeholder_emits_value_agnostic_sql():
     """A placeholder root LIMIT/OFFSET emits a VALUE-LESS bound param; a literal inlines.
 
     So the cached root statement is value-agnostic and the runtime value lives only in the
-    per-request ``run_params`` — never inlined into a cacheable plan.
+    per-request ``run_params(source_values)`` — never inlined into a cacheable plan.
     """
     ph = PgSelectAllStep(make_posts(), order_by=["id"],
-                         first=Placeholder("var:n", 5),
-                         offset=Placeholder("var:o", 3)).for_parent(constant(None))
+                         first=Placeholder("var:n"),
+                         offset=Placeholder("var:o")).for_parent(constant(None))
     sql = str(ph.build_query())
     assert ":root_first" in sql and ":root_offset" in sql
     assert "5" not in sql and "3" not in sql  # the values are NOT inlined
-    assert ph.run_params() == {"root_first": 5, "root_offset": 3}
+    assert ph.run_params({"var:n": 5, "var:o": 3}) == {"root_first": 5, "root_offset": 3}
 
 
 def test_root_collection_literal_sql_unchanged():
@@ -268,11 +279,11 @@ def test_root_collection_literal_sql_unchanged():
 def test_root_collection_placeholder_crux():
     """The four crux behaviours on the root collection's LIMIT/OFFSET, through deduplicate()."""
     a = PgSelectAllStep(make_posts(), order_by=["id"],
-                        first=Placeholder("var:n", 5)).for_parent(constant(None))
+                        first=Placeholder("var:n")).for_parent(constant(None))
     b = PgSelectAllStep(make_posts(), order_by=["id"],
-                        first=Placeholder("var:n", 99)).for_parent(constant(None))
+                        first=Placeholder("var:n")).for_parent(constant(None))
     c = PgSelectAllStep(make_posts(), order_by=["id"],
-                        first=Placeholder("var:m", 5)).for_parent(constant(None))
+                        first=Placeholder("var:m")).for_parent(constant(None))
     lit = PgSelectAllStep(make_posts(), order_by=["id"], first=5).for_parent(constant(None))
     assert dedup_key(a) == dedup_key(b)  # crux 1: same source merges
     assert dedup_key(a) != dedup_key(c)  # crux 2: different source no-merge
@@ -294,9 +305,9 @@ def test_connection_first_placeholder_crux():
     def conn(first):
         return PgConnectionStep(make_posts(), constant(None), "author_id",
                                 order_by=["id"], first=first)
-    a = conn(Placeholder("var:n", 2))
-    b = conn(Placeholder("var:n", 9))
-    c = conn(Placeholder("var:m", 2))
+    a = conn(Placeholder("var:n"))
+    b = conn(Placeholder("var:n"))
+    c = conn(Placeholder("var:m"))
     lit = conn(2)
     assert dedup_key(a) == dedup_key(b)  # crux 1
     assert dedup_key(a) != dedup_key(c)  # crux 2
@@ -313,9 +324,10 @@ def test_connection_first_placeholder_crux():
 def test_connection_after_cursor_placeholder_crux():
     """The four crux behaviours on a connection's ``after`` cursor, through deduplicate().
 
-    The decoded cursor VALUES still drive the keyset SQL (a and b decode different rows), but
-    the dedup KEY carries only the stable source tag — so two requests of the same document
-    share one plan while the value never enters the key.
+    A VARIABLE cursor is value-LESS on the shared step (it decodes per request at render); the
+    dedup KEY carries only the stable source tag — so two requests of the same document share
+    one plan while the value never enters the key, and each resolves ITS OWN seek values from
+    the per-request source map.
     """
     posts = make_posts()
     cur_a = cursor_for(posts, 10)
@@ -324,12 +336,14 @@ def test_connection_after_cursor_placeholder_crux():
     def conn(after):
         return PgConnectionStep(make_posts(), constant(None), "author_id",
                                 order_by=["id"], first=2, after=after)
-    a = conn(Placeholder("var:after", cur_a))
-    b = conn(Placeholder("var:after", cur_b))  # SAME source, DIFFERENT cursor value
-    c = conn(Placeholder("var:other", cur_a))  # different source
-    lit = conn(cur_a)  # literal cursor of the SAME value as a
+    a = conn(Placeholder("var:after"))
+    b = conn(Placeholder("var:after"))  # SAME source
+    c = conn(Placeholder("var:other"))  # different source
+    lit = conn(cur_a)  # literal cursor
     assert dedup_key(a) == dedup_key(b)  # crux 1: same source merges...
-    assert a.after_values != b.after_values  # ...yet each decodes ITS OWN values for SQL
+    # ...yet each request resolves ITS OWN decoded seek values from the source map for SQL.
+    assert a.resolve_cursor_values({"var:after": cur_a})[0] != \
+        a.resolve_cursor_values({"var:after": cur_b})[0]
     assert dedup_key(a) != dedup_key(c)  # crux 2: different source no-merge
     assert dedup_key(a) != dedup_key(lit)  # crux 3: placeholder cursor vs literal cursor
     # crux 4: the literal cursor keeps its value-included key (the decoded values)
@@ -381,9 +395,9 @@ def test_union_first_placeholder_crux():
             union_members(), shared_columns=["id", "author_id"], order_by=["id"],
             key_step=constant(None), first=first,
         )
-    a = union(Placeholder("var:n", 2))
-    b = union(Placeholder("var:n", 9))
-    c = union(Placeholder("var:m", 2))
+    a = union(Placeholder("var:n"))
+    b = union(Placeholder("var:n"))
+    c = union(Placeholder("var:m"))
     lit = union(2)
     assert dedup_key(a) == dedup_key(b)  # crux 1
     assert dedup_key(a) != dedup_key(c)  # crux 2
@@ -416,12 +430,14 @@ def test_union_after_cursor_placeholder_crux():
             union_members(), shared_columns=["id", "author_id"], order_by=["id"],
             key_step=constant(None), first=2, after=after,
         )
-    a = union(Placeholder("var:after", cur_a))
-    b = union(Placeholder("var:after", cur_b))
-    c = union(Placeholder("var:other", cur_a))
+    a = union(Placeholder("var:after"))
+    b = union(Placeholder("var:after"))
+    c = union(Placeholder("var:other"))
     lit = union(cur_a)
     assert dedup_key(a) == dedup_key(b)  # crux 1: same source merges
-    assert a.after_values != b.after_values  # ...yet each decodes its own values
+    # ...yet each request resolves its own decoded seek values from the source map.
+    assert a.resolve_cursor_values({"var:after": cur_a})[0] != \
+        a.resolve_cursor_values({"var:after": cur_b})[0]
     assert dedup_key(a) != dedup_key(c)  # crux 2
     assert dedup_key(a) != dedup_key(lit)  # crux 3
 
@@ -433,15 +449,16 @@ def test_union_after_cursor_placeholder_crux():
     assert remap[c.id] is c and remap[lit.id] is lit
 
 
-def test_union_rebind_repoints_page_cursor_and_member_where():
-    """REGRESSION: a cache HIT re-binds a pgUnionAll's page size, cursor AND member-WHERE placeholders.
+def test_union_renders_page_cursor_and_member_where_per_request():
+    """RENDER-INJECTION (deepcopy-free): a pgUnionAll resolves page size, cursor AND member-WHERE
+    placeholders from the per-request source map — never off the shared step.
 
-    A cached pgUnionAll carries the FIRST request's variable-derived ``first`` (Placeholder),
-    ``after`` cursor (Placeholder) and per-member WHERE ``pg_placeholder`` value. Without a
-    ``rebind_placeholders`` override the union would execute a LATER request with the FIRST
-    request's values — the exact cross-request value bleed the cache must never allow. This
-    drives the override directly: after rebinding to a second request's variables, the page
-    size, the decoded cursor values AND the member-WHERE bound value all move to the new request.
+    A cached pgUnionAll carries value-LESS variable-derived ``first`` (Placeholder), ``after``
+    cursor (Placeholder) and per-member WHERE ``pg_placeholder`` binds. The deepcopy-free model
+    resolves all three per request from ``source_values`` at render: the SHARED step holds no
+    value, so two requests (here, two source maps) render distinct page sizes, distinct decoded
+    cursor seek values, and distinct member-WHERE param values — the cross-request bleed the
+    cache must never allow.
     """
     posts = make_posts()
     # build cursors through a probe step so the digest matches the union's (id, __typename) order.
@@ -464,22 +481,28 @@ def test_union_rebind_repoints_page_cursor_and_member_where():
     step = PgUnionAllStep(
         members_with_where(), shared_columns=["id", "author_id"], order_by=["id"],
         key_step=constant(None),
-        first=Placeholder("var:n", 2), after=Placeholder("var:after", cur_a),
+        first=Placeholder("var:n"), after=Placeholder("var:after"),
     )
-    # the FIRST request's values are bound on the cached step.
-    assert step.first.value == 2
-    assert step.after_values == decode_for(step, cur_a)
-    assert step.members[0].where[0].right.value == "published"
+    # the SHARED step carries NO request value (value-less placeholders / no decoded cursor).
+    assert step.after_values is None and step.before_values is None
+    member_bind = step.members[0].where[0].right
+    assert member_bind.value is None  # the WHERE placeholder bind is value-LESS
 
-    # a cache HIT for a SECOND request re-points every placeholder by its source tag.
-    step.rebind_placeholders({"var:n": 10, "var:after": cur_b, "var:status": "draft"})
-    assert step.first.value == 10
-    assert step.after_values == decode_for(step, cur_b)
-    assert step.members[0].where[0].right.value == "draft"
+    # request A renders its OWN page size, decoded cursor and member-WHERE value.
+    a_values = {"var:n": 2, "var:after": cur_a, "var:status": "published"}
+    assert step.page_size(a_values) == 2
+    assert step.resolve_cursor_values(a_values)[0] == decode_for(step, cur_a)
+    assert step.member_where_params(a_values)[member_bind.key] == "published"
+
+    # request B (the same SHARED step) renders DIFFERENT values — no bleed from A.
+    b_values = {"var:n": 10, "var:after": cur_b, "var:status": "draft"}
+    assert step.page_size(b_values) == 10
+    assert step.resolve_cursor_values(b_values)[0] == decode_for(step, cur_b)
+    assert step.member_where_params(b_values)[member_bind.key] == "draft"
 
 
 def decode_for(step, cursor):
-    """The decoded keyset values for ``cursor`` under ``step``'s order (for the rebind assertion)."""
+    """The decoded keyset values for ``cursor`` under ``step``'s order (for the render assertion)."""
     from grafast_py.pg.cursor import decode_keyset_cursor
 
     return decode_keyset_cursor(cursor, step.order_by)
@@ -493,28 +516,28 @@ def decode_for(step, cursor):
 async def test_placeholder_first_byte_identical_to_literal(seeded):
     """NO-REGRESSION: a placeholder ``first`` returns the SAME rows + SAME count as inlining.
 
-    The old path passes a literal ``first=2``; the new path wraps it as a ``Placeholder``.
-    Same one windowed statement, same rows — the placeholder changes only the dedup key,
-    never the executed page.
+    The old path passes a literal ``first=2``; the new path wraps it as a value-less
+    ``Placeholder`` and supplies the value via ``source_values``. Same one windowed statement,
+    same rows — the placeholder changes only the dedup key, never the executed page.
     """
     engine = get_engine()
     with pg_request_context(SQLAlchemyExecutor(engine)):
         literal = PgSelectStep(make_posts(), constant(None), "author_id",
                                order_by=["id"], first=2)
         with count_sql(engine) as lit_counter:
-            lit_out = await literal.execute(3, [[1, 2, 3]])
+            lit_out = await literal.execute(3, [[1, 2, 3]], extra_with({}))
 
     with pg_request_context(SQLAlchemyExecutor(engine)):
         placeheld = PgSelectStep(make_posts(), constant(None), "author_id",
-                                 order_by=["id"], first=Placeholder("var:n", 2))
+                                 order_by=["id"], first=Placeholder("var:n"))
         with count_sql(engine) as ph_counter:
-            ph_out = await placeheld.execute(3, [[1, 2, 3]])
+            ph_out = await placeheld.execute(3, [[1, 2, 3]], extra_with({"var:n": 2}))
 
     assert ph_counter.count == lit_counter.count == 1
     assert ph_out == lit_out
     assert [[r["id"] for r in bucket] for bucket in ph_out] == [[1, 2], [3, 4], [6, 7]]
     # the value is NOT inlined in the placeholder statement — first/offset bind as params.
-    sql = str(placeheld.build_query())
+    sql = str(placeheld.build_query(source_values={"var:n": 2}))
     assert "__rn <= :offset + :first" in sql
 
 
@@ -523,25 +546,24 @@ async def test_placeholder_first_byte_identical_to_literal(seeded):
 async def test_same_placeholder_first_serves_two_sizes_correctly(seeded):
     """ANTI-CORRUPTION: one value-agnostic windowed statement, run with TWO page sizes.
 
-    A placeholder-bearing select is value-agnostic SQL re-bound per request. Running the same
-    statement shape with ``first=1`` then ``first=3`` must return each its OWN correct page —
-    the property a shared/cached plan depends on (a cache hit must never serve one request the
-    size of another).
+    A placeholder-bearing select is value-agnostic SQL rendered per request from
+    ``source_values``. Running the same SHARED step with ``first=1`` then ``first=3`` must
+    return each its OWN correct page — the property a shared/cached plan depends on (a cache
+    hit must never serve one request the size of another).
     """
     engine = get_engine()
+    step = PgSelectStep(make_posts(), constant(None), "author_id",
+                        order_by=["id"], first=Placeholder("var:n"))
     with pg_request_context(SQLAlchemyExecutor(engine)):
-        one = PgSelectStep(make_posts(), constant(None), "author_id",
-                           order_by=["id"], first=Placeholder("var:n", 1))
-        one_out = await one.execute(3, [[1, 2, 3]])
+        one_out = await step.execute(3, [[1, 2, 3]], extra_with({"var:n": 1}))
 
     with pg_request_context(SQLAlchemyExecutor(engine)):
-        three = PgSelectStep(make_posts(), constant(None), "author_id",
-                             order_by=["id"], first=Placeholder("var:n", 3))
-        three_out = await three.execute(3, [[1, 2, 3]])
+        three_out = await step.execute(3, [[1, 2, 3]], extra_with({"var:n": 3}))
 
     # the two requests share one value-agnostic statement SHAPE (the first/offset binds are
     # the same named params) but get distinct pages.
-    assert str(one.build_query()) == str(three.build_query())
+    assert str(step.build_query(source_values={"var:n": 1})) == \
+        str(step.build_query(source_values={"var:n": 3}))
     assert [[r["id"] for r in b] for b in one_out] == [[1], [3], [6]]
     # author 1 owns posts 1,2 (capped at 2 by its row count); author 2 owns 3,4,5; author
     # 3 owns 6,7,8,9 (capped at 3 by first=3).
@@ -554,8 +576,8 @@ async def test_root_collection_placeholder_byte_identical_to_literal(seeded):
     """NO-REGRESSION: a placeholder root LIMIT/OFFSET returns the SAME rows + count as inlining.
 
     The root collection's plain LIMIT/OFFSET: the old path inlines ``first=2, offset=1``; the
-    new path wraps each as a ``Placeholder`` (bound as a value-less param). Same one statement,
-    same rows.
+    new path wraps each as a value-less ``Placeholder`` (bound as a value-less param, supplied
+    via ``source_values``). Same one statement, same rows.
     """
     engine = get_engine()
     with pg_request_context(SQLAlchemyExecutor(engine)):
@@ -563,15 +585,15 @@ async def test_root_collection_placeholder_byte_identical_to_literal(seeded):
             constant(None)
         )
         with count_sql(engine) as lit_counter:
-            lit_out = await literal.execute(1, [[None]])
+            lit_out = await literal.execute(1, [[None]], extra_with({}))
 
     with pg_request_context(SQLAlchemyExecutor(engine)):
         placeheld = PgSelectAllStep(
             make_posts(), order_by=["id"],
-            first=Placeholder("var:n", 2), offset=Placeholder("var:o", 1),
+            first=Placeholder("var:n"), offset=Placeholder("var:o"),
         ).for_parent(constant(None))
         with count_sql(engine) as ph_counter:
-            ph_out = await placeheld.execute(1, [[None]])
+            ph_out = await placeheld.execute(1, [[None]], extra_with({"var:n": 2, "var:o": 1}))
 
     assert ph_counter.count == lit_counter.count == 1
     assert ph_out == lit_out

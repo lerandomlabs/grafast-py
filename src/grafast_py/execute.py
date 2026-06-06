@@ -108,7 +108,9 @@ def run_layer(
         return None
     seed = dict(parent_store) if parent_store else {}
     seed[layer.parent_step.id] = parents
-    extra = BucketExtra(context, parent_paths)
+    extra = BucketExtra(
+        context, parent_paths, getattr(context, "_grafast_source_values", {})
+    )
     return run_steps(
         len(parents),
         layer.ordered_steps,
@@ -459,7 +461,9 @@ def run_serial_plan_field(context, field_plan, live_parents, live_paths, parent_
     boundary = {parent_step.id}
     ordered = order_steps_within([field_plan.step], boundary)
     seed = {parent_step.id: live_parents}
-    extra = BucketExtra(context, live_paths)
+    extra = BucketExtra(
+        context, live_paths, getattr(context, "_grafast_source_values", {})
+    )
     columns = run_steps(
         len(live_parents),
         ordered,
