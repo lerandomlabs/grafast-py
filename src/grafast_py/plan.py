@@ -19,12 +19,12 @@ there is no `step is None` path and no separate per-parent resolver machine.
 from enum import Enum
 from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
-from graphql.execution.execute import get_field_def
 from graphql.execution.values import get_argument_values
 from graphql.language import FieldNode, OperationDefinitionNode, VariableNode
 from graphql.pyutils import Path
 from graphql.type import GraphQLField, GraphQLObjectType, GraphQLOutputType
 
+from . import _compat
 from .completion import (
     Completer,
     build_completer,
@@ -155,7 +155,7 @@ def plan_object(
 
     field_plans: List[FieldPlan] = []
     for response_name, field_nodes in fields.items():
-        field_def = get_field_def(context.schema, parent_type, field_nodes[0])
+        field_def = _compat.get_field_def(context.schema, parent_type, field_nodes[0])
         if not field_def:
             # unknown field — dropped from output, like execute_field's Undefined
             continue
@@ -336,7 +336,7 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     """
     from .core_steps import RootStep
 
-    config = type(context).grafast_config
+    config = context.grafast_config
     if config.cache_plans:
         cached = lookup_cached_plan(context, operation, config)
         if cached is not None:

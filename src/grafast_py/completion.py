@@ -820,7 +820,7 @@ def abstract_child_plan(context, completer, object_type):
     # empty provenance, so `FieldArgs.is_variable` would be False and the host would inline it
     # as a literal even with placeholders enabled. Thread all three so a concrete-type subtree
     # plans EXACTLY as the operation root does.
-    config = type(context).grafast_config
+    config = context.grafast_config
     plan.inline_relations = config.inline_relations
     plan.placeholders = config.placeholders
     plan.cache_plans = config.cache_plans
