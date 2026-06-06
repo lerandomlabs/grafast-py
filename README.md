@@ -328,6 +328,86 @@ app = GraphQL(
 )
 ```
 
+## LATERAL relation inlining (experimental, opt-in)
+
+By default every resource layer is its own batched `WHERE col = ANY($1)` round-trip — the
+O(depth) profile above and the correctness baseline. **Relation inlining** is an opt-in
+optimization that folds a *provably-safe* child relation into its parent's statement via a
+`LEFT JOIN LATERAL`, so a parent + its inlined children become **one** statement instead of
+one-per-layer. It is **opportunistic and equivalence-preserving**: with inlining on, the
+result is **byte-identical** to the batched path (same data, same list order, same `[]` /
+`null` for empty children) — it changes only the *number* of SQL statements, never the data.
+
+It is **experimental and ships dark this wave** (`inline_relations` defaults to `False`).
+Turn it on globally on the context class:
+
+```python
+from grafast_py import GrafastConfig, GrafastExecutionContext
+
+class InlinedContext(GrafastExecutionContext):
+    grafast_config = GrafastConfig(inline_relations=True)   # default False (ships dark)
+```
+
+With the flag off (the default) the optimize pass is a **no-op** — every pg step's
+`optimize` short-circuits to identity, so a build with no host action is byte-identical to
+one compiled without the feature at all.
+
+### Per-resource opt-out
+
+Even with the global flag on, a single table can be excluded — useful for a table whose
+codecs or `LATERAL` semantics you'd rather not fold while keeping inlining everywhere else:
+
+```python
+from grafast_py.pg import PgResource
+
+PgResource("events", schema="grafast_demo", table="events", columns=[...],
+           opt_out_inline=True)   # never folded as a parent NOR inlined as a child
+```
+
+`opt_out_inline` has no effect when the global flag is off (nothing inlines anyway).
+
+### What inlines — and what falls back (SKIP scope)
+
+Inlining is **conservative by construction**: a child is folded **only** when *every*
+safety condition is provably met; on *any* unmet or uncertain condition the child is
+**SKIPPED** — it stays a standalone batched `= ANY($1)` statement, exactly as the planner
+built it. Unsafe-but-skipped is always correct (a redundant extra statement, never wrong
+data); the predicate never inlines when in doubt. Inlined **this wave**:
+
+- **hasOne** (e.g. `Post.author`) — folded as `to_jsonb(child) … LIMIT 1`, scattered as the
+  single row or `null`.
+- **unpaginated hasMany** (e.g. `Author.posts`) — folded as
+  `coalesce(json_agg(to_jsonb(child) ORDER BY …), '[]')`, scattered as the list (or `[]` for
+  a parent with no children), reproducing the child's exact `ORDER BY` including its
+  primary-key tie-break.
+- **multi-level nesting** composes — `authors → posts → comments` folds to **one**
+  statement (the optimize pass runs to a fixpoint, so a parent re-folds after its own child
+  folded).
+
+**SKIPPED this wave** (kept on the batched path, still byte-identical via fallback):
+
+- **paginated / keyset connections** (`PgConnectionStep`: `first` / `offset` / `after` /
+  `before`, `totalCount`, aggregates) — always skipped.
+- **per-parent limited hasMany** (a `first` / `offset` window slice on a relation) — skipped
+  (the per-parent `LIMIT`-via-`row_number()` fold is deferred).
+- **filtered children** — a child carrying a host `.where()` or a resource
+  `select_customizer` scope is skipped (reproducing an arbitrary correlated predicate inside
+  the `LATERAL` with a proven-identical customization signature is deferred); an *unfiltered*
+  child folds.
+- **composite (multi-column) FK relations** — skipped (only single-column FK correlation is
+  folded this wave).
+- **non-JSON-stable codecs** — a child is folded only when every projected column survives
+  the `to_jsonb → JSON → to_py` round-trip to the *same* Python value as the batched row
+  decode; a column whose codec is not on the json-safe allowlist (e.g. some
+  timestamptz / numeric / array / range / composite codecs) skips the fold.
+- **cross-schema / cross-executor** resources, and any **mutation** (a write step is never
+  inlined).
+
+Because the fold is gated this strictly, you can flip the flag on for an existing suite as
+the broadest possible equivalence oracle: `GRAFAST_INLINE_RELATIONS=1 uv run pytest tests -m
+pg` re-runs the whole Postgres suite with inlining forced on and every existing exact-data
+assertion still holds.
+
 ## Status / caveats
 
 This engine **passes a rigorous internal gate set**: the full graphql-core 3.2.8
@@ -346,9 +426,15 @@ in this engine — do it in your validation layer (see above).
 
 **Deferred in the `grafast_py.pg` data source**: runtime `from_step` placeholders (a
 relation's match value comes from the parent row's column, not an arbitrary upstream step;
-filter values inline at plan time) and the **plan caching** that builds on them; and query
-inlining / `LATERAL` (each resource layer is its own batched `= ANY($1)` round-trip, not
-folded into the parent's query). `HAVING` on aggregates is not yet exposed.
+filter values inline at plan time) and the **plan caching** that builds on them.
+`HAVING` on aggregates is not yet exposed.
+
+**Experimental / opt-in this wave**: opportunistic `LATERAL` relation inlining
+(`inline_relations`, default **OFF**). When off — the default — each resource layer is its
+own batched `= ANY($1)` round-trip; turning it on folds a *safe-to-prove* hasOne /
+unpaginated-hasMany child into the parent's statement to cut SQL round-trips. It ships
+**dark** and is gated by a strict equivalence predicate (see
+[LATERAL relation inlining](#lateral-relation-inlining-experimental-opt-in) below).
 
 Previously deferred, now built: multi-column (composite) relation keys, the
 single-shared-request-transaction mode, connection `GROUP BY` / aggregates, a codec

@@ -53,10 +53,10 @@ def resource_from_model(
     resource_name = name or model.__tablename__
     resource_schema = schema or table.schema or "public"
     # Derive PgColumn descriptors carrying nullability/default metadata (used by
-    # mutations later); a `columns` override stays a plain name list. NO codec / type
-    # mapping is derived here — that is the declined schema-generation scope. The derived
-    # descriptors keep the SAME column NAMES (and order), so resource.columns compares
-    # equal to a hand-declared name list (the parity gate).
+    # mutations later); a `columns` override stays a plain name list. NO codec / GraphQL
+    # type generation is derived here — that is the declined schema-generation scope. The
+    # derived descriptors keep the SAME column NAMES (and order), so resource.columns
+    # compares equal to a hand-declared name list (the parity gate).
     resource_columns: Sequence[Union[str, PgColumn]]
     if columns is not None:
         resource_columns = list(columns)
@@ -78,8 +78,17 @@ def columns_from_table(table) -> List[PgColumn]:
     """Build :class:`PgColumn` descriptors from a mapped table's columns.
 
     Each descriptor takes the column NAME (so the ordered name list is unchanged) plus
-    ``not_null`` (the column is NOT NULL) and ``has_default`` (a server/column default or
-    autoincrement is present) — metadata for the mutation side. No codec/type mapping.
+    ``not_null`` (the column is NOT NULL), ``has_default`` (a server/column default or
+    autoincrement is present) — metadata for the mutation side — and the column's
+    ``sql_type`` (``col.type``). Recording the type is what lets the inlining safety
+    predicate decide each column: a NON-native type (numeric / timestamptz / bytea / array /
+    range) is NOT json-stable, so the fold SKIPS it (its ``to_jsonb`` -> JSON form differs
+    from the asyncpg row value — silent precision loss / tz-shift / bytea-as-string), while a
+    native type (int / text / bool) is provably foldable. WITHOUT the type, a model's
+    non-native column would be UNKNOWN-typed and the predicate would refuse to fold it (or, if
+    assumed native, corrupt data) — so the bridge always carries it. The non-native types also
+    feed the resource ``column_types`` keyset CAST. NO codec / GraphQL type generation is
+    derived (the declined schema-generation scope).
     """
     descriptors: List[PgColumn] = []
     for col in table.columns:
@@ -89,6 +98,7 @@ def columns_from_table(table) -> List[PgColumn]:
                 name=col.name,
                 not_null=not col.nullable,
                 has_default=has_default,
+                sql_type=col.type,
             )
         )
     return descriptors

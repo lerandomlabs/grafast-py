@@ -300,6 +300,7 @@ async def demo_schema():
     await dispose_engine()
 
 
+@pytest.mark.inline_off
 @pytest.mark.asyncio
 async def test_no_settings_keeps_o_depth_batching(demo_schema):
     """With ``settings=None`` the executor takes the no-txn path; counts stay O(depth).

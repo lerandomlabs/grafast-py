@@ -52,6 +52,13 @@ from .from_sqlalchemy import (
     resource_from_model,
     resources_from_models,
 )
+# LATERAL relation inlining substrate (Wave 3b): the fold spec + nested-row extract step
+# the parent's optimize/build_query (later steps) reproduce a child relation through.
+from .inline import (
+    InlineSpec,
+    NestedExtractStep,
+    inline_spec_from_relation,
+)
 from .mutations import (
     PgDeleteSingleStep,
     PgInsertSingleStep,
@@ -101,6 +108,10 @@ __all__ = [
     "PgSelectStep",
     "PgSelectSingleStep",
     "PgSelectAllStep",
+    # LATERAL relation inlining substrate (Wave 3b)
+    "InlineSpec",
+    "NestedExtractStep",
+    "inline_spec_from_relation",
     "PgConnectionStep",
     "connection",
     "connection_needs_total",

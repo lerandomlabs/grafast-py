@@ -17,6 +17,7 @@ the returned row steps (one batched statement per resource-layer).
 from typing import Optional, Tuple
 
 from graphql import GraphQLSchema
+from sqlalchemy.types import Integer, Text
 
 from grafast_py.core_steps import access, constant
 from grafast_py.schema import make_grafast_schema
@@ -26,7 +27,7 @@ from grafast_py.pg.mutations import (
     pg_insert_single,
     pg_update_single,
 )
-from grafast_py.pg.resource import PgRegistry, PgResource
+from grafast_py.pg.resource import PgColumn, PgRegistry, PgResource
 
 SDL = """
 type Query {
@@ -96,19 +97,39 @@ type PageInfo {
 
 
 def build_registry() -> Tuple[PgRegistry, PgResource, PgResource, PgResource]:
-    """Build the demo registry + resources with their relations wired."""
+    """Build the demo registry + resources with their relations wired.
+
+    Columns carry their native SQL type (``Integer`` / ``Text``) so the inlining safety
+    predicate can PROVE each is json-stable native and fold it (a bare untyped column is
+    UNKNOWN-typed and would not fold — see ``PgResource.is_inline_json_safe``). These are the
+    same types the ORM bridge records from ``col.type``, so the hand-declared and
+    model-derived demo registries fold identically.
+    """
     registry = PgRegistry()
     authors = PgResource(
-        "authors", "grafast_demo", "authors", ["id", "name"], registry=registry
+        "authors", "grafast_demo", "authors",
+        [PgColumn("id", sql_type=Integer()), PgColumn("name", sql_type=Text())],
+        registry=registry,
     )
     posts = PgResource(
-        "posts", "grafast_demo", "posts", ["id", "author_id", "title"], registry=registry
+        "posts", "grafast_demo", "posts",
+        [
+            PgColumn("id", sql_type=Integer()),
+            PgColumn("author_id", sql_type=Integer()),
+            PgColumn("title", sql_type=Text()),
+        ],
+        registry=registry,
     )
     comments = PgResource(
         "comments",
         "grafast_demo",
         "comments",
-        ["id", "post_id", "author_id", "body"],
+        [
+            PgColumn("id", sql_type=Integer()),
+            PgColumn("post_id", sql_type=Integer()),
+            PgColumn("author_id", sql_type=Integer()),
+            PgColumn("body", sql_type=Text()),
+        ],
         registry=registry,
     )
 
