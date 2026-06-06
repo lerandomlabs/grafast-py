@@ -39,7 +39,7 @@ two unions whose branches differ only by a filter VALUE never merge.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from sqlalchemy import (
     any_,
@@ -53,15 +53,24 @@ from sqlalchemy import (
     tuple_,
     union_all,
 )
-from sqlalchemy.sql import ColumnElement
+from sqlalchemy.sql import ColumnElement, visitors
+from sqlalchemy.sql.elements import BindParameter
 
 from ..core_steps import access
 from ..step_model import Step
 from .connection import connection_needs_total
-from .customize import check_predicate, predicate_key
+from .customize import check_predicate, placeholder_binds_in, predicate_key
 from .cursor import decode_keyset_cursor, effective_nulls, encode_keyset_cursor, keyset_where
 from .executor import current_pg_request
 from .ordering import OrderTerm, normalize_order
+from .placeholders import (
+    Placeholder,
+    placeholder_source,
+    placeholder_source_tag,
+    rebind_pagination_value,
+    rebind_placeholder_value,
+    unwrap_placeholder,
+)
 from .resource import PgResource
 from .steps import as_match_columns, grouping_key, normalize_lookup_key
 
@@ -120,13 +129,18 @@ class PgUnionMember:
         return len(self.match_columns) > 1
 
     def where_signature(self) -> Tuple[str, ...]:
-        """The value-included dedup signature of this branch's WHERE predicates.
+        """The dedup signature of this branch's WHERE predicates.
 
-        Each predicate compiled with ``literal_binds`` (via :func:`predicate_key`) so two
-        members differing only by a filter VALUE produce different signatures and never
-        merge — the same value-discrimination the select customization uses.
+        A LITERAL predicate is compiled with ``literal_binds`` (via :func:`predicate_key`) so
+        two members differing only by a filter VALUE produce different signatures and never
+        merge — the same value-discrimination the select customization uses. A PLACEHOLDER
+        predicate (a ``pg_placeholder`` over a variable-derived value) keys value-agnostically
+        off its stable source tag instead, so two requests of the same document share one key
+        while two different sources never merge — exactly as a select's customization does.
         """
-        return tuple(predicate_key(p) for p in self.where)
+        return tuple(
+            predicate_key(p, placeholder_binds_in(p) or None) for p in self.where
+        )
 
 
 class PgUnionAllStep(Step):
@@ -154,10 +168,10 @@ class PgUnionAllStep(Step):
         shared_columns: Sequence[str],
         order_by: Sequence[Union[str, OrderTerm]],
         key_step: Optional[Step] = None,
-        first: Optional[int] = None,
-        after: Optional[str] = None,
-        last: Optional[int] = None,
-        before: Optional[str] = None,
+        first: Optional[Union[int, Placeholder]] = None,
+        after: Optional[Union[str, Placeholder]] = None,
+        last: Optional[Union[int, Placeholder]] = None,
+        before: Optional[Union[str, Placeholder]] = None,
         order_is_unique: bool = False,
         needs_total: bool = False,
     ) -> None:
@@ -195,12 +209,23 @@ class PgUnionAllStep(Step):
         )
         self.order_by: Tuple[OrderTerm, ...] = base_order + (OrderTerm(TYPENAME_COLUMN),)
         self.assert_order_columns_shared()
+        # page size: a plan-time literal int/None (value-included key) OR a ``Placeholder``
+        # (variable-derived, source-keyed). The page math unwraps the runtime value; the
+        # keyset window binds page_limit as a param regardless, so a placeholder changes only
+        # the dedup key, never the SQL.
         self.first = first
         self.last = last
         self.needs_total = needs_total
+        # the stable source tags of a variable-derived after/before cursor (``None`` for a
+        # literal cursor); the dedup key emits these in place of the decoded cursor VALUES so
+        # a variable cursor keys value-agnostically (a cache hit), while the decoded values
+        # still drive the keyset SQL bound as params.
+        self.after_source: Optional[str] = placeholder_source_tag(after)
+        self.before_source: Optional[str] = placeholder_source_tag(before)
         # a connection pages forward XOR reverse; both forward (first/after) and reverse
         # (last/before) args is undefined under Relay — reject it loudly rather than page
-        # one way and silently ignore the other (mirrors PgConnectionStep).
+        # one way and silently ignore the other (mirrors PgConnectionStep). A Placeholder is
+        # never ``None``, so a variable-derived arg counts toward its direction.
         forward_arg = first is not None or after is not None
         reverse_arg = last is not None or before is not None
         if forward_arg and reverse_arg:
@@ -212,13 +237,24 @@ class PgUnionAllStep(Step):
         self.reverse = reverse_arg
         # decode the cursor LOUDLY against the current order (digest-validated); a cursor
         # minted under a different ordering — or garbage — raises at plan time. The decoded
-        # VALUES are plan-time content that discriminate the dedup key.
+        # VALUES drive the keyset SQL (bound as params); they discriminate the dedup key only
+        # for a LITERAL cursor — a variable cursor keys off its source tag (above). Unwrap a
+        # ``Placeholder`` to the cursor string before decode.
+        after_cursor = unwrap_placeholder(after)
+        before_cursor = unwrap_placeholder(before)
         self.after_values: Optional[List[Any]] = (
-            decode_keyset_cursor(after, self.order_by) if after else None
+            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
         )
         self.before_values: Optional[List[Any]] = (
-            decode_keyset_cursor(before, self.order_by) if before else None
+            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
         )
+        # keep the raw after/before (a literal cursor str or a ``Placeholder``) AND the page
+        # sizes so the plan-cache rebind can re-point a variable-derived page/cursor for the
+        # next request — the decoded ``after_values`` / ``before_values`` above carry THIS
+        # request's value, which a cache hit must replace (mirrors PgConnectionStep). A literal
+        # cursor / size is kept verbatim (its rebind is a no-op); ``None`` when the arg was absent.
+        self.after = after
+        self.before = before
         # PER-PARENT mode iff a key step is wired. Every member then needs a match key, and
         # all members must agree on the match arity (the window partitions by ONE shared
         # set of match columns across the union). ROOT mode has no key match.
@@ -330,6 +366,51 @@ class PgUnionAllStep(Step):
         """Whether the per-parent match key spans more than one column."""
         return len(self.match_columns) > 1
 
+    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
+        """Re-point this union's page-size, CURSOR and per-member WHERE placeholders to a cached request.
+
+        The plan-cache rebind hook for a pgUnionAll (Wave 4): unlike a plain select the union
+        subclasses :class:`~grafast_py.step_model.Step` directly (not ``PgCustomizable``), so it
+        does not inherit the WHERE rebind — it re-points all three placeholder surfaces itself,
+        mirroring :meth:`PgConnectionStep.rebind_placeholders`:
+
+        * ``first`` / ``last`` page sizes — a variable-derived size is a :class:`Placeholder`
+          re-pointed by source (a literal int is a no-op);
+        * ``after`` / ``before`` cursors — a variable-derived cursor is a :class:`Placeholder`
+          carrying the FIRST request's cursor string; the cached step decoded it into
+          ``after_values`` / ``before_values`` at build, so on a HIT we re-point the sentinel AND
+          RE-DECODE the new cursor against the current order (digest-validated, so a cursor from a
+          different ordering still fails loud);
+        * each member's per-branch WHERE ``pg_placeholder`` bind — re-pointed in place by its
+          source tag (the member dataclass is frozen, but its predicate bindparams are mutable
+          objects, so we set the bound VALUE on each placeholder bind without rebuilding the
+          member). The dedup key is value-agnostic and source-keyed, so the SQL shape is shared;
+          only the bound values move.
+
+        A union whose page/cursor/member-WHERE are all plan-time literals has nothing to
+        re-point, so every branch below is a no-op — as for any non-placeholder step.
+        """
+        self.first = rebind_pagination_value(self.first, values_by_source)
+        self.last = rebind_pagination_value(self.last, values_by_source)
+        self.after = rebind_pagination_value(self.after, values_by_source)
+        self.before = rebind_pagination_value(self.before, values_by_source)
+        after_cursor = unwrap_placeholder(self.after)
+        before_cursor = unwrap_placeholder(self.before)
+        self.after_values = (
+            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
+        )
+        self.before_values = (
+            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
+        )
+        for member in self.members:
+            for predicate in member.where:
+                for bind in visitors.iterate(predicate):
+                    if not isinstance(bind, BindParameter):
+                        continue
+                    source = placeholder_source(bind)
+                    if source is not None and source in values_by_source:
+                        rebind_placeholder_value(bind, values_by_source[source])
+
     # ------------------------------------------------------------------ SQL build
 
     def effective_order(self) -> Tuple[OrderTerm, ...]:
@@ -346,9 +427,19 @@ class PgUnionAllStep(Step):
             for t in self.order_by
         )
 
+    def page_size(self) -> Optional[int]:
+        """The active page size as a runtime int, unwrapping a variable-derived ``Placeholder``.
+
+        ``last`` for reverse, ``first`` for forward; a ``Placeholder`` yields its request
+        value. The page arithmetic (``page_limit`` + the one-extra-row probe in
+        ``build_connection``) reads THIS, so a placeholder page size pages exactly like a
+        literal — only the dedup key (which keeps the sentinel) differs.
+        """
+        return unwrap_placeholder(self.last if self.reverse else self.first)
+
     def page_limit(self) -> Optional[int]:
         """The per-partition row cap: the page size PLUS ONE extra (for hasNextPage)."""
-        size = self.last if self.reverse else self.first
+        size = self.page_size()
         return None if size is None else size + 1
 
     def cursor_predicate(self, member: PgUnionMember) -> Optional[ColumnElement]:
@@ -600,7 +691,8 @@ class PgUnionAllStep(Step):
         so completion-time dispatch resolves its concrete type. The cursor encodes from the
         RAW row's order-column values, so encode before decode.
         """
-        size = self.last if self.reverse else self.first
+        # the active page size as a runtime int (unwrapping a variable-derived Placeholder).
+        size = self.page_size()
         has_extra = size is not None and len(rows) > size
         page = rows[:size] if has_extra else rows
         if self.reverse:
@@ -691,14 +783,31 @@ class PgUnionAllStep(Step):
             for m in self.members
         )
 
+    def cursor_key(self, source: Optional[str], values: Optional[List[Any]]) -> Any:
+        """The dedup-key component for a cursor: its SOURCE tag (variable) or its VALUES (literal).
+
+        A variable-derived cursor keys off its stable ``source`` tag (``var:after``) — value-
+        agnostic, so two requests of the same document share one key (a cache hit) while two
+        different sources never merge. A literal cursor keeps its decoded VALUES (list ->
+        tuple, hashable) so two pages differing only by a literal ``after``/``before`` get
+        different keys, as before. ``None`` (unpaged on this side) keys as ``None``; the source
+        path is tagged (``("var", source)``) so it never collides with a same-shaped tuple.
+        """
+        if source is not None:
+            return ("var", source)
+        return tuple(values) if values is not None else None
+
     @property
     def peer_key(self) -> str:
+        # first/last render their Placeholder source (not the value) when variable-derived;
+        # after/before key by source tag (variable) or decoded values (literal) via cursor_key.
         return (
             f"pg_union_all|{self.member_signature()!r}"
             f"|{self.shared_columns!r}|{self.member_columns!r}"
             f"|{self.match_columns!r}|{self.is_per_parent}"
             f"|{self.order_by!r}|{self.first}|{self.last}"
-            f"|{self.after_values!r}|{self.before_values!r}|{self.needs_total}"
+            f"|{self.cursor_key(self.after_source, self.after_values)!r}"
+            f"|{self.cursor_key(self.before_source, self.before_values)!r}|{self.needs_total}"
         )
 
     def dedup_params(self) -> Tuple[Any, ...]:
@@ -711,11 +820,11 @@ class PgUnionAllStep(Step):
             self.order_by,
             self.first,
             self.last,
-            # decoded cursor VALUES are plan-time content, so they discriminate the key
-            # (two pages differing only by after/before must not merge); list -> tuple to
-            # stay hashable in the dedup tuple.
-            tuple(self.after_values) if self.after_values is not None else None,
-            tuple(self.before_values) if self.before_values is not None else None,
+            # the cursor key component: a variable cursor's stable source tag (value-agnostic,
+            # a cache hit across requests of the same document) or a literal cursor's decoded
+            # VALUES (so two pages differing only by after/before never merge).
+            self.cursor_key(self.after_source, self.after_values),
+            self.cursor_key(self.before_source, self.before_values),
             self.needs_total,
         )
 
@@ -761,10 +870,10 @@ def pg_union_all(
     shared_columns: Sequence[str],
     order_by: Sequence[Union[str, OrderTerm]],
     key_step: Optional[Step] = None,
-    first: Optional[int] = None,
-    after: Optional[str] = None,
-    last: Optional[int] = None,
-    before: Optional[str] = None,
+    first: Optional[Union[int, Placeholder]] = None,
+    after: Optional[Union[str, Placeholder]] = None,
+    last: Optional[Union[int, Placeholder]] = None,
+    before: Optional[Union[str, Placeholder]] = None,
     order_is_unique: bool = False,
     needs_total: bool = False,
 ) -> PgUnionAllStep:
@@ -796,10 +905,10 @@ def union_all_connection(
     order_by: Sequence[Union[str, OrderTerm]],
     info: Any,
     key_step: Optional[Step] = None,
-    first: Optional[int] = None,
-    after: Optional[str] = None,
-    last: Optional[int] = None,
-    before: Optional[str] = None,
+    first: Optional[Union[int, Placeholder]] = None,
+    after: Optional[Union[str, Placeholder]] = None,
+    last: Optional[Union[int, Placeholder]] = None,
+    before: Optional[Union[str, Placeholder]] = None,
     order_is_unique: bool = False,
 ) -> PgUnionAllStep:
     """Plan-helper that gates ``needs_total`` off the field's selection set (like a connection).

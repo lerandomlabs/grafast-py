@@ -13,6 +13,22 @@ existing pg tests — every one of which already asserts EXACT result data — b
 broadest possible byte-identical oracle for inlining. It is OFF by default, so a plain
 `uv run pytest tests` (and the conformance run, which has its own conftest and never
 sets this) is unaffected.
+
+The Wave 4 step-9 switches do the same for plan caching + runtime placeholders, via the
+sibling :func:`cache_plans_suite_toggle`:
+
+- `GRAFAST_CACHE_PLANS=1` forces `cache_plans=True` (and, because only a value-agnostic
+  placeholder-bearing plan is cacheable across values, `placeholders=True` with it), so a
+  cache hit changes only WHETHER planning re-runs — never the SQL or the data, hence the
+  whole result-asserting suite stays byte-identical.
+- `GRAFAST_PLACEHOLDERS=1` forces ONLY `placeholders=True`, so the per-argument variable
+  provenance surface (and the placeholder dedup path) ships independently of caching: a
+  host that does not call `pg_placeholder` still inlines literals exactly as before, so the
+  suite again stays byte-identical (provenance is computed but unused). This lets the two
+  knobs be A/B'd separately — placeholders can be exercised suite-wide without caching.
+
+Both are OFF by default; a plain `uv run pytest tests` and the conformance run are
+unaffected (caching + placeholders ship dark).
 """
 
 import os
@@ -34,10 +50,42 @@ os.environ.setdefault("GRAFAST_PG_URL", "postgresql+asyncpg:///grafast_py_test")
 # the BASE GrafastExecutionContext's config to inline_relations=True for the whole suite.
 INLINE_ENV_VAR = "GRAFAST_INLINE_RELATIONS"
 
+# the Wave 4 step-9 switches: when set (CI jobs `cache-on` / `placeholders-on`), the autouse
+# fixture below flips the BASE GrafastExecutionContext's config for the whole suite, so the
+# EXISTING result-asserting suite becomes the broadest byte-identical oracle.
+#   GRAFAST_CACHE_PLANS    -> cache_plans=True (a hit changes only WHETHER planning re-runs);
+#                            caching is only safe across values for a value-agnostic plan, so
+#                            placeholders are forced on with it.
+#   GRAFAST_PLACEHOLDERS   -> placeholders=True only (the variable-provenance + placeholder
+#                            dedup path, A/B'd WITHOUT caching). A host that does not opt into
+#                            pg_placeholder still inlines literals, so this too is byte-identical.
+CACHE_ENV_VAR = "GRAFAST_CACHE_PLANS"
+PLACEHOLDERS_ENV_VAR = "GRAFAST_PLACEHOLDERS"
+
+
+def _env_flag(name: str) -> bool:
+    """Whether env var ``name`` is set to a truthy value (unset / 0 / false => off)."""
+    return os.environ.get(name, "") not in ("", "0", "false", "False")
+
 
 def inline_relations_enabled() -> bool:
     """Whether the step-9 CI switch asked for inlining ON across the whole suite."""
-    return os.environ.get(INLINE_ENV_VAR, "") not in ("", "0", "false", "False")
+    return _env_flag(INLINE_ENV_VAR)
+
+
+def cache_plans_enabled() -> bool:
+    """Whether the Wave 4 switch asked for plan caching ON across the whole suite."""
+    return _env_flag(CACHE_ENV_VAR)
+
+
+def placeholders_enabled() -> bool:
+    """Whether the Wave 4 switch asked for the placeholder provenance surface ON suite-wide.
+
+    Caching implies placeholders (only a value-agnostic placeholder-bearing plan is cacheable
+    across values), so ``GRAFAST_CACHE_PLANS`` turns this on too; ``GRAFAST_PLACEHOLDERS`` turns
+    it on WITHOUT caching, so the two can be A/B'd independently.
+    """
+    return _env_flag(PLACEHOLDERS_ENV_VAR) or cache_plans_enabled()
 
 
 def pytest_configure(config):
@@ -60,6 +108,16 @@ def pytest_configure(config):
         "markers",
         "inline_off: keep inlining OFF for this test even under GRAFAST_INLINE_RELATIONS "
         "(it asserts the exact batched statement count, which a fold reduces)",
+    )
+    # the `cache_off` marker pins a test to per-request planning even under the CI cache-on
+    # switch: a test that asserts the EXACT number of plan BUILDS (which caching legitimately
+    # reduces on a hit), or that mutates a context's grafast_config mid-test in a way the
+    # shared base override would fight, opts out. The result/statement-count oracle still
+    # holds for it; only the plan-build count would differ.
+    config.addinivalue_line(
+        "markers",
+        "cache_off: keep plan caching OFF for this test even under GRAFAST_CACHE_PLANS "
+        "(it asserts the exact plan-build count, which a cache hit reduces)",
     )
 
 
@@ -98,6 +156,63 @@ def inline_relations_suite_toggle(request):
     try:
         yield
     finally:
+        if previous is None:
+            del GrafastExecutionContext.grafast_config
+        else:
+            GrafastExecutionContext.grafast_config = previous
+
+
+@pytest.fixture(autouse=True)
+def cache_plans_suite_toggle(request):
+    """Flip plan caching / placeholders ON for the whole suite under the Wave 4 switches.
+
+    The Wave 4 step-9 "broadest oracle" — the sibling of :func:`inline_relations_suite_toggle`:
+    run the EXISTING result-asserting suite with caching and/or the placeholder provenance
+    surface forced on, proving they change only WHETHER planning re-runs (a cache hit) and
+    WHICH provenance is computed (placeholders) — never the SQL or the data, so results AND
+    statement counts stay BYTE-IDENTICAL to the per-request baseline. We monkeypatch the BASE
+    :class:`GrafastExecutionContext`'s class-level ``grafast_config`` and restore it after each
+    test; the process-global plan cache is CLEARED around each test so no entry leaks across
+    tests (each test builds its own schema, but a fresh cache keeps the oracle hermetic).
+
+    Two independent env switches drive ONE merged config so they cannot fight over the shared
+    ``grafast_config`` attribute (a single fixture sets the union):
+
+    - ``GRAFAST_CACHE_PLANS=1`` => ``cache_plans=True`` (and ``placeholders=True`` with it,
+      since only a value-agnostic placeholder-bearing plan is cacheable across values).
+    - ``GRAFAST_PLACEHOLDERS=1`` => ``placeholders=True`` only (the provenance + placeholder
+      dedup path, A/B'd WITHOUT caching).
+
+    Surgical, exactly like the inlining toggle:
+
+    - A NO-OP unless at least one switch is set, so the default run and the conformance run are
+      untouched — caching + placeholders ship dark.
+    - A test with its OWN ``grafast_config`` on a context subclass shadows this base attribute,
+      so its explicit config wins.
+    - A test marked ``cache_off`` (it asserts the exact plan-BUILD count, which a hit reduces)
+      is kept off the CACHE forcing — but placeholders, which never change the build count or
+      the data, are still forced if their switch is set, so the placeholder oracle keeps its
+      reach even over the cache-build-count tests.
+    """
+    force_cache = cache_plans_enabled() and not request.node.get_closest_marker("cache_off")
+    force_placeholders = placeholders_enabled()
+    if not force_cache and not force_placeholders:
+        yield
+        return
+
+    from grafast_py.cache import default_cache
+    from grafast_py.config import GrafastConfig
+    from grafast_py.context import GrafastExecutionContext
+
+    previous = GrafastExecutionContext.__dict__.get("grafast_config")
+    GrafastExecutionContext.grafast_config = GrafastConfig(
+        cache_plans=force_cache, placeholders=force_placeholders
+    )
+    default_cache().clear()
+    try:
+        yield
+    finally:
+        default_cache().clear()
         if previous is None:
             del GrafastExecutionContext.grafast_config
         else:

@@ -15,6 +15,46 @@ experimental Python re-implementation of the core ideas of Graphile's Grafast.
 3. Batching — the DataLoader N+1 problem — becomes **automatic**: a `loadMany` over N
    parents sees all N keys in a single call and fires its loader exactly once.
 
+## The core design choice (and its trade-off)
+
+grafast-py is a **drop-in `graphql-core` `ExecutionContext`** — a batching layer that
+slots *on top of* graphql-core, **not** a replacement engine. (Upstream Grafast, by
+contrast, owns the entire execution pipeline and uses graphql-js only for the type
+system.) That single decision defines what this library is and isn't — read it before
+adopting:
+
+**What it buys you**
+
+- **Adoption is a one-liner** (`execution_context_class=GrafastExecutionContext`): no new
+  server, no rewrite, and planned fields coexist with ordinary graphql-core resolvers in
+  the *same* schema.
+- **A small, legible core** (~1.5k lines vs upstream's ~26k): one tree-shaped plan, not a
+  separate layer-plan / output-plan machinery.
+- **Correctness largely for free**: graphql-core's own execution conformance suite is the
+  oracle, so a plain-resolver schema behaves byte-identically to stock graphql-core.
+- **The asymptotic win equals upstream**: O(depth) batched SQL, not O(rows) — the N+1 fix
+  is fully here.
+
+**What it costs**
+
+- Execution is **fused with graphql-core's field-by-field, tree-shaped completion.**
+  Optimizations upstream gets from its separate `LayerPlan` / `OutputPlan` substrate are
+  therefore harder here, and are deliberately **scoped or opt-in**: query inlining
+  (`LATERAL`) covers the common relation shapes and *falls back* to the batched path
+  otherwise; cross-request plan caching is opt-in and conservative; step **hoisting** and
+  **`@defer`/`@stream`** are not implemented (incremental delivery is the one feature this
+  model genuinely fights — it would require owning output planning).
+- So the gap vs upstream is **constant-factor** (round-trips, a few redundant step runs),
+  **not asymptotic** — and our optimizers intentionally cover fewer cases.
+- We are **coupled to graphql-core's execution semantics and release cadence** (e.g.
+  incremental delivery would track graphql-core 3.3).
+
+**In one line:** if you want pragmatic Grafast-style batching for an *existing* graphql-core
+/ Ariadne app, this is the right tool and the trade-off is the whole point. If you need
+upstream-class *optimization power*, that is a different design — one that owns execution
+on top of graphql-core's type-system / parser / validation (≈ upstream's size) — which this
+library deliberately is **not**.
+
 ## Install
 
 ```bash
@@ -408,6 +448,71 @@ the broadest possible equivalence oracle: `GRAFAST_INLINE_RELATIONS=1 uv run pyt
 pg` re-runs the whole Postgres suite with inlining forced on and every existing exact-data
 assertion still holds.
 
+## Plan caching + runtime placeholders (experimental, opt-in)
+
+By default every request **re-plans** from scratch (the selection set → step-DAG build runs each
+time) and every `$variable` value is **inlined into the SQL as a literal** at plan time — so two
+requests of the same document with different variable values produce *different* SQL text. That is
+the correctness baseline: a literal still inlines and **dedups by value**, so two steps that differ
+only by a filter value get different dedup keys and never merge.
+
+Two opt-in flags (both default **OFF**, both ship dark) let a host reuse a plan across requests:
+
+- **`placeholders`** turns on per-argument *variable provenance*. The planner walks each field's
+  AST and records which arguments came from a `$variable`; a plan resolver can then ask
+  `field_args.is_variable("status")` and, for a variable-derived value, build a **value-agnostic
+  placeholder** instead of inlining the literal:
+
+  ```python
+  from grafast_py.pg import pg_placeholder
+
+  def widgets_plan(parent, args, info):
+      step = pg_select(widgets).for_parent(parent)
+      if args.is_variable("status"):
+          # value-agnostic: the SQL renders `status = $1`, tagged by the SOURCE "var:status"
+          step.builder().where(column("status") == pg_placeholder(args.source("status"), args["status"]))
+      else:
+          step.builder().where(column("status") == args["status"])   # literal, inlines + dedups by value
+      return step
+  ```
+
+  A placeholder **dedups by its SOURCE identity** (the variable name), *never* by the runtime value:
+  two steps over the same source merge; two over different sources do not; a placeholder step and a
+  coincidentally-equal *literal* step do **not** merge (their SQL differs — `$1` vs an inlined
+  literal); and existing literal-only steps keep their value-included keys **unchanged**. The host
+  owns the predicate, so it opts in **per value** — there is no auto-placeholdering.
+
+- **`cache_plans`** reuses a finalized plan across requests of the same document, keyed by
+  `(schema identity, document text, operation name, variable-arg fingerprint)`. **Only a
+  value-independent plan is cached** — every SQL-affecting variable value must be either a
+  same-every-request literal or a value-agnostic placeholder; a plan that inlined a `$variable` as a
+  literal is value-specific and is *never* cached for reuse. On a cache **hit** the stored plan is
+  re-used and each placeholder is **re-bound** to this request's variable values (the cached SQL is
+  value-agnostic, so only the bound values move). It is a pure optimization: a hit changes only
+  *whether* planning re-runs — never the SQL text or the result data.
+
+  ```python
+  from grafast_py import GrafastConfig, GrafastExecutionContext
+
+  class CachedContext(GrafastExecutionContext):
+      grafast_config = GrafastConfig(placeholders=True, cache_plans=True)   # both default False
+  ```
+
+  The cache is a bounded **LRU** (`max_entries`, default 1000; set your own via
+  `GrafastConfig(plan_cache=PlanCache(max_entries=...))`), so an adversarial stream of unique
+  documents cannot grow it without bound.
+
+With both flags off (the default) `plan_operation` never reads or writes the cache and
+`FieldArgs.is_variable` is always `False`, so every host falls back to literal inlining and the
+executed plan is **byte-identical** to a build without these features at all.
+
+Like inlining, you can flip these on for the whole suite as the broadest equivalence oracle:
+`GRAFAST_CACHE_PLANS=1 uv run pytest tests` re-runs everything with caching (+ placeholders) forced
+on, and `GRAFAST_PLACEHOLDERS=1 uv run pytest tests` exercises the placeholder dedup path *without*
+caching — every existing exact-data **and** statement-count assertion still holds, because a cache
+hit changes only whether planning re-runs and a placeholder changes only how a value-agnostic value
+is dedup-keyed, never the SQL or the data.
+
 ## Status / caveats
 
 This engine **passes a rigorous internal gate set**: the full graphql-core 3.2.8
@@ -424,17 +529,22 @@ execution timeout bounds the caller but does not itself cancel in-flight SQL (pa
 with a server-side `statement_timeout`). Query cost/depth limiting is by design **not**
 in this engine — do it in your validation layer (see above).
 
-**Deferred in the `grafast_py.pg` data source**: runtime `from_step` placeholders (a
-relation's match value comes from the parent row's column, not an arbitrary upstream step;
-filter values inline at plan time) and the **plan caching** that builds on them.
-`HAVING` on aggregates is not yet exposed.
+**Deferred in the `grafast_py.pg` data source**: `HAVING` on aggregates is not yet exposed.
 
 **Experimental / opt-in this wave**: opportunistic `LATERAL` relation inlining
-(`inline_relations`, default **OFF**). When off — the default — each resource layer is its
-own batched `= ANY($1)` round-trip; turning it on folds a *safe-to-prove* hasOne /
-unpaginated-hasMany child into the parent's statement to cut SQL round-trips. It ships
-**dark** and is gated by a strict equivalence predicate (see
-[LATERAL relation inlining](#lateral-relation-inlining-experimental-opt-in) below).
+(`inline_relations`, default **OFF**), cross-request **plan caching** (`cache_plans`, default
+**OFF**), and runtime **placeholders** (`placeholders`, default **OFF**). When all three are off
+— the default — each resource layer is its own batched `= ANY($1)` round-trip and every operation
+plans per-request, inlining each `$variable` value as a SQL literal. Turning inlining on folds a
+*safe-to-prove* hasOne / unpaginated-hasMany child into the parent's statement to cut SQL
+round-trips; turning placeholders on lets a host express a variable-derived filter / pagination
+value as a *value-agnostic* bindparam tagged by its source variable, so the resulting plan is
+value-independent; turning caching on reuses that value-independent plan across requests of the
+same document (re-binding only the values). All three ship **dark** and are gated so the default
+build is byte-identical (see
+[LATERAL relation inlining](#lateral-relation-inlining-experimental-opt-in) and
+[Plan caching + runtime placeholders](#plan-caching--runtime-placeholders-experimental-opt-in)
+below).
 
 Previously deferred, now built: multi-column (composite) relation keys, the
 single-shared-request-transaction mode, connection `GROUP BY` / aggregates, a codec

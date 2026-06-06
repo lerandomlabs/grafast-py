@@ -19,10 +19,25 @@ KEY only — the step EXECUTES the predicate with its bindparams intact, never w
 ``literal_binds``. ``literal_binds`` is valid only because every bind carries a plan-time
 value, which :func:`check_predicate` enforces (an unbound bind, or a bind reusing a
 reserved skeleton name, fails loud).
+
+A PLACEHOLDER (Wave 4) is the value-AGNOSTIC counterpart: when the value came from a GraphQL
+``$variable``, the host wraps it as ``pg_placeholder(field_args.source("status"),
+args["status"])`` — a bindparam that carries the request's value (so it still rides
+``compiled.params`` at execute, unchanged) but is tagged with a STABLE source (``var:status``,
+the variable name). A predicate containing such a bind takes a DIFFERENT key path: compiled
+WITHOUT ``literal_binds`` (value-agnostic ``status = %(name)s``) plus the sorted source tags,
+so two requests of the same document key IDENTICALLY (one shared plan), two different variable
+sources never merge, and a placeholder never merges with a coincidentally equal-valued inlined
+literal (``$1`` vs an inlined ``'published'`` are different SQL). A predicate with NO
+placeholder binds is UNAFFECTED — it keeps the value-included ``literal_binds`` key, so every
+existing merge/count stays byte-identical. The discriminator is membership in the per-step
+``placeholder_binds`` registry, populated by :meth:`PgCustomizable.add_where` when it sees a
+source-tagged bind (see :mod:`grafast_py.pg.placeholders`).
 """
 
-from typing import Any, Callable, List, Sequence, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
 
+from sqlalchemy import literal_column
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import CompileError
 from sqlalchemy.sql import ColumnElement, visitors
@@ -33,6 +48,7 @@ from ..step_model import Step
 from .conditions import Condition, compile_condition
 from .executor import current_pg_request
 from .ordering import OrderTerm
+from .placeholders import placeholder_source, rebind_placeholder_value
 
 # The bind names the batched skeleton itself owns; a host predicate may not reuse them
 # (it would shadow the skeleton's own value at execute time).
@@ -83,24 +99,47 @@ def check_predicate(predicate: Any) -> ColumnElement:
     return predicate
 
 
-def predicate_key(predicate: ColumnElement) -> str:
-    """A stable, content-based dedup key for a Core predicate (VALUE-included).
+def predicate_key(
+    predicate: ColumnElement,
+    placeholder_binds: Optional[Mapping[str, str]] = None,
+) -> str:
+    """A stable, content-based dedup key for a Core predicate.
 
-    Compiled with the Postgres dialect and ``literal_binds`` so every bound value renders
-    INLINE: ``status = 'published'`` and ``status = 'draft'`` produce DIFFERENT strings,
-    so two differently-filtered selects never dedup-merge, while identical predicates
-    yield the identical string (and DO merge). Valid only because every bind carries a
-    plan-time value — :func:`check_predicate` guarantees that before a predicate reaches
-    here. The result is a hashable ``str`` that slots into the step's ``dedup_params``
-    tuple (which dag.py places in a dict key). This compile is for the KEY only; the
-    step executes the predicate with its bindparams intact, so execution stays
-    parameterised (never run with ``literal_binds``).
+    ``placeholder_binds`` maps a placeholder bindparam's NAME to its stable source tag
+    (e.g. ``{"grafast_ph_3": "var:status"}``), as populated by
+    :meth:`PgCustomizable.add_where`. It splits the predicate into two key regimes:
+
+    LITERAL (no placeholder binds — the default, and EVERY pre-Wave-4 predicate): compiled
+    with the Postgres dialect and ``literal_binds`` so every bound value renders INLINE —
+    ``status = 'published'`` and ``status = 'draft'`` produce DIFFERENT strings, so two
+    differently-filtered selects never dedup-merge, while identical predicates yield the
+    identical string (and DO merge). Valid only because every bind carries a plan-time value
+    — :func:`check_predicate` guarantees that. This path is BYTE-IDENTICAL to pre-Wave-4, so
+    every existing merge/count is preserved.
+
+    PLACEHOLDER (one or more binds are in ``placeholder_binds``): the value is NOT known at
+    plan time (it is a per-request variable), so the key MUST NOT inline it. Compiled WITHOUT
+    ``literal_binds`` (value-agnostic ``status = %(name)s``) and SUFFIXED with the sorted
+    source tags of the predicate's placeholder binds. This discriminates by placeholder
+    IDENTITY, never by runtime value: two predicates over the SAME source merge; over
+    DIFFERENT sources do not; and a placeholder predicate never equals a literal one of a
+    coincidentally equal value (a placeholder renders a ``<<ph:source>>`` sentinel + a ``|ph=``
+    suffix; an ordinary literal renders inline). Only the PLACEHOLDER binds are replaced by a
+    source sentinel before the compile — every co-located ORDINARY literal still renders inline
+    by value (so two predicates differing only by such a literal do NOT merge), and the unique
+    ``grafast_ph_N`` name is erased so two same-source predicates converge.
+
+    The result is a hashable ``str`` that slots into the step's ``dedup_params`` tuple. This
+    compile is for the KEY only; the step executes the predicate with its bindparams intact
+    (carrying their values), so execution stays parameterised.
 
     An exotic literal that no dialect can render inline (e.g. a non-UTF8 ``bytes`` value
-    against a ``bytea`` column) raises ``CompileError``; rather than crash PLANNING we
-    fall back to :func:`structural_predicate_key` — the value-free SQL plus the bound
-    values' repr — which still distinguishes two different exotic predicates.
+    against a ``bytea`` column) raises ``CompileError``; rather than crash PLANNING we fall
+    back to :func:`structural_predicate_key` — the value-free SQL plus the bound values'
+    repr — which still distinguishes two different exotic predicates.
     """
+    if placeholder_binds:
+        return placeholder_predicate_key(predicate, placeholder_binds)
     try:
         return str(
             predicate.compile(
@@ -110,6 +149,87 @@ def predicate_key(predicate: ColumnElement) -> str:
         )
     except CompileError:
         return structural_predicate_key(predicate)
+
+
+def placeholder_predicate_key(
+    predicate: ColumnElement, placeholder_binds: Mapping[str, str]
+) -> str:
+    """The dedup key for a predicate that mixes placeholder and ordinary literal binds.
+
+    Each PLACEHOLDER bind is replaced IN THE AST by a stable source-derived sentinel
+    (``literal_column("<<ph:var:status>>")``) BEFORE compiling, then the result is compiled
+    with ``literal_binds`` so every REMAINING bind (an ordinary co-located literal that rides
+    the same ``and_(...)``) renders INLINE by its value. The AST replacement, not a post-compile
+    string rewrite, serves three ends:
+
+    - it ERASES the placeholder's per-call bind NAME, so two same-source predicates (differing
+      only by the fresh ``grafast_ph_N``) produce the IDENTICAL SQL and merge (a cache hit
+      across requests of the same document) — for BOTH the scalar ``%(name)s`` form AND the
+      expanding ``IN (__[POSTCOMPILE_name])`` form a string rewrite of ``%(name)s`` would miss;
+    - it pins each source POSITIONALLY in the SQL (``a = <<ph:var:x>> AND b = <<ph:var:y>>``),
+      so a source-to-column swap stays a DISTINCT statement, never a spurious merge; and
+    - it removes the placeholder's bound VALUE from the literal-binds compile, so the placeholder
+      stays value-agnostic while a NON-placeholder literal beside it keeps its value (``title =
+      'alpha'`` vs ``title = 'beta'`` differ, so two requests filtering by different co-located
+      literals never wrongly merge — the cross-value-corruption guard).
+
+    A trailing sorted source-tag suffix is appended so the key is human-legible and a
+    placeholder never collides with a literal-only predicate of a coincidentally equal value.
+    The result is ``(<source-positioned, literal-inlined SQL>)|ph=<sorted source tags>``.
+
+    An exotic co-located literal no dialect can render inline raises ``CompileError`` (as in the
+    literal path); we fall back to :func:`structural_placeholder_predicate_key`, which keeps the
+    same placeholder sentinels but reprs the remaining bound values instead of inlining them.
+    """
+    sentinelled = sentinel_placeholders(predicate)
+    sources = sorted(placeholder_binds.values())
+    try:
+        agnostic_sql = str(
+            sentinelled.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+    except CompileError:
+        return structural_placeholder_predicate_key(sentinelled, sources)
+    return f"{agnostic_sql}|ph={sources!r}"
+
+
+def sentinel_placeholders(predicate: ColumnElement) -> ColumnElement:
+    """Return ``predicate`` with every placeholder bind replaced by a source sentinel.
+
+    Walks the predicate AST and swaps each source-tagged placeholder
+    :class:`~sqlalchemy.sql.elements.BindParameter` for a
+    ``literal_column("<<ph:<source>>>")`` — a value-LESS, source-positioned token. Ordinary
+    literal binds are left intact so a subsequent ``literal_binds`` compile inlines THEIR
+    values. Used to build the value-agnostic placeholder dedup key (see
+    :func:`placeholder_predicate_key`).
+    """
+
+    def replace(element: Any) -> Optional[ColumnElement]:
+        if isinstance(element, BindParameter):
+            source = placeholder_source(element)
+            if source is not None:
+                return literal_column(f"<<ph:{source}>>")
+        return None
+
+    return visitors.replacement_traverse(predicate, {}, replace)
+
+
+def structural_placeholder_predicate_key(
+    sentinelled: ColumnElement, sources: Sequence[str]
+) -> str:
+    """A ``literal_binds``-free fallback for a placeholder predicate with an exotic literal.
+
+    The placeholder binds are already sentinelled out of ``sentinelled``, so the only binds
+    left are ordinary co-located literals. Compiles WITHOUT ``literal_binds`` (so an
+    unrenderable literal cannot raise) and appends a stable repr of those remaining bound
+    values, keeping a co-located literal value-discriminated while the placeholders stay
+    source-keyed. Mirrors :func:`structural_predicate_key` for the placeholder path.
+    """
+    compiled = sentinelled.compile(dialect=postgresql.dialect())
+    params = tuple(sorted((name, repr(value)) for name, value in compiled.params.items()))
+    return f"{compiled}|{params!r}|ph={sources!r}"
 
 
 def structural_predicate_key(predicate: ColumnElement) -> str:
@@ -123,6 +243,25 @@ def structural_predicate_key(predicate: ColumnElement) -> str:
     compiled = predicate.compile(dialect=postgresql.dialect())
     params = tuple(sorted((name, repr(value)) for name, value in compiled.params.items()))
     return f"{compiled}|{params!r}"
+
+
+def placeholder_binds_in(predicate: ColumnElement) -> Dict[str, str]:
+    """The placeholder binds (name -> source tag) a predicate carries, walked from its AST.
+
+    The registry-free way to discover a predicate's placeholders: walk its bindparams and
+    collect those carrying a source tag (a :func:`pg_placeholder`). Used where no per-step
+    ``placeholder_binds`` registry is available — the inline fold signature, which keys a
+    reproduced child predicate the same way the standalone child does. Returns ``{}`` for a
+    literal-only predicate, so a caller passes ``None`` (the literal key path) for it.
+    """
+    binds: Dict[str, str] = {}
+    for bind in visitors.iterate(predicate):
+        if not isinstance(bind, BindParameter):
+            continue
+        source = placeholder_source(bind)
+        if source is not None:
+            binds[bind.key] = source
+    return binds
 
 
 class PgCustomizable(Step):
@@ -144,6 +283,15 @@ class PgCustomizable(Step):
         # is preserved in the compiled string, so a stable order keeps the dedup key
         # stable). Resource-customizer predicates come first, then per-plan .where()s.
         self.where_predicates: List[ColumnElement] = list(predicates)
+        # per-step placeholder registry: placeholder bind NAME -> stable source tag (e.g.
+        # "var:status"), populated as add_where sees a source-tagged bind (Wave 4). Read by
+        # predicate_key to take the value-agnostic key path for a placeholder-bearing
+        # predicate; EMPTY for a literal-only step (the default), so its key stays the
+        # byte-identical value-included literal key. Seed it from any predicates passed in
+        # (a resource customizer could itself build a placeholder, though that is unusual).
+        self.placeholder_binds: Dict[str, str] = {}
+        for predicate in self.where_predicates:
+            self._register_placeholder_binds(predicate)
         # the customization_signature tuple is content-derived and read by BOTH peer_key
         # and dedup_params; cache it and invalidate on every where_predicates mutation.
         self._signature_cache: Union[tuple, None] = None
@@ -163,8 +311,63 @@ class PgCustomizable(Step):
         self.init_customization(resolve_customizer_predicates(customizer, context))
 
     def add_where(self, predicate: ColumnElement) -> None:
-        """AND a validated UNIFORM Core predicate onto the batched WHERE."""
+        """AND a validated UNIFORM Core predicate onto the batched WHERE.
+
+        Also registers any PLACEHOLDER binds the predicate carries (a source-tagged
+        ``pg_placeholder``) into ``placeholder_binds`` so :func:`predicate_key` takes the
+        value-agnostic key path for this predicate. A predicate with only ordinary literal
+        binds adds nothing to the registry, so its key stays the byte-identical literal key.
+        """
         self.where_predicates.append(check_predicate(predicate))
+        self._register_placeholder_binds(predicate)
+        self._signature_cache = None
+
+    def _register_placeholder_binds(self, predicate: ColumnElement) -> None:
+        """Record each source-tagged placeholder bind in ``predicate`` (name -> source tag).
+
+        Registers those of the predicate's binds carrying a placeholder source tag (a
+        ``pg_placeholder``); ordinary literal binds carry none and are skipped, so the
+        registry holds ONLY placeholder binds. A bind name is unique per ``pg_placeholder``
+        call, so no two placeholders collide in the registry.
+        """
+        self.placeholder_binds.update(placeholder_binds_in(predicate))
+
+    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
+        """Re-point this step's WHERE placeholder binds to a cached request's variable values.
+
+        The plan-cache rebind (Wave 4): a cached select's ``pg_placeholder`` binds carry the
+        FIRST request's values; on a cache HIT for a different request, re-point each to THIS
+        request's value by its stable SOURCE tag (``values_by_source["var:status"]``). Walks
+        the predicate ASTs (the binds live inside ``where_predicates``, not a flat list) and
+        sets the value on every bind whose source is supplied. A literal-only step has an empty
+        registry, so the loop body never runs — a no-op, as for any non-placeholder step.
+
+        The dedup signature is value-agnostic and source-keyed, so the bound-value change does
+        NOT invalidate the cached key; only the executed value moves. The signature cache is
+        untouched (the key never depended on the value).
+        """
+        if not self.placeholder_binds:
+            return
+        for predicate in self.where_predicates:
+            for bind in visitors.iterate(predicate):
+                if not isinstance(bind, BindParameter):
+                    continue
+                source = self.placeholder_binds.get(bind.key)
+                if source is not None and source in values_by_source:
+                    rebind_placeholder_value(bind, values_by_source[source])
+
+    def copy_customization_from(self, other: "PgCustomizable") -> None:
+        """Copy ``other``'s already-resolved customization onto this step verbatim.
+
+        An inlining clone reproduces the parent's WHERE predicate-for-predicate rather than
+        re-resolving the resource customizer; it must copy the PLACEHOLDER registry alongside
+        ``where_predicates`` so a placeholder-bearing predicate keeps its value-agnostic key
+        on the clone (a registry left empty would silently revert that predicate to the
+        value-included literal path, desyncing the clone's key from the original's). Resets
+        the signature cache so the clone recomputes against the copied state.
+        """
+        self.where_predicates = list(other.where_predicates)
+        self.placeholder_binds = dict(other.placeholder_binds)
         self._signature_cache = None
 
     def where_tree(self, condition: "Condition") -> None:
@@ -190,12 +393,37 @@ class PgCustomizable(Step):
         predicate lists yield equal tuples and different VALUES differ, so byte-different
         statements never merge. Computed once per step (both ``peer_key`` and
         ``dedup_params`` read it) and invalidated when a ``.where()`` mutates the list.
+
+        Each predicate's key is computed against ITS OWN placeholder binds (not the whole
+        step registry) so a placeholder in one predicate never leaks its source tag into
+        another predicate's key. A literal-only step has an empty registry and so every
+        ``predicate_key`` call takes the unchanged value-included literal path.
         """
         if self._signature_cache is None:
             self._signature_cache = tuple(
-                predicate_key(p) for p in self.where_predicates
+                predicate_key(p, self._placeholder_binds_for(p))
+                for p in self.where_predicates
             )
         return self._signature_cache
+
+    def _placeholder_binds_for(
+        self, predicate: ColumnElement
+    ) -> Optional[Dict[str, str]]:
+        """The subset of ``placeholder_binds`` whose binds actually appear in ``predicate``.
+
+        ``predicate_key`` keys a placeholder predicate off the SOURCE tags of ITS binds, so
+        it must see only the binds in this predicate — a step-wide registry would append
+        another predicate's source tag spuriously. Returns ``None`` when the predicate has no
+        placeholder binds, so :func:`predicate_key` takes the unchanged literal path (this is
+        the common case: an empty registry yields ``None`` for every predicate).
+        """
+        if not self.placeholder_binds:
+            return None
+        present: Dict[str, str] = {}
+        for bind in visitors.iterate(predicate):
+            if isinstance(bind, BindParameter) and bind.key in self.placeholder_binds:
+                present[bind.key] = self.placeholder_binds[bind.key]
+        return present or None
 
 
 # Capability check for the builder: a step advertises which structured surfaces it
@@ -303,6 +531,9 @@ __all__ = [
     "RESERVED_BIND_NAMES",
     "check_predicate",
     "predicate_key",
+    "placeholder_predicate_key",
+    "sentinel_placeholders",
+    "structural_placeholder_predicate_key",
     "structural_predicate_key",
     "PgCustomizable",
     "PgSelectQueryBuilder",

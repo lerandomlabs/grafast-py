@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from ..dag import Plan
 from ..core_steps import access
 from ..step_model import Step
-from .customize import PgCustomizable, predicate_key
+from .customize import PgCustomizable, placeholder_binds_in, predicate_key
 from .executor import current_pg_request
 from .inline import (
     InlineSpec,
@@ -51,6 +51,7 @@ from .inline import (
 )
 from .ordering import OrderTerm, normalize_order, order_clauses
 from .pagination import window_slice, window_slice_params
+from .placeholders import Placeholder, rebind_pagination_value, unwrap_placeholder
 from .resource import PgResource
 
 
@@ -75,8 +76,11 @@ def inline_specs_signature(inline_specs: Sequence[InlineSpec]) -> Tuple[Any, ...
             spec.local_columns,
             spec.remote_columns,
             spec.order_by,
-            tuple(predicate_key(p) for p in spec.where_predicates),
-            tuple(predicate_key(c) for c in spec.computed),
+            tuple(
+                predicate_key(p, placeholder_binds_in(p) or None)
+                for p in spec.where_predicates
+            ),
+            tuple(predicate_key(c, placeholder_binds_in(c) or None) for c in spec.computed),
         )
         for spec in inline_specs
     )
@@ -206,8 +210,8 @@ class PgSelectStep(PgCustomizable):
         match: Union[str, Sequence[str]],
         order_by: Optional[Sequence[Union[str, OrderTerm]]] = None,
         order_is_unique: bool = False,
-        first: Optional[int] = None,
-        offset: int = 0,
+        first: Optional[Union[int, Placeholder]] = None,
+        offset: Union[int, Placeholder] = 0,
         inline_specs: Sequence[InlineSpec] = (),
     ) -> None:
         super().__init__()
@@ -222,6 +226,10 @@ class PgSelectStep(PgCustomizable):
         resource.assert_order_terms_stored(self.order_by)
         # structured page bounds, applied PER PARENT via the window slice (never a
         # bucket-wide LIMIT, which would limit the whole ANY($1) result across parents).
+        # Either a plain int/None (a plan-time literal, value-included in the dedup key) or a
+        # ``Placeholder`` (a variable-derived value, source-keyed): the SQL binds first/offset
+        # as params regardless, so a placeholder only changes the DEDUP KEY — the build/page
+        # math unwraps the runtime value via ``unwrap_placeholder``.
         self.first = first
         self.offset = offset
         # the inlined child relations this parent absorbed into its own statement (Wave
@@ -238,7 +246,18 @@ class PgSelectStep(PgCustomizable):
 
     @property
     def is_limited(self) -> bool:
-        """Whether a per-parent page bound is set (window slice) vs plain select."""
+        """Whether a per-parent page bound is set (window slice) vs plain select.
+
+        A ``Placeholder`` offset/first counts as limited even when its current value is 0 /
+        None: the plan is value-agnostic, so it cannot know the runtime value and must emit
+        the window slice unconditionally (a ``Placeholder`` is never ``==`` the bare ``0`` /
+        ``None`` that would skip it). This is correct — a variable-derived bound that happens
+        to be 0 this request still rides the paginated SQL, and its dedup key (carrying the
+        source tag) is distinct from a literal ``offset=0`` plain select, as it must be (the
+        two emit different SQL).
+        """
+        if isinstance(self.first, Placeholder) or isinstance(self.offset, Placeholder):
+            return True
         return self.first is not None or self.offset != 0
 
     @property
@@ -267,13 +286,29 @@ class PgSelectStep(PgCustomizable):
         )
         self.resource.assert_order_terms_stored(self.order_by)
 
-    def set_first(self, first: Optional[int]) -> None:
-        """Set the structured per-parent page size (window slice; never a raw LIMIT)."""
+    def set_first(self, first: Optional[Union[int, Placeholder]]) -> None:
+        """Set the structured per-parent page size (window slice; never a raw LIMIT).
+
+        Accepts a plain ``int`` / ``None`` (a plan-time literal) or a ``Placeholder`` (a
+        variable-derived size); the latter only changes the dedup key, the build unwraps it.
+        """
         self.first = first
 
-    def set_offset(self, offset: int) -> None:
-        """Set the structured per-parent page offset."""
+    def set_offset(self, offset: Union[int, Placeholder]) -> None:
+        """Set the structured per-parent page offset (literal int or ``Placeholder``)."""
         self.offset = offset
+
+    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
+        """Re-point this select's WHERE and pagination placeholders to a cached request's values.
+
+        Extends the base WHERE rebind (``super``) with the per-parent ``first`` / ``offset``
+        pagination sentinels: a variable-derived bound is a :class:`Placeholder` carrying the
+        FIRST request's value, re-pointed to THIS request's value by source. A literal bound is
+        returned unchanged, so a literal page is a no-op (as is a select with no placeholders).
+        """
+        super().rebind_placeholders(values_by_source)
+        self.first = rebind_pagination_value(self.first, values_by_source)
+        self.offset = rebind_pagination_value(self.offset, values_by_source)
 
     def match_predicate(self, unique_keys: Optional[List[Any]] = None):
         """The batched key-match predicate: ``= ANY(:keys)`` (single) or tuple-IN (composite).
@@ -340,8 +375,11 @@ class PgSelectStep(PgCustomizable):
             match_columns=self.match_columns,
             unique_keys=unique_keys,
             order_by=self.order_by,
-            first=self.first,
-            offset=self.offset,
+            # unwrap a variable-derived bound to its runtime value for the SQL shape (first
+            # is None vs int decides whether the upper-bound clause is emitted); the value
+            # itself still binds as a param at execute time, so the SQL stays value-agnostic.
+            first=unwrap_placeholder(self.first),
+            offset=unwrap_placeholder(self.offset),
             where_predicates=self.where_predicates,
             computed=self.resource.computed_projections(),
         )
@@ -364,7 +402,14 @@ class PgSelectStep(PgCustomizable):
         if not self.is_composite:
             params["keys"] = unique_keys
         if self.is_limited:
-            params.update(window_slice_params(self.first, self.offset))
+            # bind the runtime first/offset (unwrapping a variable-derived Placeholder) — the
+            # value rides compiled.params, the same as a literal bound, so a placeholder
+            # changes only the dedup key, never the executed slice.
+            params.update(
+                window_slice_params(
+                    unwrap_placeholder(self.first), unwrap_placeholder(self.offset)
+                )
+            )
         rows = await request.executor.run(
             self.build_query(unique_keys), params, settings=request.settings
         )
@@ -498,9 +543,9 @@ class PgSelectStep(PgCustomizable):
             inline_specs=inline_specs,
         )
         # the constructor re-seeds the resource customizer; replace it with THIS step's
-        # already-resolved predicates so the fold reproduces the parent's WHERE verbatim.
-        clone.where_predicates = list(self.where_predicates)
-        clone._signature_cache = None
+        # already-resolved predicates so the fold reproduces the parent's WHERE verbatim
+        # (carrying the placeholder registry so a placeholder predicate keeps its key).
+        clone.copy_customization_from(self)
         return clone
 
     def optimize(self, plan: "Plan") -> Step:
@@ -554,8 +599,8 @@ class PgSelectAllStep(PgCustomizable):
         resource: PgResource,
         order_by: Optional[Sequence[Union[str, OrderTerm]]] = None,
         order_is_unique: bool = False,
-        first: Optional[int] = None,
-        offset: int = 0,
+        first: Optional[Union[int, Placeholder]] = None,
+        offset: Union[int, Placeholder] = 0,
         inline_specs: Sequence[InlineSpec] = (),
     ) -> None:
         super().__init__()
@@ -565,7 +610,10 @@ class PgSelectAllStep(PgCustomizable):
             order_by, primary_key=resource.primary_key, order_is_unique=order_is_unique
         )
         resource.assert_order_terms_stored(self.order_by)
-        # page bounds for the single root result (plain LIMIT/OFFSET; see class doc).
+        # page bounds for the single root result (plain LIMIT/OFFSET; see class doc). A
+        # plain int/None is a plan-time literal (inlined LIMIT/OFFSET, value-included in the
+        # dedup key); a ``Placeholder`` is a variable-derived value (bound as a LIMIT/OFFSET
+        # PARAM so the SQL stays value-agnostic, source-keyed in the dedup key).
         self.first = first
         self.offset = offset
         # the inlined child relations this root collection absorbed (Wave 3b): empty until
@@ -583,13 +631,24 @@ class PgSelectAllStep(PgCustomizable):
         self.add_dependency(parent_step)
         return self
 
-    def set_first(self, first: Optional[int]) -> None:
-        """Set the root page size (plain LIMIT on the single root result)."""
+    def set_first(self, first: Optional[Union[int, Placeholder]]) -> None:
+        """Set the root page size (plain LIMIT on the single root result, or bound param)."""
         self.first = first
 
-    def set_offset(self, offset: int) -> None:
-        """Set the root page offset (plain OFFSET on the single root result)."""
+    def set_offset(self, offset: Union[int, Placeholder]) -> None:
+        """Set the root page offset (plain OFFSET, or a bound param for a ``Placeholder``)."""
         self.offset = offset
+
+    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
+        """Re-point this root select's WHERE and LIMIT/OFFSET placeholders to a cached request.
+
+        Extends the base WHERE rebind with the single-root ``first`` / ``offset`` pagination
+        sentinels (a variable-derived bound is a :class:`Placeholder` re-pointed by source; a
+        literal bound is a no-op).
+        """
+        super().rebind_placeholders(values_by_source)
+        self.first = rebind_pagination_value(self.first, values_by_source)
+        self.offset = rebind_pagination_value(self.offset, values_by_source)
 
     def add_order_term(self, term: Union[str, OrderTerm]) -> None:
         """Append a UNIFORM ordering term (re-normalised with the PK tie-break)."""
@@ -616,20 +675,43 @@ class PgSelectAllStep(PgCustomizable):
             stmt = stmt.where(predicate)
         if self.order_by:
             stmt = stmt.order_by(*order_clauses(self.order_by))
-        if self.offset:
+        # LIMIT/OFFSET: a plan-time literal int inlines (``.offset(2)`` -> ``OFFSET 2``,
+        # byte-identical to before); a ``Placeholder`` emits a value-LESS bound param
+        # (``OFFSET :root_offset``) so the cached SQL is value-agnostic and the runtime value
+        # is supplied per request in ``run_params`` — never inlined into a cacheable plan.
+        if isinstance(self.offset, Placeholder):
+            stmt = stmt.offset(bindparam("root_offset"))
+        elif self.offset:
             stmt = stmt.offset(self.offset)
-        if self.first is not None:
+        if isinstance(self.first, Placeholder):
+            stmt = stmt.limit(bindparam("root_first"))
+        elif self.first is not None:
             stmt = stmt.limit(self.first)
         # fold any inlined child relations into this single root statement via a LEFT JOIN
         # LATERAL each (no-op when empty — the byte-identical batched path). The plain
         # LIMIT/OFFSET bounds the parent rows; each LATERAL fetches that row's children.
         return apply_laterals(stmt, tbl, self.inline_specs)
 
+    def run_params(self) -> Optional[Dict[str, Any]]:
+        """Execute-time params for a ``Placeholder`` LIMIT/OFFSET, or ``None`` for literals.
+
+        A literal first/offset is inlined in the SQL (no param), so the default ``None`` is
+        byte-identical to before. A variable-derived ``Placeholder`` rides a value-LESS bound
+        param (``:root_first`` / ``:root_offset``); its runtime value is unwrapped here so the
+        value lives only in the per-request params dict — the cached statement stays immutable.
+        """
+        params: Dict[str, Any] = {}
+        if isinstance(self.first, Placeholder):
+            params["root_first"] = unwrap_placeholder(self.first)
+        if isinstance(self.offset, Placeholder):
+            params["root_offset"] = unwrap_placeholder(self.offset)
+        return params or None
+
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
         async def run():
             request = current_pg_request()
             rows = await request.executor.run(
-                self.build_query(), None, settings=request.settings
+                self.build_query(), self.run_params(), settings=request.settings
             )
             # decode each row's codec-bearing attributes once; the same decoded list is
             # returned for every bucket entry (a root list has one bucket entry).
@@ -685,8 +767,7 @@ class PgSelectAllStep(PgCustomizable):
             offset=self.offset,
             inline_specs=inline_specs,
         ).for_parent(self.dependencies[0])
-        clone.where_predicates = list(self.where_predicates)
-        clone._signature_cache = None
+        clone.copy_customization_from(self)
         return clone
 
     def optimize(self, plan: "Plan") -> Step:
@@ -772,8 +853,8 @@ def pg_select(
     match: Union[str, Sequence[str]],
     order_by: Optional[Sequence[Union[str, OrderTerm]]] = None,
     order_is_unique: bool = False,
-    first: Optional[int] = None,
-    offset: int = 0,
+    first: Optional[Union[int, Placeholder]] = None,
+    offset: Union[int, Placeholder] = 0,
 ) -> PgSelectStep:
     """A batched select keyed on ``match`` (a single column name or a composite tuple)."""
     return PgSelectStep(

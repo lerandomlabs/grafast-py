@@ -799,10 +799,17 @@ def abstract_child_plan(context, completer, object_type):
 
     plan = Plan()
     # mirror `plan_operation`: an abstract concrete-type subtree is its own finalize
-    # path (own RootStep + DAG), so it must carry the same plan-level inlining
-    # decision off the context's config, else a relation under a polymorphic field
-    # would never be considered for folding even with inlining enabled.
-    plan.inline_relations = type(context).grafast_config.inline_relations
+    # path (own RootStep + DAG), so it must carry the same plan-level inlining /
+    # placeholder / caching decisions off the context's config — else a relation under a
+    # polymorphic field would never be considered for folding even with inlining enabled,
+    # and (the placeholder gap) a `$variable` arg on a field UNDER a concrete type would see
+    # empty provenance, so `FieldArgs.is_variable` would be False and the host would inline it
+    # as a literal even with placeholders enabled. Thread all three so a concrete-type subtree
+    # plans EXACTLY as the operation root does.
+    config = type(context).grafast_config
+    plan.inline_relations = config.inline_relations
+    plan.placeholders = config.placeholders
+    plan.cache_plans = config.cache_plans
     root_step = RootStep()
     plan.add_step(root_step)
     child_plan = plan_object(

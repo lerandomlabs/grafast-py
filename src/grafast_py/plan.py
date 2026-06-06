@@ -14,11 +14,11 @@ resolver-adapter (`ResolveStep`) route, which the planner wires into the same st
 DAG so plain-resolver schemas run unchanged.
 """
 
-from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 from graphql.execution.execute import get_field_def
 from graphql.execution.values import get_argument_values
-from graphql.language import FieldNode, OperationDefinitionNode
+from graphql.language import FieldNode, OperationDefinitionNode, VariableNode
 from graphql.pyutils import Path
 from graphql.type import GraphQLField, GraphQLObjectType, GraphQLOutputType
 
@@ -132,8 +132,43 @@ def plan_object(
                 parent_type,
                 Path(None, response_name, parent_type.name),
             )
-            field_step = plan_fn(parent_step, FieldArgs(args), info)
+            # per-argument variable provenance (Wave 4 placeholders): walk this field's
+            # argument AST so a plan resolver can tell a `$variable`-derived value from a
+            # plan-time literal. Computed when `placeholders` is on OR when `cache_plans` is on
+            # — caching NEEDS the provenance so an INLINED variable (read raw, not
+            # placeholdered) is detected below and the plan marked non-cacheable; without it a
+            # `cache_plans=True` / `placeholders=False` host would bleed the first request's
+            # value across requests. Both off (the default) => empty provenance =>
+            # `FieldArgs.is_variable` is always False => every host inlines literals exactly as
+            # before (byte-identical).
+            variable_args, variable_sources = (
+                variable_provenance(field_nodes[0])
+                if (plan.placeholders or plan.cache_plans)
+                else (None, None)
+            )
+            field_args = FieldArgs(
+                args, variable_args=variable_args, variable_sources=variable_sources
+            )
+            field_step = plan_fn(parent_step, field_args, info)
             plan.add_step(field_step)
+            # cacheability: if the host INLINED a variable-derived arg's value as a plan-time
+            # literal (read its raw value WITHOUT taking its placeholder source) the plan is
+            # value-specific and must NOT be cached across requests. `FieldArgs` tracks the
+            # raw reads and the placeholdered sources and nets them; a fully-placeholdered or
+            # all-literal field leaves `cacheable` True.
+            if field_args.inlined_variable_args():
+                plan.cacheable = False
+        elif plan is not None and plan.cache_plans and args_error is None:
+            # legacy resolver path (plan_fn is None): the coerced args are FROZEN onto
+            # FieldPlan.args from this request, and a cache HIT skips the planner and replays
+            # them — so a resolver reading a `$variable`-derived arg would serve a later
+            # request the FIRST request's value. A legacy resolver has no step to re-point, so
+            # the placeholder/cursor rebind cannot fix it; refuse to cache a plan carrying any
+            # variable-derived legacy arg (re-plan per request), the conservative analogue of
+            # the abstract-field bail-out.
+            legacy_variable_args, _ = variable_provenance(field_nodes[0])
+            if legacy_variable_args:
+                plan.cacheable = False
 
         # an object/plan field passes its step down as the child bucket's parent;
         # a legacy field (or a plan field over leaves) passes the inherited step.
@@ -174,6 +209,33 @@ def plan_object(
     )
 
 
+def variable_provenance(
+    field_node: FieldNode,
+) -> Tuple[FrozenSet[str], Dict[str, str]]:
+    """Compute per-argument variable provenance from a field's argument AST.
+
+    graphql-core's ``get_argument_values`` coerces a ``$variable`` argument to its
+    runtime value before a plan resolver runs, so the coerced ``args`` dict alone cannot
+    tell a literal from a variable. The seam is the AST: an ``ArgumentNode`` whose
+    ``.value`` is a :class:`~graphql.language.VariableNode` came from a variable, and the
+    variable name is ``arg.value.name.value``.
+
+    Returns the SET of variable-derived argument names plus a mapping arg-name ->
+    GraphQL-variable-name, which :class:`FieldArgs` turns into the stable ``"var:<name>"``
+    source tag a placeholder dedups by. Arguments given as literals (or as a list/object
+    literal) are not included, so a host inlines them by value exactly as before. This is
+    pure ``graphql.language`` — no execute-internals dependency.
+    """
+    variable_args: Set[str] = set()
+    variable_sources: Dict[str, str] = {}
+    for arg in field_node.arguments:
+        if isinstance(arg.value, VariableNode):
+            arg_name = arg.name.value
+            variable_args.add(arg_name)
+            variable_sources[arg_name] = arg.value.name.value
+    return frozenset(variable_args), variable_sources
+
+
 def attach_child_plan(completer: Completer, child_plan: ObjectPlan) -> Completer:
     """Rebuild a completer chain with the leaf ObjectCompleter's child plan set."""
     from .completion import ListCompleter, NonNullCompleter, ObjectCompleter
@@ -199,14 +261,36 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     (`context._grafast_plan` / `context._grafast_root_step`). Fields without a plan
     resolver contribute no steps, so for the conformance suite the DAG is empty and
     the legacy path is entirely unaffected.
+
+    Cross-request plan cache (Wave 4, opt-in)
+    -----------------------------------------
+    When `GrafastConfig.cache_plans` is on, a finalized VALUE-INDEPENDENT plan is cached by
+    `(schema identity, document text, operation name, variable fingerprint)` and reused
+    across requests of the same document — a HIT skips the whole plan build, RE-BINDS each
+    placeholder to THIS request's variables (`rebind_cached_plan`), and stashes the cached
+    triple. A MISS plans normally and, if the result is cacheable (no variable value was
+    inlined as a literal), stores it. With `cache_plans` off (the default) the cache is never
+    touched, so the path below the cache block is byte-identical to pre-Wave-4.
     """
     from .core_steps import RootStep
+
+    config = type(context).grafast_config
+    if config.cache_plans:
+        cached = lookup_cached_plan(context, operation, config)
+        if cached is not None:
+            return cached
 
     plan = Plan()
     # thread the plan-level inlining decision off the context's config so each pg
     # step's `optimize(self, plan)` reads one constant (`plan.inline_relations`)
     # instead of the whole context. Default-OFF config => no-op optimize pass.
-    plan.inline_relations = type(context).grafast_config.inline_relations
+    plan.inline_relations = config.inline_relations
+    # plan-level placeholder/caching decisions, threaded off the SAME config the same
+    # way: `placeholders` gates whether `plan_object` computes per-argument variable
+    # provenance (and threads it into `FieldArgs`); `cache_plans` gates the cross-request
+    # plan cache. Both default-OFF => no provenance computed, nothing cached, byte-identical.
+    plan.placeholders = config.placeholders
+    plan.cache_plans = config.cache_plans
     root_step = RootStep()
     plan.add_step(root_step)
 
@@ -216,9 +300,122 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
 
     object_plan = finalize_plan(plan, object_plan)
 
+    # an ABSTRACT field's per-concrete-type subtree is planned LAZILY at execute time (in
+    # `completion.abstract_child_plan`), AFTER this operation plan is stored, and its steps are
+    # held on the completer (NOT in `plan.steps`), so the operation-level placeholder rebind
+    # never reaches them. A host that inlines a `$variable` under a concrete type would therefore
+    # bake the FIRST request's value into the completer-cached subtree and a later cache HIT would
+    # serve it the wrong value. The subtree's cacheability cannot be known here (it is not built
+    # yet), so the operation conservatively refuses to cache when it owns ANY abstract field —
+    # such an operation re-plans per request, rebuilding its subtrees fresh. (A non-abstract
+    # operation is unaffected: every SQL-affecting step lives in `plan.steps` and rebinds.)
+    if owns_abstract_field(object_plan):
+        plan.cacheable = False
+
     context._grafast_plan = plan
     context._grafast_root_step = root_step
+
+    if config.cache_plans and plan.cacheable:
+        store_cached_plan(context, operation, config, object_plan, root_step, plan)
+
     return object_plan
+
+
+def owns_abstract_field(object_plan: ObjectPlan) -> bool:
+    """Whether any field in the (transitively nested) ObjectPlan tree returns an abstract type.
+
+    Walks the completer tree of every field, recursing through List / NonNull wrappers and into
+    object-field child plans, and returns True at the first :class:`AbstractCompleter` (an
+    interface / union field). Used by `plan_operation` to refuse caching an operation whose
+    abstract subtrees are planned lazily at execute time (their placeholder steps live on the
+    completer, beyond the operation-level rebind's reach) — see the cacheability note there.
+    """
+    from .completion import AbstractCompleter
+
+    def completer_has_abstract(completer: Any) -> bool:
+        if isinstance(completer, AbstractCompleter):
+            return True
+        inner = getattr(completer, "inner", None)
+        if inner is not None and completer_has_abstract(inner):
+            return True
+        item = getattr(completer, "item_completer", None)
+        if item is not None and completer_has_abstract(item):
+            return True
+        return False
+
+    def visit(op: ObjectPlan) -> bool:
+        for fp in op.fields:
+            if completer_has_abstract(fp.completer):
+                return True
+            child = find_object_completer(fp.completer)
+            if child is not None and child.child_plan is not None and visit(child.child_plan):
+                return True
+        return False
+
+    return visit(object_plan)
+
+
+def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
+    """Return the cached ObjectPlan for this request (re-bound to its variables), or None.
+
+    A cache HIT ISOLATES the shared cached entry into a per-request deep copy
+    (`isolate_cached_plan`) and re-points every placeholder on that COPY to THIS request's
+    variable values (the cached SQL is value-agnostic, so only the bound values move), then
+    re-stashes the COPY's triple on the context for the executor. Isolating per request keeps
+    the shared cache entry IMMUTABLE, so two concurrent requests of the same document with
+    different variables each rebind+execute their own copy and never bleed values into each
+    other — no request-level serialization needed. A MISS returns None so `plan_operation`
+    plans normally. Only called when `cache_plans` is on.
+    """
+    from .cache import compute_cache_key, isolate_cached_plan, rebind_cached_plan
+
+    cache = config.plan_cache if config.plan_cache is not None else _process_cache()
+    key = compute_cache_key(context.schema, operation, context.fragments, config)
+    cached = cache.get(key)
+    if cached is None:
+        return None
+    if cached.schema is not context.schema:
+        # a stale `id(schema)` collision (a freed schema's id reused by this one) — treat as a
+        # miss so we never serve a plan built against a different schema.
+        return None
+    # deep-copy into a per-request plan BEFORE rebinding, so the rebind mutates this request's
+    # own copy and never the shared cache entry (the concurrency-safety guarantee).
+    request_plan = isolate_cached_plan(cached)
+    rebind_cached_plan(request_plan, context.variable_values, operation)
+    context._grafast_plan = request_plan.plan
+    context._grafast_root_step = request_plan.root_step
+    return request_plan.object_plan
+
+
+def store_cached_plan(
+    context, operation: OperationDefinitionNode, config, object_plan, root_step, plan
+):
+    """Store a freshly-finalized, value-independent plan under its cache key.
+
+    Called only on a MISS when `cache_plans` is on AND `plan.cacheable` (no variable value
+    was inlined as a plan-time literal). A value-specific plan is never stored — reusing it
+    would serve a later request the earlier request's value.
+    """
+    from .cache import CachedPlan, compute_cache_key
+
+    cache = config.plan_cache if config.plan_cache is not None else _process_cache()
+    key = compute_cache_key(context.schema, operation, context.fragments, config)
+    cache.put(
+        key,
+        CachedPlan(
+            object_plan=object_plan,
+            root_step=root_step,
+            plan=plan,
+            schema=context.schema,
+        ),
+    )
+
+
+def _process_cache():
+    """The process-global plan cache (lazy), used when the config supplies none."""
+    from .cache import default_cache
+
+    return default_cache()
 
 
 def finalize_plan(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:

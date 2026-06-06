@@ -108,6 +108,58 @@ def test_field_args_exposes_coerced_values():
     assert args.get("missing", 99) == 99
 
 
+def test_field_args_old_constructor_reports_no_variables():
+    # the single-arg constructor must keep working: no provenance => every arg is a
+    # literal, so is_variable is always False and source falls back to the arg name.
+    args = FieldArgs({"status": "published", "limit": 10})
+    assert args.variable_args == frozenset()
+    assert args.is_variable("status") is False
+    assert args.is_variable("limit") is False
+    assert args.is_variable("missing") is False
+    # source still returns a stable tag even with no variable-name mapping
+    assert args.source("status") == "var:status"
+
+
+def test_field_args_reports_variable_provenance():
+    args = FieldArgs(
+        {"status": "published", "limit": 10},
+        variable_args=frozenset({"status"}),
+        variable_sources={"status": "wantedStatus"},
+    )
+    assert args.variable_args == frozenset({"status"})
+    assert args.is_variable("status") is True
+    # a literal-valued arg is not a variable even when other args are
+    assert args.is_variable("limit") is False
+    # the source tag keys off the GraphQL variable name, not the arg name
+    assert args.source("status") == "var:wantedStatus"
+
+
+def test_field_args_source_tag_is_request_stable_across_instances():
+    # two FieldArgs built for the same document but different runtime values must
+    # produce the SAME source tag (the variable name), so placeholder dedup/caching hits.
+    a = FieldArgs(
+        {"status": "published"},
+        variable_args=frozenset({"status"}),
+        variable_sources={"status": "wantedStatus"},
+    )
+    b = FieldArgs(
+        {"status": "draft"},
+        variable_args=frozenset({"status"}),
+        variable_sources={"status": "wantedStatus"},
+    )
+    assert a.source("status") == b.source("status") == "var:wantedStatus"
+    # but the coerced values still differ per request
+    assert a["status"] != b["status"]
+
+
+def test_field_args_source_falls_back_to_arg_name_without_variable_sources():
+    # provenance built from variable_args alone (no name mapping) still yields a stable
+    # tag derived from the arg name.
+    args = FieldArgs({"status": "published"}, variable_args=frozenset({"status"}))
+    assert args.is_variable("status") is True
+    assert args.source("status") == "var:status"
+
+
 # ------------------------------------------------ planner builds a step DAG
 def build_plan(schema, query: str):
     document = parse(query)

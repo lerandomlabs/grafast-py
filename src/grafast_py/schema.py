@@ -20,7 +20,7 @@ This module provides three attachment surfaces:
   ``make_executable_schema(type_defs, bindable)`` flow.
 """
 
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, FrozenSet, Mapping, Optional, Set
 
 from graphql import (
     GraphQLAbstractType,
@@ -41,26 +41,131 @@ TypeResolver = Callable[..., Optional[str]]
 
 
 class FieldArgs:
-    """A thin read accessor over a field's coerced argument values.
+    """A thin read accessor over a field's coerced argument values, plus per-argument
+    variable provenance.
 
     ``field_args.get("name")`` / ``field_args["name"]`` return the already-coerced
     argument value (NOT a step — plan resolvers treat args as plain values and lift
     them with ``constant`` when a step is needed). ``raw`` exposes the whole coerced dict.
+
+    Provenance (Wave 4 placeholders)
+    --------------------------------
+    graphql-core's ``get_argument_values`` coerces a ``$variable`` argument to its
+    runtime value before a plan resolver ever runs, so ``raw`` alone "cannot tell a
+    literal from a variable". The seam is the field AST: an argument whose value node is
+    a ``VariableNode`` came from a variable. The planner walks the field's argument nodes
+    (when ``placeholders`` is enabled) and threads the SET of variable-derived argument
+    names here as ``variable_args``, with the corresponding GraphQL variable name per arg
+    in ``variable_sources``.
+
+    A host plan resolver then asks ``field_args.is_variable("status")`` and, for a
+    variable-derived value, builds a value-agnostic pg placeholder keyed by
+    ``field_args.source("status")`` (a stable ``"var:<variable_name>"`` tag) instead of
+    inlining the literal. The source tag is REQUEST-STABLE (the variable name, not a
+    per-request id), so two requests of the same document produce the same key and share
+    one cached plan, while two different variable sources never merge.
+
+    The old single-argument constructor ``FieldArgs(args)`` keeps working: ``variable_args``
+    defaults to empty, so ``is_variable`` is always ``False`` and every host falls back to
+    literal inlining — byte-identical to pre-Wave-4 behaviour.
+
+    Cacheability tracking (Wave 4 plan cache)
+    -----------------------------------------
+    A plan is only safe to cache across requests when every SQL-affecting ``$variable`` value
+    is VALUE-AGNOSTIC (a source-tagged placeholder), never INLINED as a plan-time literal. The
+    seam is HOW a host reads a variable-derived arg: building a placeholder reads ``source()``
+    (value-agnostic), while inlining reads the raw value (``__getitem__`` / ``get``). So this
+    accessor records, in ``literal_variable_reads``, every variable arg whose RAW value was
+    read — the planner consults it after the resolver runs and marks the plan non-cacheable
+    when a variable value was inlined. Reading ``source()`` does NOT record a literal read, so
+    a placeholdered arg keeps the plan cacheable.
     """
 
-    def __init__(self, args: Optional[Mapping[str, Any]]) -> None:
+    def __init__(
+        self,
+        args: Optional[Mapping[str, Any]],
+        variable_args: Optional[FrozenSet[str]] = None,
+        variable_sources: Optional[Mapping[str, str]] = None,
+    ) -> None:
         self.raw: Dict[str, Any] = dict(args or {})
+        self.variable_args: FrozenSet[str] = (
+            frozenset(variable_args) if variable_args else frozenset()
+        )
+        # arg name -> the GraphQL variable name it resolved from; used to build the
+        # stable source tag. Defaults empty so source() falls back to the arg name.
+        self.variable_sources: Dict[str, str] = dict(variable_sources or {})
+        # variable-derived arg names whose RAW (coerced) value the host READ (``__getitem__`` /
+        # ``get``), and (separately) those for which the host asked for the placeholder
+        # ``source()``. A variable arg READ raw but NOT placeholdered was INLINED as a plan-time
+        # literal — that pins the plan to a per-request value, so the plan is non-cacheable. A
+        # variable arg whose ``source()`` was taken (even if its raw value was also read, to bind
+        # it onto a ``pg_placeholder``) is value-agnostic and keeps the plan cacheable. Both
+        # empty when no provenance was threaded (placeholders off), so the default path never
+        # marks anything non-cacheable. See :meth:`inlined_variable_args`.
+        self.literal_variable_reads: Set[str] = set()
+        self.placeholdered_variable_args: Set[str] = set()
 
     def get(self, name: str, default: Any = None) -> Any:
+        self._note_literal_read(name)
         return self.raw.get(name, default)
 
     def __getitem__(self, name: str) -> Any:
+        self._note_literal_read(name)
         return self.raw[name]
+
+    def _note_literal_read(self, name: str) -> None:
+        """Record a RAW read of a variable-derived arg (a candidate inline-as-literal use).
+
+        Only variable-derived args matter — reading a plan-time literal arg's value is
+        always cacheable (it is the same every request). A variable arg read raw is a
+        CANDIDATE inline; :meth:`inlined_variable_args` subtracts those the host also
+        placeholdered (where the raw read only fed the placeholder's bound value).
+        """
+        if name in self.variable_args:
+            self.literal_variable_reads.add(name)
+
+    def inlined_variable_args(self) -> Set[str]:
+        """Variable-derived args the host INLINED as plan-time literals (read raw, not placeholdered).
+
+        The planner reads this to decide cacheability: a non-empty result means a per-request
+        variable value entered the SQL text, so the plan is value-specific and must NOT be
+        cached. Reading a variable's raw value to BIND it onto a placeholder (``source()`` was
+        also taken) does not count — that path is value-agnostic and stays cacheable.
+        """
+        return self.literal_variable_reads - self.placeholdered_variable_args
 
     def __contains__(self, name: str) -> bool:
         return name in self.raw
 
+    def is_variable(self, name: str) -> bool:
+        """True iff argument ``name`` originated from a GraphQL ``$variable``.
+
+        Always ``False`` when no provenance was threaded in (the default / placeholders
+        off), so a host always sees literals and inlines exactly as before.
+        """
+        return name in self.variable_args
+
+    def source(self, name: str) -> str:
+        """The stable placeholder source tag for variable-derived argument ``name``.
+
+        Returns ``"var:<variable_name>"`` — request-stable across requests of the same
+        document, so identical-source placeholders dedup/merge and produce a cache hit,
+        while different variable sources never merge. Falls back to the argument name
+        when the underlying variable name was not threaded in (e.g. provenance built from
+        ``variable_args`` alone).
+
+        Taking a variable arg's source records it as PLACEHOLDERED, so a raw value-read of the
+        same arg (to bind it onto the placeholder) does not mark the plan non-cacheable — the
+        value never enters the SQL text, only a value-agnostic ``%(name)s`` does.
+        """
+        if name in self.variable_args:
+            self.placeholdered_variable_args.add(name)
+        var_name = self.variable_sources.get(name, name)
+        return f"var:{var_name}"
+
     def __repr__(self) -> str:
+        if self.variable_args:
+            return f"FieldArgs({self.raw!r}, variable_args={sorted(self.variable_args)!r})"
         return f"FieldArgs({self.raw!r})"
 
 
