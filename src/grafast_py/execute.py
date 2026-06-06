@@ -1,10 +1,12 @@
 """The bucket/batch executor.
 
-Executes an ObjectPlan over a *bucket* of parent objects layer by layer. For each
-field plan we run one batched ResolveStep over all parents, then drive the field's
-**completer** (the wrapping-type descent: NonNull/List/leaf/object) over that batch
-of resolved values via `complete_values`. Object completion recurses into a child
-bucket (the Grafast batching point); lists fan their items into a fresh batch.
+Executes an ObjectPlan over a *bucket* of parent objects layer by layer. The
+bucket's steps run ONCE over all parents (a plan step or a resolver-adapter
+ResolveStep — every field carries one), producing each field's value column in the
+bucket store; we then drive the field's **completer** (the wrapping-type descent:
+NonNull/List/leaf/object) over that batch of resolved values via `complete_values`.
+Object completion recurses into a child bucket (the Grafast batching point); lists
+fan their items into a fresh batch.
 
 Null-bubbling is reproduced natively *per parent*: completion returns a `Bubble`
 for a parent whose non-null sub-structure resolved to None. At the field's write
@@ -18,7 +20,7 @@ completion is awaitable the whole object-plan execution becomes a coroutine, but
 the resulting `data`/`errors` are identical to the synchronous path.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, NamedTuple, Optional
 
 from graphql.pyutils import Path
 
@@ -27,7 +29,22 @@ from .completion import NonNullCompleter, complete_values
 from .dag import order_steps_within
 from .plan import FieldPlan, LayerPlan, ObjectPlan
 from .step_model import run_steps
-from .steps import run_resolve_step
+from .steps import BucketExtra
+
+
+class _FieldOutcome(NamedTuple):
+    """The per-field batched result completion consumes: value column + per-parent info/path.
+
+    Execute-internal carrier (the old cross-module `ResolveOutcome`, minus the unused
+    `awaitable` flag): `values[i]` is the field's raw value for live parent `i` (or a raised
+    exception kept as a value), `infos[i]`/`paths[i]` its resolve info and field path. Async
+    is driven by coroutines sitting in `values`, detected by `is_awaitable` in completion —
+    no awaitable flag is needed.
+    """
+
+    values: List[Any]
+    infos: List[Any]
+    paths: List[Path]
 
 
 class FieldCompletion:
@@ -48,33 +65,37 @@ def is_live(state: "FieldCompletion", i: int) -> bool:
     return state.bubble[i] is None and state.outputs[i] is not None
 
 
-def run_layer(context, layer: LayerPlan, parents: List[Any]):
+def run_layer(context, layer: LayerPlan, parents: List[Any], parent_paths: List[Path]):
     """Run a LayerPlan's steps ONCE over a bucket of parents -> the bucket store.
 
     Pure batch-boundary concern: reads ONLY the LayerPlan — its `parent_step` boundary and
     its finalize-materialised `ordered_steps` — never the output shape. We seed the
-    `parent_step` id with `parents` (the operation root, or the enclosing plan field's
-    column) and run the layer's steps in dependency order via `run_steps`. The decisive
-    effect: a `loadMany` in this layer sees EVERY key across all `parents` in one
-    `execute`, so its batch callback fires exactly once for the whole bucket.
+    `parent_step` id with `parents` (the operation root, or the enclosing field's column),
+    build the per-invocation `BucketExtra` (request context + per-parent `parent_paths`,
+    needed by any `ResolveStep` to build each resolver `info.path`), and run the layer's
+    steps in dependency order via `run_steps`. The decisive effect: a `loadMany` in this
+    layer sees EVERY key across all `parents` in one `execute`, so its batch callback fires
+    exactly once for the whole bucket.
 
     `run_steps` already includes any `effect_steps` an optimizer orphaned (a mutation whose
     return value was inlined): no field consumes them, so they RUN FOR EFFECT here, their
     output column discarded but the write executed.
 
     Returns a dict `step.id -> output column` (or a coroutine resolving to it when an async
-    load is in the sub-DAG), or `None` for a bucket with no steps to run (the pure
-    legacy-resolver path, or a boundary-less bucket) — unchanged from before the de-fusion.
+    load is in the sub-DAG), or `None` for a bucket with no steps to run (a boundary-less
+    bucket) — unchanged from before the de-fusion.
     """
     if layer.parent_step is None or not layer.run_steps:
         return None
     seed = {layer.parent_step.id: parents}
+    extra = BucketExtra(context, parent_paths)
     return run_steps(
         len(parents),
         layer.ordered_steps,
         context.is_awaitable,
         seed=seed,
         on_step_batch=getattr(context, "_grafast_on_step_batch", None),
+        extra=extra,
     )
 
 
@@ -92,10 +113,10 @@ def execute_object_plan(
 
     The two halves are DE-FUSED: `run_layer` produces the bucket store (step.id -> column)
     from the LayerPlan alone, and `walk_output` serialises THIS object plan against that
-    store — each plan field reads its already-batched value column instead of re-entering a
-    resolver per parent; legacy fields keep the per-parent adapter.
+    store — every field (a plan step or a resolver-adapter ResolveStep) reads its
+    already-batched value column from the store, read uniformly.
     """
-    store = run_layer(context, plan.layer, parents)
+    store = run_layer(context, plan.layer, parents, parent_paths)
     if context.is_awaitable(store):
 
         async def after_steps():
@@ -282,11 +303,12 @@ def complete_field(
     Resolves only the parents still live, drives the field completer over their
     values, then writes each completed value (or Bubble) back into its parent.
 
-    A field WITH a plan resolver reads its value column from the bucket-level
-    `step_columns` (the batched step DAG already ran once over the whole bucket —
-    `field_plan.step` is the field's value step) rather than re-entering a resolver
-    per parent; that is where automatic batching is realised. A field WITHOUT a plan
-    resolver takes the legacy per-parent `ResolveStep` adapter, unchanged.
+    Every field carries a `FieldPlan.step` (a plan step or a resolver-adapter
+    ResolveStep), so completion reads its value column uniformly: the batched path
+    selects the column from the bucket store `step_columns` (the step DAG already ran
+    once over the whole bucket — this is where automatic batching is realised), and
+    the serial (mutation) path runs just this field's step sub-DAG over the live
+    parents. There is no separate per-parent resolver path.
     """
     live_idx = [i for i in range(len(parents)) if is_live(state, i)]
     if not live_idx:
@@ -294,11 +316,13 @@ def complete_field(
 
     live_parents = [parents[i] for i in live_idx]
     live_paths = [parent_paths[i] for i in live_idx]
-    if field_plan.step is not None and step_columns is not None:
+    if step_columns is not None:
+        # batched path: this field's value column is already in the bucket store
+        # (a plan step or a resolver-adapter ResolveStep — read uniformly).
         outcome = plan_field_outcome(
             context, field_plan, live_idx, live_paths, step_columns
         )
-    elif field_plan.step is not None:
+    else:
         # serial (mutation) path: no bucket-level columns were precomputed, so run
         # just this field's step sub-DAG over the live parents — keeping each
         # mutation field's effects ordered rather than batched across siblings.
@@ -325,8 +349,6 @@ def complete_field(
                 )
 
             return finish_serial()
-    else:
-        outcome = run_resolve_step(context, field_plan, live_parents, live_paths)
 
     completed = complete_values(
         context,
@@ -382,20 +404,21 @@ def run_serial_plan_field(context, field_plan, live_parents, live_paths, parent_
 
     Seeds the bucket's `parent_step` boundary with `live_parents` and runs only this
     field's reachable steps, so a mutation field's effects are not batched across its
-    siblings. Returns a `ResolveOutcome` (or a coroutine resolving to one when the
-    sub-DAG has an async load).
+    siblings. Threads a per-invocation `BucketExtra` (request context + per-parent paths)
+    so a resolver-adapter ResolveStep on this field gets its context/paths. Returns a
+    `_FieldOutcome` (or a coroutine resolving to one when the sub-DAG has an async load).
     """
-    from .steps import ResolveOutcome
-
     boundary = {parent_step.id}
     ordered = order_steps_within([field_plan.step], boundary)
     seed = {parent_step.id: live_parents}
+    extra = BucketExtra(context, live_paths)
     columns = run_steps(
         len(live_parents),
         ordered,
         context.is_awaitable,
         seed=seed,
         on_step_batch=getattr(context, "_grafast_on_step_batch", None),
+        extra=extra,
     )
 
     field_def = field_plan.field_def
@@ -418,27 +441,21 @@ def run_serial_plan_field(context, field_plan, live_parents, live_paths, parent_
 
         async def finish():
             cols = await columns
-            return ResolveOutcome(
-                values=list(cols[step_id]), infos=infos, paths=paths, awaitable=False
-            )
+            return _FieldOutcome(values=list(cols[step_id]), infos=infos, paths=paths)
 
         return finish()
 
-    return ResolveOutcome(
-        values=list(columns[step_id]), infos=infos, paths=paths, awaitable=False
-    )
+    return _FieldOutcome(values=list(columns[step_id]), infos=infos, paths=paths)
 
 
 def plan_field_outcome(context, field_plan, live_idx, live_paths, step_columns):
-    """Assemble a `ResolveOutcome` for a plan-resolver field from its step column.
+    """Assemble a `_FieldOutcome` for a field from its already-batched step column.
 
-    The bucket DAG produced `field_plan.step`'s output for every parent position;
-    we select the live entries and build the field path / resolve info per live
-    parent (completion needs them for abstract-type resolution and error locating).
-    The values came from ONE batched step run, not a per-parent resolver loop.
+    The bucket DAG produced `field_plan.step`'s output for every parent position (a plan
+    step or a resolver-adapter ResolveStep alike); we select the live entries and build
+    the field path / resolve info per live parent (completion needs them for abstract-type
+    resolution and error locating). The values came from ONE batched step run.
     """
-    from .steps import ResolveOutcome
-
     field_def = field_plan.field_def
     column = step_columns[field_plan.step.id]
     values = [column[i] for i in live_idx]
@@ -456,7 +473,7 @@ def plan_field_outcome(context, field_plan, live_idx, live_paths, step_columns):
         )
         paths.append(field_path)
 
-    return ResolveOutcome(values=values, infos=infos, paths=paths, awaitable=False)
+    return _FieldOutcome(values=values, infos=infos, paths=paths)
 
 
 def scatter(context, field_plan, completed, live_idx, paths, state) -> None:

@@ -219,9 +219,14 @@ def test_planner_recurses_with_the_field_step_as_child_parent():
     assert name_fp.step.dependencies[0] is captured["people_step"]
 
 
-def test_legacy_field_without_plan_contributes_no_step():
+def test_no_plan_field_contributes_a_resolve_step():
+    """A no-plan resolver field now carries a ResolveStep (the unified path)."""
+    from grafast_py.steps import ResolveStep
+
     schema = build_schema(SDL)  # no plans attached
     _ctx, object_plan = build_plan(schema, "{ people { name } }")
     people_fp = object_plan.fields[0]
     assert people_fp.plan_fn is None
-    assert people_fp.step is None
+    # every field carries a step now; a plain-resolver field's step is a ResolveStep.
+    assert isinstance(people_fp.step, ResolveStep)
+    assert people_fp.step.dedupable is False

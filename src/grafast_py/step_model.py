@@ -9,11 +9,12 @@ dependency. Running a step once per bucket — rather than re-entering a resolve
 (field, parent) pair — is what makes batching automatic: a future `loadMany` step
 sees EVERY key in its bucket in a single `execute`, so it can issue one batch call.
 
-This module ships the base class and the executor plus the legacy-resolver adapter
-(`ResolveStep`). The concrete value steps (access, lambda, constant, list, object,
-loadOne/loadMany) and the plan-resolver API arrive in the next build stage; they all
-subclass `Step` and obey the same `execute` contract, so the executor here is the
-single place steps are run.
+This module ships the base class and the executor. The concrete value steps (access,
+lambda, constant, list, object, loadOne/loadMany), the plan-resolver API, and the
+resolver-adapter (`ResolveStep`, in `steps.py`) all subclass `Step` and obey the same
+`execute` contract, so the executor here is the single place steps are run. A step may
+declare `wants_extra` to receive a per-invocation `BucketExtra` (request context +
+per-parent paths) as a third `execute` argument; pure value/load steps do not.
 """
 
 from contextlib import nullcontext
@@ -47,6 +48,13 @@ class Step:
     # computed/loaded twice is computed once). SIDE-EFFECTING steps (e.g. mutations) set
     # this False so two distinct writes are never collapsed into one.
     dedupable: bool = True
+
+    # whether `run_steps` passes the per-bucket-invocation BucketExtra (request context +
+    # per-parent paths) as a third execute() argument. False for every pure value/load step
+    # (a step's column is a function of its dependency columns alone); the resolver-adapter
+    # sets it True because it needs the request's field_resolver/middleware/build_resolve_info
+    # and per-parent paths, which are per-invocation and MUST NOT be stored on the shared step.
+    wants_extra: bool = False
 
     def __init__(self) -> None:
         self.dependencies: List["Step"] = []
@@ -136,6 +144,7 @@ def run_steps(
     is_awaitable: Callable[[Any], bool],
     seed: Optional[Dict[int, List[Any]]] = None,
     on_step_batch: Optional[Callable[[Step, int], Any]] = None,
+    extra=None,
 ):
     """Execute a topologically ordered list of steps once each over a bucket.
 
@@ -152,6 +161,10 @@ def run_steps(
     called around each step's `execute` and may return a context manager (a span) or
     None. It wraps the batch boundary — the exact point Grafast batches a layer.
 
+    `extra` is an optional per-invocation `BucketExtra` (request context + per-parent
+    paths) passed to a step's `execute` only when it declares `wants_extra`; it is a
+    fresh argument per call, never shared mutable state.
+
     Returns a dict mapping `step.id -> output column`. When any step's `execute`
     returns a coroutine (an async *column*, e.g. a future batched load), the whole
     call returns a coroutine resolving to that dict; steps are then awaited in
@@ -164,7 +177,7 @@ def run_steps(
         cols = [results[dep.id] for dep in step.dependencies]
         span = _span(on_step_batch, step, count)
         span.__enter__()
-        out = step.execute(count, cols)
+        out = step.execute(count, cols, extra) if step.wants_extra else step.execute(count, cols)
         if is_awaitable(out):
             # the real work is in the await; keep the span open across it.
             return _run_steps_async(
@@ -177,6 +190,7 @@ def run_steps(
                 span,
                 is_awaitable,
                 on_step_batch,
+                extra,
             )
         span.__exit__(None, None, None)
         _store(results, step, count, out)
@@ -194,7 +208,7 @@ def _span(on_step_batch, step, count):
 
 async def _run_steps_async(
     count, ordered_steps, results, index, pending_step, pending, pending_span,
-    is_awaitable, on_step_batch=None,
+    is_awaitable, on_step_batch=None, extra=None,
 ):
     """Finish a step run that hit an awaitable column, awaiting in dep order."""
     out = await pending
@@ -204,7 +218,7 @@ async def _run_steps_async(
     for step in ordered_steps[index + 1 :]:
         cols = [results[dep.id] for dep in step.dependencies]
         with _span(on_step_batch, step, count):
-            out = step.execute(count, cols)
+            out = step.execute(count, cols, extra) if step.wants_extra else step.execute(count, cols)
             if is_awaitable(out):
                 out = await out
         _store(results, step, count, out)
