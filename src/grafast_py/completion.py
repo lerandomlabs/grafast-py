@@ -94,6 +94,27 @@ class NonNullCompleter(NamedTuple):
 Completer = Any
 
 
+class HoistBridge(NamedTuple):
+    """The P4 channel carrying a parent bucket's HOISTED columns down to a child bucket.
+
+    When a step is hoisted to a shallower (parent) layer, its column is produced in the
+    PARENT bucket but a child bucket still needs it (keyed by the hoisted step id). This
+    bridge threads that down through the value-completion recursion so `run_object_children`
+    can seed the child layer from `parent_store` (the parent bucket store, indexed by parent
+    bucket position) projected by `value_owner` (which parent bucket position each completed
+    `values[j]` belongs to).
+
+    `value_owner[j]` is the parent BUCKET position of completion value `j` — it follows the
+    list flatten / object scatter so the hoisted column (produced at parent bucket granularity)
+    is expanded to each child position correctly. It is `None` (the default everywhere) when no
+    field in this descent has any hoisted-out column, so every non-hoisting path is
+    byte-identical (the bridge is never built and never read).
+    """
+
+    parent_store: dict
+    value_owner: List[int]
+
+
 def build_completer(
     context, return_type: GraphQLOutputType, field_nodes
 ) -> Completer:
@@ -148,6 +169,7 @@ def complete_values(
     infos: List[Any],
     field_nodes,
     field_label: str,
+    bridge: Optional["HoistBridge"] = None,
 ):
     """Complete a batch of raw values through `completer`.
 
@@ -161,20 +183,25 @@ def complete_values(
     `infos[i]` is the field's `GraphQLResolveInfo` for value `i`; abstract-type
     resolution needs it (and graphql-core reuses the field's single info for every
     list item, so list expansion replicates the parent info per item).
+
+    `bridge` is the P4 :class:`HoistBridge` carrying a parent bucket's hoisted columns
+    down to the object child bucket (it follows list flatten / object scatter so each
+    child position seeds the right hoisted value). It is `None` by default and on every
+    non-hoisting path, so completion is byte-identical when nothing was hoisted.
     """
     if isinstance(completer, LeafCompleter):
         return complete_leaf_values(context, completer, values, paths, field_nodes)
     if isinstance(completer, NonNullCompleter):
         return complete_non_null_values(
-            context, completer, values, paths, infos, field_nodes, field_label
+            context, completer, values, paths, infos, field_nodes, field_label, bridge
         )
     if isinstance(completer, ListCompleter):
         return complete_list_values(
-            context, completer, values, paths, infos, field_nodes, field_label
+            context, completer, values, paths, infos, field_nodes, field_label, bridge
         )
     if isinstance(completer, ObjectCompleter):
         return complete_object_values(
-            context, completer, values, paths, infos, field_nodes
+            context, completer, values, paths, infos, field_nodes, bridge
         )
     if isinstance(completer, AbstractCompleter):
         return complete_abstract_values(
@@ -262,16 +289,17 @@ def serialize_leaf(leaf_type: GraphQLLeafType, value: Any):
 
 
 def complete_non_null_values(
-    context, completer, values, paths, infos, field_nodes, field_label
+    context, completer, values, paths, infos, field_nodes, field_label, bridge=None
 ):
     """Complete the inner type, then forbid None: a None inner becomes a Bubble.
 
     The Bubble carries the located cannot-return-null error built at *this*
     boundary's path. An inner value that is already a Bubble propagates unchanged
-    (its originating error is preserved).
+    (its originating error is preserved). `bridge` (P4 hoist channel) passes through to
+    the inner completer unchanged — a NonNull wrapper does not reshape the value batch.
     """
     inner = complete_values(
-        context, completer.inner, values, paths, infos, field_nodes, field_label
+        context, completer.inner, values, paths, infos, field_nodes, field_label, bridge
     )
 
     if context.is_awaitable(inner):
@@ -316,7 +344,7 @@ def non_null_error(field_label: str) -> TypeError:
 
 
 def complete_list_values(
-    context, completer, values, paths, infos, field_nodes, field_label
+    context, completer, values, paths, infos, field_nodes, field_label, bridge=None
 ):
     """Complete a batch of list-typed values.
 
@@ -329,6 +357,10 @@ def complete_list_values(
     Async raw values and async iterables are drained/awaited first, then the
     synchronous flatten+complete path runs; awaitable items are handled by the
     item completer's own awaiting.
+
+    `bridge` (P4 hoist channel) is threaded into the flatten so each item carries the
+    parent BUCKET position of its source list — a list reshapes the value batch, so the
+    hoisted column must be re-projected per flattened item.
     """
     pending = prepare_list_inputs(context, values)
     if pending is not None:
@@ -336,7 +368,7 @@ def complete_list_values(
         async def finish_inputs():
             await pending
             built = build_list_results(
-                context, completer, values, paths, infos, field_nodes, field_label
+                context, completer, values, paths, infos, field_nodes, field_label, bridge
             )
             if context.is_awaitable(built):
                 return await built
@@ -344,7 +376,7 @@ def complete_list_values(
 
         return finish_inputs()
     return build_list_results(
-        context, completer, values, paths, infos, field_nodes, field_label
+        context, completer, values, paths, infos, field_nodes, field_label, bridge
     )
 
 
@@ -384,7 +416,7 @@ def prepare_list_inputs(context, values):
 
 
 def build_list_results(
-    context, completer, values, paths, infos, field_nodes, field_label
+    context, completer, values, paths, infos, field_nodes, field_label, bridge=None
 ):
     """Flatten items into one batch, complete, then re-collect per list."""
     item_values: List[Any] = []
@@ -392,6 +424,10 @@ def build_list_results(
     # parallel to item_values: each list item reuses its source list's field info
     # (graphql-core threads the field's single `info` through list completion)
     item_infos: List[Any] = []
+    # P4 hoist channel: parallel to item_values, the parent BUCKET position of each item's
+    # source list (carried from `bridge.value_owner[i]`) so the item-level bridge can project
+    # the hoisted column per flattened item. Built only when a bridge is present.
+    item_owner: List[int] = [] if bridge is not None else None
     # spans[i] is (start, length) into item_values for source list i, the sentinel
     # ("null",) when the value is null, or None when the value is invalid (with the
     # located error stashed in `invalid[i]`)
@@ -419,8 +455,13 @@ def build_list_results(
             item_values.append(item)
             item_paths.append(paths[i].add_key(index, None))
             item_infos.append(infos[i])
+            if item_owner is not None:
+                item_owner.append(bridge.value_owner[i])
         spans.append((start, len(item_values) - start))
 
+    item_bridge = (
+        bridge._replace(value_owner=item_owner) if bridge is not None else None
+    )
     completed_items = complete_values(
         context,
         completer.item_completer,
@@ -429,6 +470,7 @@ def build_list_results(
         item_infos,
         field_nodes,
         field_label,
+        item_bridge,
     )
 
     if context.is_awaitable(completed_items):
@@ -479,23 +521,28 @@ def collect_lists(context, completer, completed_items, spans, invalid):
 # ---------------------------------------------------------------------------
 
 
-def complete_object_values(context, completer, values, paths, infos, field_nodes):
-    """Complete a batch of object values by recursing into the child bucket."""
+def complete_object_values(context, completer, values, paths, infos, field_nodes, bridge=None):
+    """Complete a batch of object values by recursing into the child bucket.
+
+    `bridge` (P4 hoist channel) carries the parent bucket's hoisted columns + the per-value
+    parent-bucket-owner map down to `run_object_children`, which seeds the child layer with the
+    hoisted columns (so a hoisted step is read, not re-run, in the child bucket).
+    """
     pending = resolve_awaitable_values(context, values)
     if pending is not None:
 
         async def finish_inputs():
             await pending
-            built = run_object_bucket(context, completer, values, paths, field_nodes)
+            built = run_object_bucket(context, completer, values, paths, field_nodes, bridge)
             if context.is_awaitable(built):
                 return await built
             return built
 
         return finish_inputs()
-    return run_object_bucket(context, completer, values, paths, field_nodes)
+    return run_object_bucket(context, completer, values, paths, field_nodes, bridge)
 
 
-def run_object_bucket(context, completer, values, paths, field_nodes):
+def run_object_bucket(context, completer, values, paths, field_nodes, bridge=None):
     object_type = completer.object_type
     child_objs: List[Any] = []
     child_paths: List[Path] = []
@@ -534,13 +581,13 @@ def run_object_bucket(context, completer, values, paths, field_nodes):
         async def finish_guarded():
             resolved = await gather_guard(context, guard)
             return run_object_children(
-                context, completer, child_objs, child_paths, origin, results, field_nodes, resolved
+                context, completer, child_objs, child_paths, origin, results, field_nodes, resolved, bridge
             )
 
         return finish_guarded()
 
     return run_object_children(
-        context, completer, child_objs, child_paths, origin, results, field_nodes, guard or None
+        context, completer, child_objs, child_paths, origin, results, field_nodes, guard or None, bridge
     )
 
 
@@ -569,9 +616,19 @@ async def _wrap(value):
 
 
 def run_object_children(
-    context, completer, child_objs, child_paths, origin, results, field_nodes, guard
+    context, completer, child_objs, child_paths, origin, results, field_nodes, guard, bridge=None
 ):
-    """Filter out is_type_of failures (as Bubbles), then recurse into the bucket."""
+    """Filter out is_type_of failures (as Bubbles), then recurse into the bucket.
+
+    `bridge` (P4 hoist channel) seeds the child layer with any columns the planner HOISTED
+    out of it: a hoisted step's column was produced once in a shallower (parent) bucket, so
+    here we project it to each kept child position via the parent-bucket-owner map and pass it
+    as `parent_store` to the child `execute_object_plan`. The child layer's `ordered_steps`
+    already exclude those step ids (`populate_layers` added them to the boundary), so the step
+    is READ from the seed, never re-executed in the child bucket — the fire-once guarantee. No
+    bridge (the default / no hoisted-out step) => `parent_store` stays None and the call is
+    byte-identical.
+    """
     from .execute import execute_object_plan
 
     keep_objs: List[Any] = []
@@ -600,7 +657,13 @@ def run_object_children(
     if capture is not None:
         capture(completer, keep_objs, keep_origin, keep_paths)
 
-    child_results = execute_object_plan(context, completer.child_plan, keep_objs, keep_paths)
+    child_parent_store = build_hoist_parent_store(
+        completer.child_plan, bridge, keep_origin
+    )
+
+    child_results = execute_object_plan(
+        context, completer.child_plan, keep_objs, keep_paths, child_parent_store
+    )
 
     if context.is_awaitable(child_results):
 
@@ -620,6 +683,30 @@ def invalid_return_type_error(object_type, result, field_nodes) -> GraphQLError:
         f"Expected value of type '{object_type.name}' but got: {inspect(result)}.",
         field_nodes,
     )
+
+
+def build_hoist_parent_store(child_plan, bridge, keep_origin):
+    """Build the child bucket's `parent_store` for the steps hoisted OUT of its layer.
+
+    For each step id in `child_plan.layer.hoisted_out_ids`, the planner relocated the step to
+    a shallower (parent) layer; its column lives in the PARENT bucket store (`bridge.parent_store`,
+    indexed by parent bucket position). We project it to the kept child positions: kept child k
+    came from completion value `keep_origin[k]`, whose parent bucket position is
+    `bridge.value_owner[keep_origin[k]]`. The resulting column is element-for-element aligned with
+    `keep_objs`, so the child layer reads each hoisted step's value at its own bucket position
+    without re-running the step. Returns `None` when nothing was hoisted out (the default path —
+    `run_layer` then seeds only the `parent_step` boundary, byte-identical).
+    """
+    hoisted_out = child_plan.layer.hoisted_out_ids
+    if not hoisted_out or bridge is None:
+        return None
+    value_owner = bridge.value_owner
+    parent_store = bridge.parent_store
+    child_store = {}
+    for hid in hoisted_out:
+        parent_column = parent_store[hid]
+        child_store[hid] = [parent_column[value_owner[o]] for o in keep_origin]
+    return child_store
 
 
 # ---------------------------------------------------------------------------
@@ -824,6 +911,12 @@ def abstract_child_plan(context, completer, object_type):
     plan.inline_relations = config.inline_relations
     plan.placeholders = config.placeholders
     plan.cache_plans = config.cache_plans
+    # carry the hoist decision too so a concrete-type subtree finalizes EXACTLY as the
+    # operation root does. A subtree's top layer reason is ROOT (its own RootStep), so the
+    # hoist pass naturally finds no shallower layer to lift into and is inert here; threading
+    # it keeps parity and future-proofs nested subtrees. `is_mutation` stays False — an
+    # abstract subtree is only reached from a query/event walk, never a mutation root.
+    plan.hoist = config.hoist
     root_step = RootStep()
     plan.add_step(root_step)
     child_plan = plan_object(
