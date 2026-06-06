@@ -1,14 +1,15 @@
-"""The inlining SAFETY PREDICATE (Wave 3b, step 5): ``inline_candidates`` / ``find_inline_candidates``.
+"""The inlining SAFETY PREDICATE: ``inline_candidates`` / ``find_inline_candidates``.
 
-Step 4 built the LATERAL SQL (``build_lateral`` / ``apply_laterals``) a parent emits when it
-carries an :class:`InlineSpec`; this step adds the PURE PREDICATE that DECIDES which child
-relations are provably safe to fold. ``parent.inline_candidates(plan)`` (delegating to
+The LATERAL SQL (``build_lateral`` / ``apply_laterals``) a parent emits when it carries an
+:class:`InlineSpec` is paired with this PURE PREDICATE that DECIDES which child relations are
+provably safe to fold. ``parent.inline_candidates(plan)`` (delegating to
 :func:`grafast_py.pg.inline.find_inline_candidates`) returns ``[(child_step, InlineSpec), ...]``
 for every child that passes EVERY enumerated condition, and ``[]`` when inlining is off — with
-NO DAG mutation and NO SQL (the optimize wiring that consumes this list is a later step).
+NO DAG mutation and NO SQL (the predicate only inspects; the optimize wiring consumes the list
+separately).
 
 The defining property is CONSERVATISM: inlining must be byte-identical to the batched
-``= ANY($1)`` path, so any unmet/uncertain condition SKIPS the child (P keeps the batched
+``= ANY($1)`` path, so any unmet/uncertain condition SKIPS the child (keeping the batched
 child — a redundant statement, never wrong data). These tests pin BOTH halves:
 
 - the PASS cases: a plain hasOne (``Post.author``) and an unpaginated hasMany
@@ -98,7 +99,7 @@ def test_has_many_unpaginated_folds_with_faithful_spec():
     assert spec.resource is posts
     # the order is reproduced verbatim — the default PK order (id asc), the PK tie-break baked.
     assert [t.column for t in spec.order_by] == ["id"]
-    # an unfiltered fold carries no LATERAL predicates this wave.
+    # an unfiltered fold carries no LATERAL predicates.
     assert spec.where_predicates == ()
     # the alias is the deterministic derived nested column the LATERAL projects.
     assert spec.nested_alias == nested_alias_for(posts, ("author_id",))
@@ -220,7 +221,7 @@ def test_skip_when_child_resource_opts_out():
 
 
 def test_skip_limited_has_many():
-    """A per-parent paginated hasMany (first/offset) is NOT foldable this wave — SKIP."""
+    """A per-parent paginated hasMany (first/offset) is NOT foldable — SKIP."""
     _registry, authors, posts = make_blog_registry()
     plan, parent = root_authors_plan(authors)
     plan.add_step(authors.related_many(parent, "posts", first=2))
@@ -228,7 +229,7 @@ def test_skip_limited_has_many():
 
 
 def test_skip_composite_fk_relation():
-    """A composite FK (a ListStep key) is not the single-column correlation — SKIP this wave."""
+    """A composite FK (a ListStep key) is not the single-column correlation — SKIP."""
     registry = PgRegistry()
     lines = PgResource(
         "lines", "grafast_demo", "lines", ["org_id", "item_id"],
@@ -251,7 +252,7 @@ def test_skip_composite_fk_relation():
 
 
 def test_skip_paginated_connection():
-    """A PgConnectionStep (paginated / aggregate / keyset) is always SKIPPED this wave."""
+    """A PgConnectionStep (paginated / aggregate / keyset) is always SKIPPED."""
     _registry, authors, posts = make_blog_registry()
     plan, parent = root_authors_plan(authors)
     key = access(parent, ("id",))
@@ -310,11 +311,12 @@ def test_json_stable_codec_column_still_folds():
 def test_skip_bare_column_with_no_codec_and_no_type():
     """A codec-LESS column with NO declared type is UNKNOWN — cannot prove json-stable, SKIP.
 
-    The core blocker-1 guard: a bare string column (no codec, no ``sql_type``) MIGHT be a
-    non-native scalar whose ``to_jsonb`` -> JSON form differs from the asyncpg row value
-    (numeric precision loss, timestamptz tz-shift, bytea-as-string). The predicate refuses to
-    ASSUME native; it fails safe and keeps the batched child. Declaring the column's type (or
-    a codec) is what makes a genuinely-native column foldable (see the other branch tests).
+    The json-stability condition of the inlining safety predicate: a bare string column (no
+    codec, no ``sql_type``) MIGHT be a non-native scalar whose ``to_jsonb`` -> JSON form
+    differs from the asyncpg row value (numeric precision loss, timestamptz tz-shift,
+    bytea-as-string). The predicate refuses to ASSUME native; it fails safe and keeps the
+    batched child. Declaring the column's type (or a codec) is what makes a genuinely-native
+    column foldable (see the other branch tests).
     """
     registry = PgRegistry()
     authors = PgResource(
@@ -338,7 +340,7 @@ def test_skip_bare_non_native_typed_column():
 
     The type IS known (e.g. the ORM bridge recorded it), and it is non-native — its JSON form
     drops trailing numeric precision (``12.5000`` -> ``12.5``) — so the fold SKIPS even with no
-    codec. This is the type-aware half of the blocker-1 guard.
+    codec. This is the type-aware half of the json-stability condition.
     """
     from sqlalchemy.types import Numeric
 
@@ -379,7 +381,7 @@ def test_typed_native_columns_fold():
 
 
 def test_skip_filtered_child():
-    """A child carrying a host .where() (a filter) is SKIPPED this wave — deferred."""
+    """A child carrying a host .where() (a filter) is SKIPPED — not currently inlined."""
     _registry, authors, posts = make_blog_registry()
     plan, parent = root_authors_plan(authors)
     child = authors.related_many(parent, "posts")
@@ -410,9 +412,9 @@ def test_skip_self_referential_relation():
     employees.has_many("reports", employees, ...) folds the SAME table into itself: the flat
     build_lateral emits the inner child as a bare table with the SAME unaliased name as the
     outer parent, so the `parent.local = child.remote` correlation would resolve to the INNER
-    table and collapse into a within-row comparison (every parent silently gets []). Until the
-    per-select alias subsystem exists, the predicate must NOT fold a self-relation — it keeps
-    the correct batched `= ANY($1)` path. Covers BOTH the hasMany and hasOne self-relations.
+    table and collapse into a within-row comparison (every parent silently gets []). Without a
+    per-select alias subsystem the predicate must NOT fold a self-relation — it keeps the
+    correct batched `= ANY($1)` path. Covers BOTH the hasMany and hasOne self-relations.
     """
     registry = PgRegistry()
     employees = PgResource(
@@ -547,8 +549,8 @@ async def reseeded_engine():
 async def test_predicate_spec_inlines_equivalently_in_one_fewer_statement(reseeded_engine):
     """The PREDICATE-produced spec, when applied, is byte-identical to the batched child.
 
-    Step 5 produces the :class:`InlineSpec` but does not wire the rewrite (a later step). This
-    is the honest equivalence proof for the PREDICATE: take the spec ``inline_candidates``
+    The predicate produces the :class:`InlineSpec` without wiring the rewrite itself. This is
+    the honest equivalence proof for the PREDICATE: take the spec ``inline_candidates``
     returns for ``Author.posts``, APPLY it (build the inlined parent + the
     :class:`NestedExtractStep` the fold would create), and assert the scattered child lists
     are BYTE-IDENTICAL to the standalone batched ``= ANY($1)`` child — in ONE FEWER statement.
@@ -581,8 +583,8 @@ async def test_predicate_spec_inlines_equivalently_in_one_fewer_statement(reseed
             assert len(candidates) == 1  # the predicate chose to fold Author.posts
             _folded, spec = candidates[0]
 
-            # apply the spec exactly as the optimize pass (a later step) would: a parent
-            # carrying the spec + a NestedExtractStep on its derived alias.
+            # apply the spec exactly as the optimize pass would: a parent carrying the
+            # spec + a NestedExtractStep on its derived alias.
             inlined_root = PgSelectAllStep(
                 authors, order_by=["id"], inline_specs=[spec]
             )

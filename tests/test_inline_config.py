@@ -1,12 +1,12 @@
-"""Inlining config knobs (Wave 3b, step 1): the two opt-in toggles only.
+"""Inlining config knobs: the two opt-in toggles only.
 
-This step adds the toggles for opportunistic LATERAL relation inlining but NO
-behavior: ``GrafastConfig.inline_relations`` and the per-resource
-``PgResource(opt_out_inline=...)`` escape hatch both default OFF, and nothing in
-the engine reads them yet. These tests pin the defaults (so the no-op invariant is
-visible) and that an explicit override is honoured. The byte-identical behaviour of
-the wider suite under the default-off flag is the real proof there is no behaviour
-change; this file just documents the surface.
+These toggles gate opportunistic LATERAL relation inlining:
+``GrafastConfig.inline_relations`` and the per-resource
+``PgResource(opt_out_inline=...)`` escape hatch both default OFF. These tests pin
+the defaults (so the no-op invariant is visible) and that an explicit override is
+honoured. The byte-identical behaviour of the wider suite under the default-off
+flag is the real proof there is no behaviour change; this file just documents the
+surface.
 """
 
 from grafast_py.config import DEFAULT_CONFIG, GrafastConfig
@@ -14,7 +14,7 @@ from grafast_py.pg.resource import PgResource, PgRegistry
 
 
 def test_inline_relations_defaults_off():
-    """The global inlining toggle ships dark: default config has it False."""
+    """The global inlining toggle is off by default: default config has it False."""
     assert GrafastConfig().inline_relations is False
     assert DEFAULT_CONFIG.inline_relations is False
 
