@@ -132,14 +132,18 @@ def plan_object(
                 parent_type,
                 Path(None, response_name, parent_type.name),
             )
-            # per-argument variable provenance (Wave 4 placeholders): when the plan-level
-            # `placeholders` flag is on, walk this field's argument AST so a plan resolver
-            # can tell a `$variable`-derived value from a plan-time literal. Off by default
-            # => empty provenance => `FieldArgs.is_variable` is always False => every host
-            # inlines literals exactly as before (byte-identical).
+            # per-argument variable provenance (Wave 4 placeholders): walk this field's
+            # argument AST so a plan resolver can tell a `$variable`-derived value from a
+            # plan-time literal. Computed when `placeholders` is on OR when `cache_plans` is on
+            # — caching NEEDS the provenance so an INLINED variable (read raw, not
+            # placeholdered) is detected below and the plan marked non-cacheable; without it a
+            # `cache_plans=True` / `placeholders=False` host would bleed the first request's
+            # value across requests. Both off (the default) => empty provenance =>
+            # `FieldArgs.is_variable` is always False => every host inlines literals exactly as
+            # before (byte-identical).
             variable_args, variable_sources = (
                 variable_provenance(field_nodes[0])
-                if plan.placeholders
+                if (plan.placeholders or plan.cache_plans)
                 else (None, None)
             )
             field_args = FieldArgs(
@@ -153,6 +157,17 @@ def plan_object(
             # raw reads and the placeholdered sources and nets them; a fully-placeholdered or
             # all-literal field leaves `cacheable` True.
             if field_args.inlined_variable_args():
+                plan.cacheable = False
+        elif plan is not None and plan.cache_plans and args_error is None:
+            # legacy resolver path (plan_fn is None): the coerced args are FROZEN onto
+            # FieldPlan.args from this request, and a cache HIT skips the planner and replays
+            # them — so a resolver reading a `$variable`-derived arg would serve a later
+            # request the FIRST request's value. A legacy resolver has no step to re-point, so
+            # the placeholder/cursor rebind cannot fix it; refuse to cache a plan carrying any
+            # variable-derived legacy arg (re-plan per request), the conservative analogue of
+            # the abstract-field bail-out.
+            legacy_variable_args, _ = variable_provenance(field_nodes[0])
+            if legacy_variable_args:
                 plan.cacheable = False
 
         # an object/plan field passes its step down as the child bucket's parent;

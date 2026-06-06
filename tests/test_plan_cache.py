@@ -476,6 +476,48 @@ def test_plan_using_a_placeholder_stays_cacheable():
     assert plan.cacheable is True
 
 
+def test_inlining_a_variable_is_not_cacheable_even_with_placeholders_off():
+    """cache_plans WITHOUT placeholders still detects an inlined $variable -> non-cacheable.
+
+    The bug: with placeholders off, provenance was not computed, so an inlined variable went
+    unrecorded and the value-pinned plan was cached — a later request bled the first value.
+    Caching now forces provenance (placeholders OR cache_plans), so the inline is detected and
+    the plan re-plans per request.
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    schema = make_grafast_schema(
+        SDL, {"Query": {"things": things_inlining_plan}, "Thing": {"id": id_plan}}
+    )
+    plan = plan_query(
+        schema,
+        "query Q($s: String) { things(status: $s) { id } }",
+        GrafastConfig(placeholders=False, cache_plans=True),
+        {"s": "published"},
+    )
+    assert plan.cacheable is False
+
+
+def test_legacy_resolver_field_with_variable_arg_is_not_cacheable():
+    """A legacy (no-plan-resolver) field with a $variable arg is non-cacheable under cache_plans.
+
+    The coerced args are frozen on FieldPlan.args and a cache HIT replays them, so a legacy
+    resolver reading the $variable would serve a later request the first value — and a legacy
+    resolver has no step to re-point. The plan must therefore not be cached (re-plan instead).
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    # `things` has NO plan resolver -> the legacy graphql-core resolver path.
+    schema = make_grafast_schema(SDL, {})
+    plan = plan_query(
+        schema,
+        "query Q($s: String) { things(status: $s) { id } }",
+        GrafastConfig(cache_plans=True),
+        {"s": "published"},
+    )
+    assert plan.cacheable is False
+
+
 def test_all_literal_plan_is_cacheable():
     """A plan with NO variable args is cacheable (reading a literal arg is always value-stable)."""
     from grafast_py.schema import make_grafast_schema
