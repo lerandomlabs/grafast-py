@@ -593,6 +593,13 @@ def run_object_children(
     if not keep_objs:
         return results
 
+    # test-only seam (no-op in production): exposes this hop's child seed + index map so a
+    # test can prove the child layer is runnable from (parent value column, keep_origin)
+    # alone — keep_objs == [parent_column[o] for o in keep_origin] element-for-element.
+    capture = getattr(context, "_grafast_capture_keep_origin", None)
+    if capture is not None:
+        capture(completer, keep_objs, keep_origin, keep_paths)
+
     child_results = execute_object_plan(context, completer.child_plan, keep_objs, keep_paths)
 
     if context.is_awaitable(child_results):
@@ -742,9 +749,16 @@ def dispatch_abstract(context, completer, values, paths, infos, field_nodes, run
     if not groups:
         return results
 
+    # test-only seam (no-op in production): exposes each concrete-type group's seed + index
+    # map (the group `origin` indexing the abstract field's own value column) so a test can
+    # prove the group layer is runnable from (abstract value column, origin) alone.
+    capture = getattr(context, "_grafast_capture_group_origin", None)
+
     pending = []
     for objs, group_paths, origin, object_type in groups.values():
         child_plan = abstract_child_plan(context, completer, object_type)
+        if capture is not None:
+            capture(object_type, child_plan, objs, origin, group_paths, values)
         child_results = execute_object_plan_for_group(
             context, child_plan, objs, group_paths
         )

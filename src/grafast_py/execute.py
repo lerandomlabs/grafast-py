@@ -65,7 +65,13 @@ def is_live(state: "FieldCompletion", i: int) -> bool:
     return state.bubble[i] is None and state.outputs[i] is not None
 
 
-def run_layer(context, layer: LayerPlan, parents: List[Any], parent_paths: List[Path]):
+def run_layer(
+    context,
+    layer: LayerPlan,
+    parents: List[Any],
+    parent_paths: List[Path],
+    parent_store: Optional[Dict[int, List[Any]]] = None,
+):
     """Run a LayerPlan's steps ONCE over a bucket of parents -> the bucket store.
 
     Pure batch-boundary concern: reads ONLY the LayerPlan — its `parent_step` boundary and
@@ -81,13 +87,27 @@ def run_layer(context, layer: LayerPlan, parents: List[Any], parent_paths: List[
     return value was inlined): no field consumes them, so they RUN FOR EFFECT here, their
     output column discarded but the write executed.
 
+    `parent_store` is the GENERIC request-state seam: an optional `step.id -> column` dict
+    whose entries are seeded as ADDITIONAL boundary columns alongside `parent_step`. This is
+    one channel three phases share rather than three parallel ones: (1) P2.5 child-layer
+    detachment — a child object layer is seeded directly from a parent value column + index
+    map, decoupled from the parent walk (exercised by tests/test_lifecycle_detachment.py);
+    (2) P5 a per-request placeholder-value map; (3) P7 a deferred-job continuation re-reading
+    a parent column. INVARIANT: every `parent_store` key MUST already be a boundary excluded
+    from `layer.ordered_steps` — which was precomputed against `{parent_step.id}` at finalize
+    (`populate_layers`). Seeding `parent_step.id` itself (the only key P2.5 uses) always
+    satisfies this; a future phase seeding a NON-boundary column would have to recompute the
+    order (`order_steps_within`) for that call. We do NOT recompute the order per call here —
+    that would be a perf regression and is unnecessary for the boundary-only keys used today.
+
     Returns a dict `step.id -> output column` (or a coroutine resolving to it when an async
     load is in the sub-DAG), or `None` for a bucket with no steps to run (a boundary-less
     bucket) — unchanged from before the de-fusion.
     """
     if layer.parent_step is None or not layer.run_steps:
         return None
-    seed = {layer.parent_step.id: parents}
+    seed = dict(parent_store) if parent_store else {}
+    seed[layer.parent_step.id] = parents
     extra = BucketExtra(context, parent_paths)
     return run_steps(
         len(parents),
@@ -104,6 +124,7 @@ def execute_object_plan(
     plan: ObjectPlan,
     parents: List[Any],
     parent_paths: List[Path],
+    parent_store: Optional[Dict[int, List[Any]]] = None,
 ):
     """Execute an ObjectPlan over a bucket: run its LayerPlan, then walk its output.
 
@@ -115,8 +136,13 @@ def execute_object_plan(
     from the LayerPlan alone, and `walk_output` serialises THIS object plan against that
     store — every field (a plan step or a resolver-adapter ResolveStep) reads its
     already-batched value column from the store, read uniformly.
+
+    `parent_store` is forwarded GENERICALLY to `run_layer` as the request-state seam (see
+    its docstring): additional `step.id -> column` boundary seeds shared by P2.5 child-layer
+    detachment, P5 placeholder-value maps and P7 deferred continuations. Nothing here
+    special-cases a consumer — the dict is the only channel.
     """
-    store = run_layer(context, plan.layer, parents, parent_paths)
+    store = run_layer(context, plan.layer, parents, parent_paths, parent_store)
     if context.is_awaitable(store):
 
         async def after_steps():
@@ -125,6 +151,28 @@ def execute_object_plan(
 
         return _await_bucket(context, after_steps())
     return walk_output(context, plan, parents, parent_paths, store)
+
+
+def run_child_layer_from_store(context, child_plan, parent_store, index_map, child_paths):
+    """Run a child object layer seeded from a parent store column + an index map.
+
+    The decisive simplification P2.5 makes possible: a child object layer is runnable from
+    its parent's value column ALONE, without re-entering the parent walk. `parent_store`
+    holds `child_plan.layer.parent_step.id -> parent value column`; `index_map` (which IS the
+    completion-time `keep_origin`/`origin` scatter list) projects each child-bucket position
+    to its parent-bucket position. The seed list is the parent column projected through the
+    index map, which is element-for-element equal to the transient `keep_objs`/`objs` the
+    inline completion path materialises — so the IDENTICAL child step DAG runs over the
+    IDENTICAL bucket.
+
+    The projection reads an ALREADY-RESOLVED column (the caller projects after
+    `resolve_awaitable_values`), so async ordering is unchanged. Returns the child store /
+    completion list exactly as `execute_object_plan` would, leaving the per-parent scatter
+    back through `index_map` to the caller.
+    """
+    parent_column = parent_store[child_plan.layer.parent_step.id]
+    seed_objs = [parent_column[o] for o in index_map]
+    return execute_object_plan(context, child_plan, seed_objs, child_paths)
 
 
 def _await_bucket(context, awaitable):
