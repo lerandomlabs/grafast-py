@@ -153,6 +153,71 @@ function objectsFor(queryPlans) {
   };
 }
 
+// ----------------------------------------------------- polymorphism (abstract types)
+// Twin of corpus.py SDL_POLY/FEED/poly_objects_for. Interface + union over a list of
+// mixed concrete types; each concrete type loads a DIFFERENT relation, so a query
+// selecting both fires each loader once per concrete-type group.
+const SDL_POLY = /* GraphQL */ `
+  type Query {
+    feed: [Content!]!
+    item(id: Int!): Content
+    search: [Hit!]!
+  }
+  interface Content { id: Int! }
+  type Article implements Content { id: Int! headline: String! author: Author }
+  type Photo implements Content { id: Int! caption: String! tags: [Tag!]! }
+  type Author { id: Int! name: String! }
+  type Tag { id: Int! label: String! }
+  union Hit = Article | Photo
+`;
+
+const FEED = [
+  { id: 1, kind: "article", __typename: "Article", headline: "H1", authorId: 1 },
+  { id: 2, kind: "photo", __typename: "Photo", caption: "C2" },
+  { id: 3, kind: "article", __typename: "Article", headline: "H3", authorId: 2 },
+  { id: 4, kind: "photo", __typename: "Photo", caption: "C4" },
+  { id: 5, kind: "article", __typename: "Article", headline: "H5", authorId: 1 },
+];
+const FEED_BY_ID = { 1: FEED[0], 2: FEED[1], 3: FEED[2], 4: FEED[3], 5: FEED[4] };
+
+const TAGS_BY_PHOTO = {
+  2: [{ id: 201, label: "sky" }],
+  4: [{ id: 202, label: "sea" }, { id: 203, label: "sun" }],
+};
+
+LOADERS.loadTagsByPhoto = (ids) => ids.map((id) => TAGS_BY_PHOTO[id] ?? []);
+
+function polyObjectsFor(queryPlans) {
+  return {
+    Query: { plans: queryPlans },
+    Article: {
+      plans: {
+        id: leaf("id"),
+        headline: leaf("headline"),
+        author: ($p) => loadOne(access($p, "authorId"), LOADERS.loadAuthors),
+      },
+    },
+    Photo: {
+      plans: {
+        id: leaf("id"),
+        caption: leaf("caption"),
+        tags: ($p) => loadMany(access($p, "id"), LOADERS.loadTagsByPhoto),
+      },
+    },
+    Author: { plans: { id: leaf("id"), name: leaf("name") } },
+    Tag: { plans: { id: leaf("id"), label: leaf("label") } },
+  };
+}
+
+// resolveType bridges (twin of corpus.py POLY_TYPE_RESOLVERS): interface by `kind`
+// discriminator, union by `__typename` tag.
+const POLY_INTERFACES = {
+  Content: { resolveType: (obj) => ({ article: "Article", photo: "Photo" })[obj.kind] },
+};
+const POLY_UNIONS = {
+  Hit: { resolveType: (obj) => obj.__typename },
+};
+
 // ----------------------------------------------------------------- the fixtures
 export const FIXTURES = [
   {
@@ -374,6 +439,49 @@ export const FIXTURES = [
         }),
     }),
     query: `{ boom }`,
+    variables: {},
+  },
+  // ---- polymorphism: interface/union batching over mixed concrete-type lists ----
+  {
+    name: "iface_list_typename",
+    sdl: SDL_POLY,
+    plans: polyObjectsFor({ feed: () => constant(FEED) }),
+    interfaces: POLY_INTERFACES,
+    query: `{ feed { __typename id } }`,
+    variables: {},
+  },
+  {
+    name: "iface_list_relation_one_type",
+    sdl: SDL_POLY,
+    plans: polyObjectsFor({ feed: () => constant(FEED) }),
+    interfaces: POLY_INTERFACES,
+    query: `{ feed { ... on Photo { tags { label } } } }`,
+    variables: {},
+  },
+  {
+    name: "iface_list_relation_both_types",
+    sdl: SDL_POLY,
+    plans: polyObjectsFor({ feed: () => constant(FEED) }),
+    interfaces: POLY_INTERFACES,
+    query: `{ feed { id ... on Article { author { name } } ... on Photo { tags { label } } } }`,
+    variables: {},
+  },
+  {
+    name: "iface_single_relation",
+    sdl: SDL_POLY,
+    plans: polyObjectsFor({
+      item: (_p, args) => lambda(args.getRaw("id"), (id) => FEED_BY_ID[id] ?? null),
+    }),
+    interfaces: POLY_INTERFACES,
+    query: `{ item(id: 1) { ... on Article { author { name } } } }`,
+    variables: {},
+  },
+  {
+    name: "union_list_relation_both",
+    sdl: SDL_POLY,
+    plans: polyObjectsFor({ search: () => constant(FEED) }),
+    unions: POLY_UNIONS,
+    query: `{ search { ... on Article { author { name } } ... on Photo { tags { label } } } }`,
     variables: {},
   },
 ];

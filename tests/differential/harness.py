@@ -43,7 +43,9 @@ def run_fixture(fixture: Dict[str, Any]) -> Dict[str, Any]:
     for name, fn in originals.items():
         LOADERS[name] = make_wrapper(name, fn)
     try:
-        schema = make_grafast_schema(fixture["sdl"], fixture["plans"])
+        schema = make_grafast_schema(
+            fixture["sdl"], fixture["plans"], type_resolvers=fixture.get("type_resolvers")
+        )
         result = execute(
             schema,
             parse(fixture["query"]),

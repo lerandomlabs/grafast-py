@@ -35,6 +35,8 @@ async function runFixture(fixture) {
     const schema = makeGrafastSchema({
       typeDefs: fixture.sdl,
       objects: fixture.plans,
+      ...(fixture.interfaces ? { interfaces: fixture.interfaces } : {}),
+      ...(fixture.unions ? { unions: fixture.unions } : {}),
     });
     const result = await grafast({
       schema,
