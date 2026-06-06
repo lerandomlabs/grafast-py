@@ -21,6 +21,7 @@ from grafast_py.dag import (
     _collapse_chain,
     _compose_remaps,
     order_steps,
+    order_steps_within,
 )
 from grafast_py.step_model import Step, run_steps
 
@@ -221,7 +222,6 @@ def test_tree_shake_force_kept_write_actually_runs_for_effect():
     writes: List[Any] = []
     plan = Plan()
     root = plan.add_step(RootStep())
-    root.seed([{"id": 7}])
     value_source = plan.add_step(AccessStep(root, ["id"]))
     plan.add_step(WriteStep(value_source, writes))
     consumed = plan.add_step(ConstantStep(1))
@@ -233,8 +233,14 @@ def test_tree_shake_force_kept_write_actually_runs_for_effect():
     assert writes == [], "the write ran without any run target — test is not isolating it"
 
     # the fix: run the consumed roots PLUS the reported orphan (what finalize attaches as
-    # the bucket's effect step) — now the write executes for effect.
-    run_steps(1, order_steps([consumed, *orphaned]), never_awaitable)
+    # the bucket's effect step) — now the write executes for effect. Seed the root boundary
+    # the way the executor does (pre-populate root.id, exclude it from the ordered list).
+    run_steps(
+        1,
+        order_steps_within([consumed, *orphaned], {root.id}),
+        never_awaitable,
+        seed={root.id: [{"id": 7}]},
+    )
     assert writes == [[7]], (
         "the force-kept orphaned write did not run for effect — its write was lost"
     )

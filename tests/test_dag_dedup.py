@@ -9,7 +9,7 @@ key against the same loader collapsing to a single step.
 from typing import Any, List
 
 from grafast_py.core_steps import AccessStep, ConstantStep, LoadOneStep, RootStep
-from grafast_py.dag import Plan, order_steps
+from grafast_py.dag import Plan, order_steps, order_steps_within
 from grafast_py.step_model import run_steps
 
 
@@ -72,9 +72,12 @@ def test_dedup_merges_two_loaders_over_the_same_key_and_loader():
 
     # run the deduped DAG and confirm a single batch call
     survivor = remap[load1.id]
-    root.seed([{"id": 7}, {"id": 8}])
-    ordered = order_steps([survivor])
-    results = run_steps(2, ordered, never_awaitable)
+    # seed the root boundary the way the executor does: pre-populate root.id and
+    # exclude it from the ordered list (its column is given, never executed).
+    ordered = order_steps_within([survivor], {root.id})
+    results = run_steps(
+        2, ordered, never_awaitable, seed={root.id: [{"id": 7}, {"id": 8}]}
+    )
     assert results[survivor.id] == [7, 8]
     assert calls["n"] == 1
 
