@@ -30,6 +30,7 @@ from sqlalchemy.sql.elements import BindParameter
 
 from ..config import log
 from ..step_model import Step
+from .conditions import Condition, compile_condition
 from .executor import current_pg_request
 from .ordering import OrderTerm
 
@@ -166,6 +167,17 @@ class PgCustomizable(Step):
         self.where_predicates.append(check_predicate(predicate))
         self._signature_cache = None
 
+    def where_tree(self, condition: "Condition") -> None:
+        """Compile a structured filter :class:`Condition` and AND it onto the batched WHERE.
+
+        A thin adaptor: it compiles the condition tree to a Core boolean predicate and
+        folds it via :meth:`add_where`, so a compiled condition is JUST another peer in
+        ``where_predicates``. It therefore inherits the value-discriminated dedup of
+        :func:`predicate_key` unchanged — no new dedup discriminator, no skeleton change —
+        and runs the same :func:`check_predicate` validation as a hand-built ``.where()``.
+        """
+        self.add_where(compile_condition(condition))
+
     def builder(self) -> "PgSelectQueryBuilder":
         """The host-facing query-level customization wrapper over this step."""
         return PgSelectQueryBuilder(self)
@@ -217,6 +229,17 @@ class PgSelectQueryBuilder:
     def where(self, predicate: ColumnElement) -> "PgSelectQueryBuilder":
         """AND a UNIFORM Core predicate onto the batched WHERE (raw string fails loud)."""
         self._step.add_where(check_predicate(predicate))
+        return self
+
+    def where_tree(self, condition: Condition) -> "PgSelectQueryBuilder":
+        """Compile a structured filter :class:`Condition` and AND it onto the batched WHERE.
+
+        The structured-filter counterpart to :meth:`where`: it hands the condition tree to
+        the wrapped step's :meth:`PgCustomizable.where_tree`, which compiles and folds it
+        through the SAME validated ``add_where`` path — so a compiled filter is just another
+        uniform WHERE peer, value-discriminated in the dedup key like any other predicate.
+        """
+        self._step.where_tree(condition)
         return self
 
     def order_by(self, term: Union[str, OrderTerm]) -> "PgSelectQueryBuilder":

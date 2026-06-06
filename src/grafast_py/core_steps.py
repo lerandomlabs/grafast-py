@@ -18,8 +18,10 @@ two steps with the same class, the same dependency winner ids, the same
 to one, so a value loaded/accessed twice is loaded/accessed once.
 """
 
+import base64
 import inspect
-from typing import Any, Callable, List, Optional, Sequence, Tuple
+import json
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .step_model import Step
 
@@ -385,7 +387,6 @@ class LoadStep(Step):
         # coalesce duplicate keys; remember which entries asked for each unique key.
         unique_keys: List[Any] = []
         slot_for_key: dict[Any, int] = {}
-        unhashable: List[Tuple[int, Any]] = []
         entry_slot: List[int] = [0] * count
         for i in range(count):
             key = keys[i]
@@ -461,6 +462,369 @@ class LoadManyStep(LoadStep):
     """
 
 
+# ------------------------------------------------------------- Relay global ids
+# A Relay global object identifier opaquely names ONE node across the whole schema:
+# its type plus the local id(s) that locate the row within that type. We encode it
+# the way Grafast / graphql-relay do — a base64 of a compact JSON ``[typename, *id]``
+# array — so it stays printable, order-stable, and self-describing (the typename is
+# carried inside the id so ``node(id)`` knows which loader to dispatch to). Pure
+# stdlib (base64 + json): no value here needs a SQL type, so this is core-agnostic and
+# keeps :mod:`core_steps` free of any sqlalchemy import (the hard core invariant).
+
+
+def encode_global_id(typename: str, *id_parts: Any) -> str:
+    """Encode a Relay global id from a typename and its local id part(s).
+
+    The payload is ``[typename, id1, id2, ...]`` JSON-serialised then URL-safe-base64-wrapped
+    (the ``-``/``_`` alphabet, so the id is URL-printable without escaping).
+    Multiple parts support composite primary keys (the per-column values, in order);
+    the single-part case (the common one) is just ``[typename, id]``. The parts must be
+    JSON-native (int/str/bool/None) — the same shape a row's key columns carry — so the
+    id round-trips losslessly through :func:`decode_global_id`.
+    """
+    if not id_parts:
+        raise ValueError(
+            f"cannot encode a global id for {typename!r} with no id parts"
+        )
+    payload = [typename, *id_parts]
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def decode_global_id(global_id: str) -> Tuple[str, Tuple[Any, ...]]:
+    """Decode a Relay global id to ``(typename, id_parts)``; raise LOUDLY on garbage.
+
+    Mirrors :func:`encode_global_id`. A non-string id (``None`` / int / bytes), a malformed
+    base64/JSON body, a non-array payload, or a payload missing the typename + at least one
+    id part is REJECTED with a ``ValueError`` — there is no silent decode-to-empty, so a
+    forged or stale id is surfaced rather than dispatched to the wrong loader. The non-string
+    guard is a ``ValueError`` (not the ``AttributeError`` a bare ``.encode()`` would raise) so
+    a single non-string entry is carried as THAT entry's per-entry error in
+    :meth:`NodeStep.execute` rather than poisoning the whole bucket. Returns the typename and
+    the remaining parts as a tuple (a 1-tuple for the common single-column id).
+    """
+    if not isinstance(global_id, str):
+        raise ValueError(
+            f"malformed global id {global_id!r}: expected a string, got "
+            f"{type(global_id).__name__}"
+        )
+    try:
+        # binascii.Error (bad base64) is a ValueError subclass, so ValueError covers
+        # both the decode and the json.loads failure modes here. altchars=-_ matches the
+        # URL-safe alphabet encode_global_id emits; validate=True rejects stray characters.
+        raw = base64.b64decode(global_id.encode(), altchars=b"-_", validate=True)
+        payload = json.loads(raw.decode())
+    except (ValueError, UnicodeDecodeError) as err:
+        raise ValueError(f"malformed global id {global_id!r}: {err}") from err
+
+    if not isinstance(payload, list) or len(payload) < 2:
+        raise ValueError(
+            f"malformed global id {global_id!r}: expected [typename, id, ...]"
+        )
+    typename, *id_parts = payload
+    if not isinstance(typename, str):
+        raise ValueError(
+            f"malformed global id {global_id!r}: typename is not a string"
+        )
+    return typename, tuple(id_parts)
+
+
+class NodeStep(Step):
+    """Resolve a Relay ``node(id)`` field by decoding the id and dispatching by type.
+
+    One dependency: the per-entry global-id step (dep 0, a string column). At execute
+    time every entry's id is decoded to ``(typename, id_parts)`` and routed to the
+    loader registered for that typename in ``loaders``; each loader is a batch callback
+    with the SAME ``load_fn(keys) -> records`` contract as :class:`LoadOneStep`, so all
+    ids for a given type are loaded in ONE call (the Grafast batching payoff carries
+    through the node interface). Per type the keys are the decoded id parts — the bare
+    value for a single-column id, the tuple for a composite one.
+
+    Routing per type rather than one global loader is what lets ``node`` span many
+    resources: a query selecting nodes of several types issues one batched load PER
+    type, never one-load-per-id. A typename with no registered loader, or an id whose
+    decode fails, is carried as that entry's value (an Exception) so the field completer
+    locates it at the node field's path — it never poisons sibling entries of other
+    types. An async loader (one that returns a coroutine) makes ``execute`` return a
+    coroutine resolving to the per-entry column.
+    """
+
+    is_sync_and_safe = False
+
+    def __init__(
+        self, id_step: Step, loaders: Dict[str, Callable[[List[Any]], Any]]
+    ) -> None:
+        super().__init__()
+        # snapshot the registry so a later mutation of the caller's dict cannot change
+        # which loaders a built plan dispatches to (the plan is immutable once built).
+        self.loaders: Dict[str, Callable[[List[Any]], Any]] = dict(loaders)
+        self.add_dependency(id_step)
+
+    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+        ids = values[0]
+
+        # decode every entry up front, partitioning the bucket by typename so each
+        # type's keys batch into ONE loader call. A poisoned upstream entry or a decode
+        # failure is recorded per-entry and excluded from any batch.
+        per_entry_error: List[Optional[Exception]] = [None] * count
+        keys_by_type: Dict[str, List[Any]] = {}
+        entry_type: List[Optional[str]] = [None] * count
+        for i in range(count):
+            raw = ids[i]
+            if isinstance(raw, Exception):
+                per_entry_error[i] = raw
+                continue
+            try:
+                typename, id_parts = decode_global_id(raw)
+            except ValueError as err:
+                per_entry_error[i] = err
+                continue
+            loader = self.loaders.get(typename)
+            if loader is None:
+                per_entry_error[i] = KeyError(
+                    f"node(id): no loader registered for type {typename!r}"
+                )
+                continue
+            # a single-column id loads under its bare value; a composite id under the
+            # tuple — matching the key shape a per-type loader expects.
+            key = id_parts[0] if len(id_parts) == 1 else id_parts
+            entry_type[i] = typename
+            keys_by_type.setdefault(typename, []).append(key)
+
+        # run each type's loader ONCE over its keys; keep results addressable by
+        # (typename, key) so they scatter back to every entry that asked for them.
+        loaded_by_type: Dict[str, Any] = {}
+        pending_types: List[str] = []
+        for typename, keys in keys_by_type.items():
+            loader = self.loaders[typename]
+            try:
+                result = loader(keys)
+            except Exception as raw_error:  # a type's batch raised → poison ITS entries
+                loaded_by_type[typename] = raw_error
+                continue
+            loaded_by_type[typename] = result
+            if _is_coroutine(result):
+                pending_types.append(typename)
+
+        if pending_types:
+
+            async def finish():
+                for typename in pending_types:
+                    try:
+                        loaded_by_type[typename] = await loaded_by_type[typename]
+                    except Exception as raw_error:
+                        loaded_by_type[typename] = raw_error
+                return self._scatter_nodes(
+                    count, per_entry_error, entry_type,
+                    keys_by_type, loaded_by_type,
+                )
+
+            return finish()
+
+        return self._scatter_nodes(
+            count, per_entry_error, entry_type,
+            keys_by_type, loaded_by_type,
+        )
+
+    def _scatter_nodes(
+        self,
+        count: int,
+        per_entry_error: List[Optional[Exception]],
+        entry_type: List[Optional[str]],
+        keys_by_type: Dict[str, List[Any]],
+        loaded_by_type: Dict[str, Any],
+    ) -> List[Any]:
+        """Align each type's batch result back to the entries it was loaded for.
+
+        A type's result is asserted 1:1 with the keys passed to its loader (the
+        :class:`LoadStep` alignment contract). Keys are appended in entry order, so the
+        Nth entry of a given type takes the Nth result for that type; the running
+        ``next_pos`` cursor walks entries in order to reproduce that alignment. An entry
+        whose decode/dispatch failed earlier carries its recorded Exception, and an
+        entry whose type's batch raised carries that batch error.
+        """
+        for typename, keys in keys_by_type.items():
+            loaded = loaded_by_type[typename]
+            if isinstance(loaded, Exception):
+                continue  # whole-type failure: handled per entry below
+            if len(loaded) != len(keys):
+                raise AssertionError(
+                    f"node(id) loader for {typename!r} returned {len(loaded)} results"
+                    f" for {len(keys)} keys"
+                )
+
+        next_pos: Dict[str, int] = {t: 0 for t in keys_by_type}
+        out: List[Any] = []
+        for i in range(count):
+            error = per_entry_error[i]
+            if error is not None:
+                out.append(error)
+                continue
+            typename = entry_type[i]
+            loaded = loaded_by_type[typename]
+            if isinstance(loaded, Exception):
+                out.append(loaded)
+                continue
+            pos = next_pos[typename]
+            next_pos[typename] = pos + 1
+            out.append(loaded[pos])
+        return out
+
+    @property
+    def peer_key(self) -> str:
+        # the registered loaders fix which rows each id resolves to, so two node steps
+        # merge only when they dispatch over the SAME loader set (by identity, like
+        # LoadStep keys on load_fn identity). Type order is irrelevant — sort it.
+        loader_ids = tuple(
+            (typename, id(fn)) for typename, fn in sorted(self.loaders.items())
+        )
+        return f"node|{loader_ids!r}"
+
+    def dedup_params(self) -> Tuple[Any, ...]:
+        return tuple(
+            (typename, id(fn)) for typename, fn in sorted(self.loaders.items())
+        )
+
+
+# ---------------------------------------------------------- list-transform steps
+# These reshape the per-entry LIST produced by a list-producing step (a loadMany, a
+# list_step, an each, or any step whose column entries are lists) WITHOUT a round trip
+# to the source: filter/first/last/reverse run in one pass over the already-materialised
+# per-entry lists. They mirror Grafast's ``listTransform`` family (``filter`` / ``first``
+# / ``last`` / ``reverse``) and stay core-agnostic — the predicate is a plain Python
+# callable, never compiled to SQL. A non-list entry (None or an upstream Exception) is
+# passed through untouched so a missing list or a poisoned upstream is not masked.
+
+
+class FilterStep(Step):
+    """Keep only the per-entry list items for which ``predicate(item)`` is truthy.
+
+    One dependency: the list-producing step (dep 0). ``execute`` filters each entry's
+    list in one pass; a ``None`` entry stays ``None`` and an upstream Exception is
+    passed through. A predicate that RAISES for an item is caught PER ENTRY and carried
+    as that entry's value (the completer locates it at the field's path), so one bad
+    entry never poisons the whole bucket — mirroring :class:`LambdaStep`. Dedup is by
+    predicate identity (a captured closure is unique), like :class:`LambdaStep`.
+    """
+
+    is_sync_and_safe = True
+
+    def __init__(self, list_step: Step, predicate: Callable[[Any], bool]) -> None:
+        super().__init__()
+        self.predicate = predicate
+        self.add_dependency(list_step)
+
+    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+        predicate = self.predicate
+        col = values[0]
+        out: List[Any] = []
+        for i in range(count):
+            entry = col[i]
+            if entry is None or isinstance(entry, Exception):
+                out.append(entry)
+                continue
+            try:
+                out.append([item for item in entry if predicate(item)])
+            except Exception as raw_error:  # predicate raised → carry as THIS entry's value
+                out.append(raw_error)
+        return out
+
+    @property
+    def peer_key(self) -> str:
+        return f"filter|{id(self.predicate)}"
+
+    def dedup_params(self) -> Tuple[Any, ...]:
+        return (id(self.predicate),)
+
+
+class FirstStep(Step):
+    """Take the FIRST item of each entry's list (or ``None`` when empty/absent).
+
+    One dependency: the list-producing step (dep 0). The ``connection.edges.node`` and
+    ``edge.node`` plumbing aside, this is the plain ``first`` transform: it reduces a
+    list column to a scalar column. Two ``first`` steps over the same list dedup to one.
+    """
+
+    is_sync_and_safe = True
+
+    def __init__(self, list_step: Step) -> None:
+        super().__init__()
+        self.add_dependency(list_step)
+
+    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+        col = values[0]
+        out: List[Any] = []
+        for i in range(count):
+            entry = col[i]
+            if isinstance(entry, Exception):
+                out.append(entry)
+                continue
+            out.append(entry[0] if entry else None)
+        return out
+
+    @property
+    def peer_key(self) -> str:
+        return "first"
+
+
+class LastStep(Step):
+    """Take the LAST item of each entry's list (or ``None`` when empty/absent).
+
+    The mirror of :class:`FirstStep`. One dependency: the list-producing step (dep 0).
+    """
+
+    is_sync_and_safe = True
+
+    def __init__(self, list_step: Step) -> None:
+        super().__init__()
+        self.add_dependency(list_step)
+
+    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+        col = values[0]
+        out: List[Any] = []
+        for i in range(count):
+            entry = col[i]
+            if isinstance(entry, Exception):
+                out.append(entry)
+                continue
+            out.append(entry[-1] if entry else None)
+        return out
+
+    @property
+    def peer_key(self) -> str:
+        return "last"
+
+
+class ReverseStep(Step):
+    """Reverse each entry's list in place-of-copy (a ``None`` entry stays ``None``).
+
+    One dependency: the list-producing step (dep 0). Returns a NEW reversed list per
+    entry (the source column is never mutated). Two ``reverse`` steps over the same list
+    dedup to one.
+    """
+
+    is_sync_and_safe = True
+
+    def __init__(self, list_step: Step) -> None:
+        super().__init__()
+        self.add_dependency(list_step)
+
+    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+        col = values[0]
+        out: List[Any] = []
+        for i in range(count):
+            entry = col[i]
+            if entry is None or isinstance(entry, Exception):
+                out.append(entry)
+                continue
+            out.append(list(reversed(entry)))
+        return out
+
+    @property
+    def peer_key(self) -> str:
+        return "reverse"
+
+
 def _is_coroutine(value: Any) -> bool:
     """Awaitable predicate used by transient sub-DAG runs (EachStep, loaders)."""
     return inspect.isawaitable(value)
@@ -510,6 +874,34 @@ def load_many(spec: Step, load_fn: Callable[[List[Any]], Any]) -> LoadManyStep:
     return LoadManyStep(spec, load_fn)
 
 
+def node(
+    id_step: Step, loaders: Dict[str, Callable[[List[Any]], Any]]
+) -> NodeStep:
+    """Resolve a Relay ``node(id)`` field via a per-typename loader registry.
+
+    ``id_step`` produces the per-entry global id (string); ``loaders`` maps a typename
+    to its batch load callback (the :class:`LoadOneStep` ``load_fn(keys) -> records``
+    contract). See :class:`NodeStep`.
+    """
+    return NodeStep(id_step, loaders)
+
+
+def filter_step(list_step: Step, predicate: Callable[[Any], bool]) -> FilterStep:
+    return FilterStep(list_step, predicate)
+
+
+def first_step(list_step: Step) -> FirstStep:
+    return FirstStep(list_step)
+
+
+def last_step(list_step: Step) -> LastStep:
+    return LastStep(list_step)
+
+
+def reverse_step(list_step: Step) -> ReverseStep:
+    return ReverseStep(list_step)
+
+
 __all__ = [
     "ConstantStep",
     "AccessStep",
@@ -522,6 +914,11 @@ __all__ = [
     "LoadStep",
     "LoadOneStep",
     "LoadManyStep",
+    "NodeStep",
+    "FilterStep",
+    "FirstStep",
+    "LastStep",
+    "ReverseStep",
     "get_in",
     "constant",
     "access",
@@ -532,4 +929,11 @@ __all__ = [
     "each",
     "load_one",
     "load_many",
+    "encode_global_id",
+    "decode_global_id",
+    "node",
+    "filter_step",
+    "first_step",
+    "last_step",
+    "reverse_step",
 ]

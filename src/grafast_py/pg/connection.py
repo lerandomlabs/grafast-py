@@ -13,16 +13,31 @@ only when the selection set asks for it (``needs_total``); being its own query i
 correct even on an EMPTY terminal page. So a connection layer is at most TWO statements
 across all parents — the page query plus the optional count (O(depth)).
 
+DOMAIN AGGREGATES (``sum``/``avg``/``min``/``max``/``count`` over a column, optionally
+GROUPed) are a THIRD optional batched statement built the same way: ``match, <aggs>
+GROUP BY match[, <group_by>]`` (:meth:`PgConnectionStep.build_aggregate_query`). It mirrors
+``build_count_query`` exactly — same key match, same host WHERE predicates (so it AND-s the
+SAME ``where_predicates``, INCLUDING any compiled filter Condition, as the page query),
+WITHOUT the keyset cursor predicate (it aggregates the FULL per-parent set, correct even on
+an empty terminal page). It is issued only when the selection set asks for an aggregate
+(:func:`connection_aggregates`). The aggregate SPEC (which functions over which columns,
+plus the optional extra grouping) folds into the connection dedup key alongside
+``needs_total`` + ``customization_signature`` — two byte-different aggregate statements never
+merge. A connection layer is therefore at most THREE statements across all parents (page +
+optional count + optional aggregate), still O(depth).
+
 Forward paging is ``first``/``after``; reverse is ``last``/``before`` (keyset on the
 reversed order, ``last+1`` then re-reversed in Python). Sub-fields are plain
 :class:`AccessStep` projections into the per-entry dict, and ``edges[].node`` is the row
 dict, so nested relations under a node batch exactly like a plain row.
 """
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from graphql.language import FieldNode, FragmentSpreadNode, InlineFragmentNode
-from sqlalchemy import any_, bindparam, column, func, select, table
+from sqlalchemy import any_, bindparam, column, func, select, table, tuple_
+from sqlalchemy.sql import ColumnElement
 
 from ..core_steps import access
 from ..step_model import Step
@@ -36,6 +51,7 @@ from .cursor import (
 from .executor import current_pg_request
 from .ordering import OrderTerm, normalize_order, order_clauses
 from .resource import PgResource
+from .steps import as_match_columns, grouping_key, normalize_lookup_key
 
 
 def connection_needs_total(info: Any) -> bool:
@@ -73,8 +89,93 @@ def _selects_total(selection_set: Any, fragments: Dict[str, Any]) -> bool:
     return False
 
 
+# The aggregate functions a connection can compute over a per-parent set, mapped to the
+# Core function each emits. ``count`` over a column counts NON-NULL values of it; ``count``
+# with no column is the per-parent row count (count(*) — totalCount already covers the
+# unconditional case, so a column-less ``count`` here is for a filtered/distinct variant a
+# host wires explicitly). The set mirrors Grafast's pgAggregate built-ins.
+AGGREGATE_FUNCTIONS = frozenset({"sum", "avg", "min", "max", "count"})
+
+
+@dataclass(frozen=True)
+class PgAggregate:
+    """One aggregate over a connection's per-parent set: ``<function>(<column>) AS <alias>``.
+
+    ``function`` is one of :data:`AGGREGATE_FUNCTIONS`; ``column`` is the stored column it
+    aggregates (``None`` only for a bare ``count`` -> ``count(*)``); ``alias`` is the output
+    key the aggregate value lands under in the per-parent aggregate dict. The triple is the
+    UNIT the connection dedup key folds over — two aggregate specs differing in any of
+    function / column / alias must not merge — so the dataclass is frozen (hashable) and
+    every field participates in equality.
+    """
+
+    function: str
+    column: Optional[str] = None
+    alias: str = ""
+
+    def __post_init__(self) -> None:
+        if self.function not in AGGREGATE_FUNCTIONS:
+            raise ValueError(
+                f"unsupported aggregate function {self.function!r}; supported: "
+                f"{', '.join(sorted(AGGREGATE_FUNCTIONS))}"
+            )
+        if self.column is None and self.function != "count":
+            raise ValueError(
+                f"aggregate {self.function!r} needs a column (only count may omit one)"
+            )
+        if not self.alias:
+            raise ValueError("aggregate needs an output alias")
+
+    def projection(self) -> ColumnElement:
+        """The labelled Core aggregate expression (``<function>(<column>) AS <alias>``).
+
+        A bare ``count`` (no column) emits ``count(*)``; every other form applies the
+        function to ``column(self.column)``. Projected into the aggregate SELECT alongside
+        the match columns, so each per-parent group carries its aggregate value under
+        ``alias``.
+        """
+        if self.column is None:
+            return func.count().label(self.alias)
+        return getattr(func, self.function)(column(self.column)).label(self.alias)
+
+
+def connection_aggregates(info: Any, aggregate_fields: Mapping[str, PgAggregate]) -> List[PgAggregate]:
+    """The aggregates the connection's selection set asks for (gated, like ``needs_total``).
+
+    ``aggregate_fields`` maps a connection sub-field NAME to the :class:`PgAggregate` it
+    denotes (the host's binding of GraphQL aggregate fields to SQL aggregates). This walks
+    the connection field's own sub-selection — resolving fragment spreads and inline
+    fragments exactly like :func:`connection_needs_total` — and returns the aggregates whose
+    field is selected, in declaration (mapping) order so the spec is deterministic. The plan
+    resolver calls it once to decide whether (and which) aggregate statement is issued, so a
+    connection selecting no aggregate field skips the aggregate query entirely.
+    """
+    fragments = getattr(info, "fragments", {}) or {}
+    selected: set = set()
+    for field_node in info.field_nodes:
+        _collect_aggregate_fields(field_node.selection_set, fragments, selected)
+    return [agg for name, agg in aggregate_fields.items() if name in selected]
+
+
+def _collect_aggregate_fields(
+    selection_set: Any, fragments: Dict[str, Any], selected: set
+) -> None:
+    """Collect the field NAMES selected under a selection set (and its fragments)."""
+    if selection_set is None:
+        return
+    for selection in selection_set.selections:
+        if isinstance(selection, FieldNode):
+            selected.add(selection.name.value)
+        elif isinstance(selection, InlineFragmentNode):
+            _collect_aggregate_fields(selection.selection_set, fragments, selected)
+        elif isinstance(selection, FragmentSpreadNode):
+            fragment = fragments.get(selection.name.value)
+            if fragment is not None:
+                _collect_aggregate_fields(fragment.selection_set, fragments, selected)
+
+
 class PgConnectionStep(PgCustomizable):
-    """Batched Relay connection over a hasMany lookup keyed on ``match_column``.
+    """Batched Relay connection over a hasMany lookup keyed on ``match_columns``.
 
     Host customization: UNIFORM WHERE predicates AND-combined onto the INNER WHERE
     (before ``row_number()`` materialises) — the resource ``select_customizer`` (resolved
@@ -85,7 +186,8 @@ class PgConnectionStep(PgCustomizable):
     Forward paging is ``first``/``after``; reverse paging is ``last``/``before``. Exactly
     one direction is in play per step (a connection field is forward XOR reverse).
     ``needs_total`` (set by the plan resolver from the selection set) gates the separate
-    count aggregate.
+    count aggregate; ``aggregates`` (likewise selection-gated) gates the separate domain
+    aggregate, optionally grouped by ``aggregate_group_by`` beyond the match key.
     """
 
     is_sync_and_safe = False
@@ -94,7 +196,7 @@ class PgConnectionStep(PgCustomizable):
         self,
         resource: PgResource,
         key_step: Step,
-        match_column: str,
+        match: Union[str, Sequence[str]],
         order_by: Sequence[Union[str, OrderTerm]],
         first: Optional[int] = None,
         after: Optional[str] = None,
@@ -102,10 +204,14 @@ class PgConnectionStep(PgCustomizable):
         before: Optional[str] = None,
         order_is_unique: bool = False,
         needs_total: bool = False,
+        aggregates: Sequence[PgAggregate] = (),
+        aggregate_group_by: Sequence[str] = (),
     ) -> None:
         super().__init__()
         self.resource = resource
-        self.match_column = match_column
+        # single column name (fast path) OR a tuple (a COMPOSITE key); the page/count
+        # queries partition+group over the same column(s).
+        self.match_columns: Tuple[str, ...] = as_match_columns(match)
         self.order_is_unique = order_is_unique
         self.order_by: Tuple[OrderTerm, ...] = normalize_order(
             order_by, primary_key=resource.primary_key, order_is_unique=order_is_unique
@@ -114,6 +220,12 @@ class PgConnectionStep(PgCustomizable):
         self.first = first
         self.last = last
         self.needs_total = needs_total
+        # the domain aggregates (selection-gated) and the OPTIONAL extra GROUP BY columns
+        # (beyond the match key, e.g. a per-status sub-total). Stored as tuples so the spec
+        # is hashable and folds straight into the dedup key; empty ``aggregates`` means no
+        # aggregate statement is issued.
+        self.aggregates: Tuple[PgAggregate, ...] = tuple(aggregates)
+        self.aggregate_group_by: Tuple[str, ...] = tuple(aggregate_group_by)
         # A connection pages forward XOR reverse; supplying BOTH a forward (first/after)
         # and a reverse (last/before) arg is undefined under the Relay spec. Reject it
         # loudly at construction rather than derive `reverse` loosely and silently page one
@@ -139,6 +251,38 @@ class PgConnectionStep(PgCustomizable):
         # dep 0 is the key step; values[0] is the key column at execute time.
         self.add_dependency(key_step)
         self.seed_resource_customization(resource)
+
+    @property
+    def is_composite(self) -> bool:
+        """Whether the match key spans more than one column (the tuple-IN path)."""
+        return len(self.match_columns) > 1
+
+    @property
+    def match_column(self) -> str:
+        """The lone match column (single-column fast path; raises if composite)."""
+        if self.is_composite:
+            raise ValueError(
+                f"connection on {self.resource.name!r} is composite "
+                f"({self.match_columns}); use match_columns"
+            )
+        return self.match_columns[0]
+
+    def match_predicate(self, unique_keys: Optional[List[Any]] = None):
+        """The batched key-match predicate: ``= ANY(:keys)`` (single) or tuple-IN (composite).
+
+        Mirrors :meth:`PgSelectStep.match_predicate`: the composite tuple-IN bakes the
+        list-of-tuples onto the bindparam at build time so the RawExecutor postcompile path
+        can expand it; the single fast path keeps ``= ANY`` ($1::T[]) with ``keys`` bound at
+        execute time and ignores ``unique_keys``.
+        """
+        if not self.is_composite:
+            return column(self.match_columns[0]) == any_(
+                bindparam("keys", expanding=False)
+            )
+        cols = [column(c) for c in self.match_columns]
+        return tuple_(*cols).in_(
+            bindparam("keys", value=unique_keys or [], expanding=True)
+        )
 
     def _decode_cursors(self) -> None:
         """Decode the after/before cursors LOUDLY against the CURRENT ``self.order_by``.
@@ -236,21 +380,23 @@ class PgConnectionStep(PgCustomizable):
             predicates.append(cursor)
         return predicates
 
-    def build_page_query(self):
+    def build_page_query(self, unique_keys: Optional[List[Any]] = None):
         """Build the batched window-sliced PAGE SELECT (ONE statement across parents).
 
-        The inner query filters ``match = ANY(:keys)`` AND the host predicates AND the
-        keyset cursor predicate, then numbers each parent's rows ``row_number() OVER
-        (PARTITION BY match ORDER BY <effective order>) AS __rn``. The outer keeps only
-        ``__rn <= :page_limit`` (page size + 1 extra, per partition) and orders by match
-        then ``__rn`` so each parent's page rows come back in window order. Only the page
-        rows (plus the one-extra probe) return — the slice is IN SQL.
+        The inner query filters the key match (``= ANY(:keys)`` single / tuple-IN
+        composite) AND the host predicates AND the keyset cursor predicate, then numbers
+        each parent's rows ``row_number() OVER (PARTITION BY match ORDER BY <effective
+        order>) AS __rn``. The outer keeps only ``__rn <= :page_limit`` (page size + 1
+        extra, per partition) and orders by match column(s) then ``__rn`` so each parent's
+        page rows come back in window order. Only the page rows (plus the one-extra probe)
+        return — the slice is IN SQL. ``unique_keys`` supplies the composite IN list at
+        build time (ignored by the single fast path).
 
         Computed attributes (``expression.label(name)`` over the table columns) are
         projected in the INNER (table-scope) select and re-selected by label in the outer,
         so each node row carries the computed value with no extra statement.
         """
-        match = column(self.match_column)
+        match_cols = [column(c) for c in self.match_columns]
         cols = [column(c) for c in self.resource.columns]
         computed = self.resource.computed_projections()
         computed_names = [c.name for c in computed]
@@ -262,7 +408,7 @@ class PgConnectionStep(PgCustomizable):
         rn = (
             func.row_number()
             .over(
-                partition_by=match,
+                partition_by=match_cols,
                 order_by=order_clauses(self.effective_order()),
             )
             .label("__rn")
@@ -270,7 +416,7 @@ class PgConnectionStep(PgCustomizable):
         inner = (
             select(*cols, *computed, rn)
             .select_from(tbl)
-            .where(match == any_(bindparam("keys", expanding=False)))
+            .where(self.match_predicate(unique_keys))
         )
         for predicate in self.inner_predicates():
             inner = inner.where(predicate)
@@ -279,33 +425,84 @@ class PgConnectionStep(PgCustomizable):
         outer_cols = [inner.c[c] for c in self.resource.columns] + [
             inner.c[name] for name in computed_names
         ]
+        # order by every match column (the partition key) then __rn so each parent's page
+        # is contiguous and in window order.
         stmt = select(*outer_cols).order_by(
-            inner.c[self.match_column], inner.c["__rn"]
+            *[inner.c[c] for c in self.match_columns], inner.c["__rn"]
         )
         if self.page_limit() is not None:
             # per-partition upper bound: __rn <= page_limit (bound param; page + 1 extra).
             stmt = stmt.where(inner.c["__rn"] <= bindparam("page_limit"))
         return stmt
 
-    def build_count_query(self):
+    def build_count_query(self, unique_keys: Optional[List[Any]] = None):
         """Build the SEPARATE batched total aggregate: ``match, count(*) GROUP BY match``.
 
         Counts the FULL per-parent set (NOT affected by first/after) under the same host
         customization predicates as the page — but WITHOUT the keyset cursor predicate, so
-        the total is the parent's whole count even on an empty terminal page. One statement
-        for the whole bucket.
+        the total is the parent's whole count even on an empty terminal page. The match
+        column(s) are projected each under their own name (so a composite key reconstructs
+        its tuple) and grouped over; one statement for the whole bucket. ``unique_keys``
+        supplies the composite IN list at build time.
         """
-        match = column(self.match_column)
+        match_cols = [column(c) for c in self.match_columns]
         tbl = table(
             self.resource.table,
             *[column(c) for c in self.resource.columns],
             schema=self.resource.schema,
         )
         stmt = (
-            select(match.label("__match"), func.count().label("__total"))
+            select(*match_cols, func.count().label("__total"))
             .select_from(tbl)
-            .where(match == any_(bindparam("keys", expanding=False)))
-            .group_by(match)
+            .where(self.match_predicate(unique_keys))
+            .group_by(*match_cols)
+        )
+        for predicate in self.where_predicates:
+            stmt = stmt.where(predicate)
+        return stmt
+
+    @property
+    def has_aggregates(self) -> bool:
+        """Whether any domain aggregate is selected (gates the aggregate statement)."""
+        return bool(self.aggregates)
+
+    def aggregate_spec(self) -> Tuple[Tuple[str, Optional[str], str], ...]:
+        """The aggregate SPEC as a hashable tuple of ``(function, column, alias)`` triples.
+
+        The dedup discriminator for the aggregate statement: two connections whose
+        aggregates differ in any function / column / alias — or whose ordering differs —
+        produce DIFFERENT specs, so byte-different aggregate SQL never merges. Folded into
+        both ``peer_key`` and ``dedup_params`` alongside the extra grouping.
+        """
+        return tuple((a.function, a.column, a.alias) for a in self.aggregates)
+
+    def build_aggregate_query(self, unique_keys: Optional[List[Any]] = None):
+        """Build the SEPARATE batched DOMAIN aggregate, mirroring :meth:`build_count_query`.
+
+        ``match[, <group_by>], <agg projections> GROUP BY match[, <group_by>]`` over the
+        FULL per-parent set: the SAME key match (single ``= ANY`` / composite tuple-IN) and
+        the SAME host ``where_predicates`` (INCLUDING any compiled filter Condition) as the
+        page query, but WITHOUT the keyset cursor predicate — so the aggregate covers the
+        parent's whole set, correct even on an empty terminal page (exactly like the count).
+        The match column(s) are projected each under their own name (so a composite key
+        reconstructs its tuple); the optional ``aggregate_group_by`` columns are added to
+        BOTH the projection and the GROUP BY, so a grouped aggregate yields one row per
+        ``(match, group_by...)`` bucket. ``unique_keys`` supplies the composite IN list at
+        build time.
+        """
+        match_cols = [column(c) for c in self.match_columns]
+        group_cols = [column(c) for c in self.aggregate_group_by]
+        projections = [a.projection() for a in self.aggregates]
+        tbl = table(
+            self.resource.table,
+            *[column(c) for c in self.resource.columns],
+            schema=self.resource.schema,
+        )
+        stmt = (
+            select(*match_cols, *group_cols, *projections)
+            .select_from(tbl)
+            .where(self.match_predicate(unique_keys))
+            .group_by(*match_cols, *group_cols)
         )
         for predicate in self.where_predicates:
             stmt = stmt.where(predicate)
@@ -313,36 +510,88 @@ class PgConnectionStep(PgCustomizable):
 
     # ------------------------------------------------------------------- execute
 
+    def count_row_key(self, row: Dict[str, Any]) -> Any:
+        """The per-parent total's lookup key from a count row: scalar or column tuple."""
+        return grouping_key(row, self.match_columns)
+
+    def aggregate_values(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """The aggregate alias -> value mapping carried by one aggregate row.
+
+        Projects out only the aggregate aliases (NOT the match / group_by key columns), so a
+        per-parent aggregate dict carries just the computed values under their output keys. A
+        ``min`` / ``max`` returns a value OF its source column's type, so it rides the SAME
+        resource codec decode a page node gets (a min/max over a codec'd range/enum/timestamptz
+        column is decoded, not surfaced raw). ``sum`` / ``avg`` / ``count`` produce a numeric
+        result that is NOT the column's type, so they pass through undecoded.
+        """
+        return {
+            a.alias: (
+                self.resource.decode_value(a.column, row[a.alias])
+                if a.function in ("min", "max") and a.column is not None
+                else row[a.alias]
+            )
+            for a in self.aggregates
+        }
+
     async def run_queries(
         self, unique_keys: List[Any]
-    ) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
-        """Run the page query (always) and the count query (iff ``needs_total``).
+    ) -> Tuple[List[Dict[str, Any]], Dict[Any, int], Dict[Any, List[Dict[str, Any]]]]:
+        """Run the page query (always), the count (iff ``needs_total``), the aggregate (iff selected).
 
-        Returns the page rows and a per-parent ``match -> total`` map (empty when
-        ``needs_total`` is unset — totalCount then reports 0 for unselected counts).
+        Returns the page rows, a per-parent ``match -> total`` map (empty when ``needs_total``
+        is unset — totalCount then reports 0 for unselected counts), and a per-parent
+        ``match -> [aggregate row dicts]`` map (empty when no aggregate is selected; one entry
+        per GROUP BY bucket, so an UNGROUPED aggregate is a single-element list). The
+        single-column path binds ``keys`` at execute time; the composite path bakes the IN
+        list at build time, so it passes no ``keys`` param. The aggregate is a THIRD statement
+        at most — issued only when the selection set asks for one.
         """
         request = current_pg_request()
-        params: Dict[str, Any] = {"keys": unique_keys}
+        params: Dict[str, Any] = {}
+        if not self.is_composite:
+            params["keys"] = unique_keys
         if self.page_limit() is not None:
             params["page_limit"] = self.page_limit()
         rows = await request.executor.run(
-            self.build_page_query(), params, settings=request.settings
+            self.build_page_query(unique_keys), params, settings=request.settings
         )
 
         totals: Dict[Any, int] = {}
         if self.needs_total:
+            count_params: Dict[str, Any] = {}
+            if not self.is_composite:
+                count_params["keys"] = unique_keys
             count_rows = await request.executor.run(
-                self.build_count_query(),
-                {"keys": unique_keys},
+                self.build_count_query(unique_keys),
+                count_params,
                 settings=request.settings,
             )
-            totals = {r["__match"]: r["__total"] for r in count_rows}
-        return rows, totals
+            totals = {self.count_row_key(r): r["__total"] for r in count_rows}
+
+        aggregates: Dict[Any, List[Dict[str, Any]]] = {}
+        if self.has_aggregates:
+            agg_params: Dict[str, Any] = {}
+            if not self.is_composite:
+                agg_params["keys"] = unique_keys
+            agg_rows = await request.executor.run(
+                self.build_aggregate_query(unique_keys),
+                agg_params,
+                settings=request.settings,
+            )
+            # group the aggregate rows under the MATCH key (the scatter key); an extra
+            # GROUP BY yields several rows per parent (one bucket each), an ungrouped
+            # aggregate exactly one.
+            for row in agg_rows:
+                aggregates.setdefault(self.count_row_key(row), []).append(row)
+        return rows, totals, aggregates
 
     def build_connection(
-        self, rows: List[Dict[str, Any]], total: int
+        self,
+        rows: List[Dict[str, Any]],
+        total: int,
+        aggregate_rows: Sequence[Dict[str, Any]] = (),
     ) -> Dict[str, Any]:
-        """Assemble one parent's page rows + total into a Relay connection dict.
+        """Assemble one parent's page rows + total + aggregates into a Relay connection dict.
 
         ``rows`` are this parent's page rows in window order (already filtered + limited
         in SQL). With the one-extra probe present (``len(rows) > size``), the extra row is
@@ -350,6 +599,13 @@ class PgConnectionStep(PgCustomizable):
         restore the requested order; ``hasNextPage``/``hasPreviousPage`` are assigned per
         direction. ``total`` is the full per-parent count (from the separate aggregate),
         so it is correct even when the page is empty.
+
+        ``aggregate_rows`` are this parent's rows from the SEPARATE aggregate statement (one
+        per GROUP BY bucket; empty when no aggregate is selected). When ungrouped, the lone
+        row's aggregate values are surfaced flat under ``aggregates``; with an extra GROUP BY
+        each bucket's group_by key columns AND aggregate values are surfaced under
+        ``aggregateGroups``. Both are absent (``None``) when no aggregate is selected, so an
+        unaggregated connection is byte-identical to before.
         """
         size = self.last if self.reverse else self.first
         has_extra = size is not None and len(rows) > size
@@ -387,28 +643,73 @@ class PgConnectionStep(PgCustomizable):
             "startCursor": edges[0]["cursor"] if edges else None,
             "endCursor": edges[-1]["cursor"] if edges else None,
         }
-        return {
+        connection: Dict[str, Any] = {
             "edges": edges,
             "nodes": nodes,
             "totalCount": total,
             "pageInfo": page_info,
         }
+        if self.has_aggregates:
+            # ungrouped: surface the lone bucket's aggregate values flat under `aggregates`
+            # (an empty per-parent set has NO aggregate row, so sum/avg/min/max are null and
+            # a column-less count is 0 — Postgres elides the GROUP row, we synthesise it).
+            # grouped: one entry per bucket under `aggregateGroups`, each carrying its
+            # group_by key columns plus the aggregate values.
+            if self.aggregate_group_by:
+                # the group-by key columns ride the SAME resource codec decode page nodes get,
+                # so a GROUP BY over a codec'd (enum/range/timestamptz) column surfaces the
+                # decoded key, not the raw asyncpg value — consistent with the node's column.
+                connection["aggregateGroups"] = [
+                    {
+                        **{
+                            c: self.resource.decode_value(c, row[c])
+                            for c in self.aggregate_group_by
+                        },
+                        **self.aggregate_values(row),
+                    }
+                    for row in aggregate_rows
+                ]
+            else:
+                connection["aggregates"] = (
+                    self.aggregate_values(aggregate_rows[0])
+                    if aggregate_rows
+                    else self.empty_aggregates()
+                )
+        return connection
+
+    def empty_aggregates(self) -> Dict[str, Any]:
+        """The aggregate dict for a parent with NO matching rows (the empty-set defaults).
+
+        Postgres returns no GROUP row for an empty set, so the ungrouped aggregate has no
+        row to read; synthesise the SQL-faithful defaults — ANY ``count`` (column-less
+        ``count(*)`` OR ``count(col)``) is 0, since count is the one aggregate immune to the
+        empty-set→NULL rule (it counts rows/non-NULL values and returns bigint 0 over zero
+        rows). Every other aggregate (``sum``/``avg``/``min``/``max``) is the SQL ``NULL`` of
+        an empty aggregate.
+        """
+        return {
+            a.alias: 0 if a.function == "count" else None
+            for a in self.aggregates
+        }
 
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
-        keys = values[0]
+        composite = self.is_composite
+        keys = [normalize_lookup_key(k, composite) for k in values[0]]
         unique_keys = [k for k in dict.fromkeys(keys) if k is not None]
         if not unique_keys:
             empty = self.build_connection([], 0)
             return [dict(empty) for _ in range(count)]
 
         async def run():
-            rows, totals = await self.run_queries(unique_keys)
+            rows, totals, aggregates = await self.run_queries(unique_keys)
             by_key: Dict[Any, List[Dict[str, Any]]] = {}
             for row in rows:
-                by_key.setdefault(row[self.match_column], []).append(row)
+                by_key.setdefault(grouping_key(row, self.match_columns), []).append(row)
             return [
                 self.build_connection(
-                    by_key.get(keys[i], []), totals.get(keys[i], 0)
+                    by_key.get(keys[i], []),
+                    totals.get(keys[i], 0),
+                    aggregates.get(keys[i], []),
                 )
                 for i in range(count)
             ]
@@ -417,17 +718,22 @@ class PgConnectionStep(PgCustomizable):
 
     @property
     def peer_key(self) -> str:
+        # the aggregate spec + extra grouping is APPENDED last (after needs_total +
+        # customization_signature), per the unified APPEND-never-insert convention, so two
+        # connections differing only by which aggregates they compute (or how they group)
+        # never merge — they emit a byte-different aggregate statement.
         return (
-            f"pg_connection|{self.resource.qualified_table}|{self.match_column}"
+            f"pg_connection|{self.resource.qualified_table}|{self.match_columns!r}"
             f"|{self.order_by!r}|{self.first}|{self.last}"
             f"|{self.after_values!r}|{self.before_values!r}|{self.needs_total}"
             f"|{self.customization_signature()!r}"
+            f"|{self.aggregate_spec()!r}|{self.aggregate_group_by!r}"
         )
 
     def dedup_params(self) -> Tuple[Any, ...]:
         return (
             self.resource.qualified_table,
-            self.match_column,
+            self.match_columns,
             self.order_by,
             self.first,
             self.last,
@@ -438,6 +744,11 @@ class PgConnectionStep(PgCustomizable):
             tuple(self.before_values) if self.before_values is not None else None,
             self.needs_total,
             self.customization_signature(),
+            # the aggregate spec + extra grouping fold in last (APPEND, never insert): the
+            # aggregate statement's SQL is determined by which functions over which columns,
+            # plus the GROUP BY, so two specs that differ MUST get different keys.
+            self.aggregate_spec(),
+            self.aggregate_group_by,
         )
 
     def get(self, attr: Any) -> Step:
@@ -458,7 +769,7 @@ def _reverse_nulls(term: OrderTerm) -> Optional[str]:
 def connection(
     resource: PgResource,
     key_step: Step,
-    match_column: str,
+    match: Union[str, Sequence[str]],
     order_by: Sequence[Union[str, OrderTerm]],
     first: Optional[int] = None,
     after: Optional[str] = None,
@@ -466,17 +777,28 @@ def connection(
     before: Optional[str] = None,
     order_is_unique: bool = False,
     needs_total: bool = False,
+    aggregates: Sequence[PgAggregate] = (),
+    aggregate_group_by: Sequence[str] = (),
 ) -> PgConnectionStep:
-    """Plan-helper: a batched, keyset-paged Relay connection over a hasMany lookup."""
+    """Plan-helper: a batched, keyset-paged Relay connection over a hasMany lookup.
+
+    ``match`` is the FK key — a single column name (fast path) or a composite tuple.
+    ``aggregates`` (selection-gated via :func:`connection_aggregates`) requests the separate
+    domain aggregate, optionally grouped by ``aggregate_group_by`` beyond the match key.
+    """
     return PgConnectionStep(
-        resource, key_step, match_column, order_by,
+        resource, key_step, match, order_by,
         first=first, after=after, last=last, before=before,
         order_is_unique=order_is_unique, needs_total=needs_total,
+        aggregates=aggregates, aggregate_group_by=aggregate_group_by,
     )
 
 
 __all__ = [
     "PgConnectionStep",
+    "PgAggregate",
+    "AGGREGATE_FUNCTIONS",
     "connection",
     "connection_needs_total",
+    "connection_aggregates",
 ]
