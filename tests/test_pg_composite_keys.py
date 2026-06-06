@@ -469,7 +469,7 @@ async def test_composite_runs_on_raw_executor_as_expanded_tuple_in():
 
     seen_sql: list[str] = []
 
-    async def run_on_raw_pool(sql_text, positional_params, settings):
+    async def run_on_raw_pool(sql_text, positional_params, settings, commit):
         seen_sql.append(sql_text)
         raw = await engine.raw_connection()
         try:

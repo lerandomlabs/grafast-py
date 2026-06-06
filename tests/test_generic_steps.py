@@ -347,6 +347,18 @@ def test_filter_step_passes_through_none_and_exception_entries():
     assert results[odd.id][2] is err
 
 
+def test_filter_step_predicate_raise_is_carried_per_entry_not_poisoning_the_bucket():
+    """A predicate that raises for one entry's item errors ONLY that entry; siblings complete."""
+    # the predicate reads d["ok"]; entry 1 has an item missing that key -> KeyError.
+    source = SourceStep([[{"ok": True}, {"ok": False}], [{"ok": True}, {"nope": 1}]])
+    kept = FilterStep(source, lambda d: d["ok"])
+    results = run([kept], 2)
+    # entry 0 filters cleanly; entry 1's predicate raise is carried as THAT entry's value,
+    # so the bucket is not poisoned (entry 0 still completed).
+    assert results[kept.id][0] == [{"ok": True}]
+    assert isinstance(results[kept.id][1], KeyError)
+
+
 def test_filter_dedup_same_predicate_peers_different_not():
     """Filter dedup keys on predicate identity (a closure is unique), both directions."""
     pred = lambda v: v > 0  # noqa: E731

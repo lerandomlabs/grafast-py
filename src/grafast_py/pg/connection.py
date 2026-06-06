@@ -242,16 +242,12 @@ class PgConnectionStep(PgCustomizable):
         # reverse paging when last/before is in play; otherwise forward. The guard above
         # ensures the two are mutually exclusive here.
         self.reverse = reverse_arg
-        # decode the cursor LOUDLY against the current order (digest-validated); a cursor
-        # minted under a different ordering — or a garbage cursor — raises at plan time
-        # rather than being silently misapplied. The decoded VALUES are plan-time content
-        # that discriminate the dedup key.
-        self.after_values: Optional[List[Any]] = (
-            decode_keyset_cursor(after, self.order_by) if after else None
-        )
-        self.before_values: Optional[List[Any]] = (
-            decode_keyset_cursor(before, self.order_by) if before else None
-        )
+        # raw cursors are kept so the decode can be RE-RUN whenever the order mutates
+        # (add_order_term); decoding only at construction would seek with stale values
+        # against a changed order.
+        self._after_cursor = after
+        self._before_cursor = before
+        self._decode_cursors()
         # dep 0 is the key step; values[0] is the key column at execute time.
         self.add_dependency(key_step)
         self.seed_resource_customization(resource)
@@ -288,6 +284,28 @@ class PgConnectionStep(PgCustomizable):
             bindparam("keys", value=unique_keys or [], expanding=True)
         )
 
+    def _decode_cursors(self) -> None:
+        """Decode the after/before cursors LOUDLY against the CURRENT ``self.order_by``.
+
+        Run at construction AND again whenever the order is mutated (add_order_term), so
+        the seek values are always validated against the order actually emitted. The decode
+        is digest-validated: a cursor minted under a different ordering — or a garbage
+        cursor — raises a clear "minted for a different ordering" ``ValueError`` at plan
+        time rather than seeking with stale values (an IndexError, or worse a SILENT
+        mis-seek for a same-length order change). The decoded VALUES are plan-time content
+        that discriminate the dedup key.
+        """
+        self.after_values: Optional[List[Any]] = (
+            decode_keyset_cursor(self._after_cursor, self.order_by)
+            if self._after_cursor
+            else None
+        )
+        self.before_values: Optional[List[Any]] = (
+            decode_keyset_cursor(self._before_cursor, self.order_by)
+            if self._before_cursor
+            else None
+        )
+
     def add_order_term(self, term: Union[str, OrderTerm]) -> None:
         """Append a UNIFORM ordering term (re-normalised with the PK tie-break)."""
         existing = list(self.order_by)
@@ -298,6 +316,10 @@ class PgConnectionStep(PgCustomizable):
             order_is_unique=self.order_is_unique,
         )
         self.resource.assert_order_terms_stored(self.order_by)
+        # the order just changed, so any after/before cursor decoded under the OLD order is
+        # now invalid; re-decode against the new order. A now-incompatible cursor (different
+        # digest) is rejected LOUDLY here instead of silently seeking the wrong page.
+        self._decode_cursors()
 
     def set_first(self, first: Optional[int]) -> None:
         """Set the structured per-parent forward page size."""
