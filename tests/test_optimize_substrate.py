@@ -545,7 +545,7 @@ def test_orphaned_write_in_nested_bucket_runs_for_effect():
 
     `inner.tag`'s plan inlines a `ParentKeyedWriteStep` that keys off the `inner` object's
     own bucket parent (the `outer` row), orphaning the write. finalize must attach it to
-    the DEEPEST bucket (the inner one), and `run_bucket_steps` must run it there — over the
+    the DEEPEST bucket (the inner one), and `run_layer` must run it there — over the
     inner bucket's parents, not the root's. The data still returns the inlined constant.
     """
     writes.clear()

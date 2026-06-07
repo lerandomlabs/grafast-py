@@ -118,3 +118,43 @@ def test_finalize_plan_is_idempotent_when_reapplied():
 
     assert plan.steps == steps_before
     assert again == object_plan
+
+
+def test_run_layer_and_walk_output_are_independently_callable():
+    """P2 de-fusion acceptance: execution and serialization are separable.
+
+    `run_layer` reads ONLY the LayerPlan (its boundary + finalize-materialised
+    `ordered_steps`) to produce the bucket store; `walk_output` consumes a store to
+    serialize, with NO dependency on having just run the layer. Composed they equal the
+    fused `execute_object_plan` — proving the split is genuine, not cosmetic. (This is the
+    SHAPE-level detachment P2 delivers; the child layers still run during the output walk's
+    descent — full lifecycle detachment is P2.5.)
+    """
+    from grafast_py.execute import execute_object_plan, run_layer, walk_output
+
+    def people_plan(parent, args, info):
+        return get(parent, "people")
+
+    def name_plan(parent, args, info):
+        return get(parent, "name")
+
+    schema = make_grafast_schema(
+        SDL, {"Query": {"people": people_plan}, "Person": {"name": name_plan}}
+    )
+    ctx, object_plan = build_plan(schema, "{ people { name } }")
+    root_value = {"people": [{"name": "Ann"}, {"name": "Bob"}]}
+
+    # (a) run the root LayerPlan ALONE -> the bucket store. No output walk has happened.
+    store = run_layer(ctx, object_plan.layer, [root_value])
+    assert isinstance(store, dict)
+    assert object_plan.layer.parent_step.id in store
+    for step in object_plan.layer.run_steps:
+        assert step.id in store  # the layer self-describes what it runs
+
+    # (b) walk the OutputPlan against that already-produced store.
+    via_halves = walk_output(ctx, object_plan, [root_value], [None], store)
+
+    # composed, the two halves equal the fused entry point and the expected data.
+    via_fused = execute_object_plan(ctx, object_plan, [root_value], [None])
+    assert via_halves == via_fused
+    assert via_halves == [{"people": [{"name": "Ann"}, {"name": "Bob"}]}]

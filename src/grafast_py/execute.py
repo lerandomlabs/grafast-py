@@ -25,7 +25,7 @@ from graphql.pyutils import Path
 from .bubble import Bubble
 from .completion import NonNullCompleter, complete_values
 from .dag import order_steps_within
-from .plan import FieldPlan, ObjectPlan
+from .plan import FieldPlan, LayerPlan, ObjectPlan
 from .step_model import run_steps
 from .steps import run_resolve_step
 
@@ -48,40 +48,30 @@ def is_live(state: "FieldCompletion", i: int) -> bool:
     return state.bubble[i] is None and state.outputs[i] is not None
 
 
-def run_bucket_steps(context, plan: ObjectPlan, parents: List[Any]):
-    """Run this bucket's plan-resolver step sub-DAG ONCE, seeded by `parents`.
+def run_layer(context, layer: LayerPlan, parents: List[Any]):
+    """Run a LayerPlan's steps ONCE over a bucket of parents -> the bucket store.
 
-    The bucket's parent column is `plan.layer.parent_step`'s output (the operation root, or
-    the enclosing plan field's step). We seed that step id with `parents` and run
-    every plan-field step reachable from it (access / lambda / load / object steps)
-    in dependency order via `run_steps`, pruning the walk at the parent_step boundary
-    so a child bucket reuses — rather than recomputes — its parent's column. The
-    decisive effect: a `loadMany` in this layer sees EVERY key across all `parents` in
-    one `execute`, so its batch callback fires exactly once for the whole bucket.
+    Pure batch-boundary concern: reads ONLY the LayerPlan — its `parent_step` boundary and
+    its finalize-materialised `ordered_steps` — never the output shape. We seed the
+    `parent_step` id with `parents` (the operation root, or the enclosing plan field's
+    column) and run the layer's steps in dependency order via `run_steps`. The decisive
+    effect: a `loadMany` in this layer sees EVERY key across all `parents` in one
+    `execute`, so its batch callback fires exactly once for the whole bucket.
 
-    Returns a dict `step.id -> output column` (or a coroutine resolving to it when an
-    async load is in the sub-DAG), or `None` when the bucket has no plan-field steps
-    (the pure legacy-resolver path).
+    `run_steps` already includes any `effect_steps` an optimizer orphaned (a mutation whose
+    return value was inlined): no field consumes them, so they RUN FOR EFFECT here, their
+    output column discarded but the write executed.
 
-    `plan.layer.effect_steps` are side-effecting steps an optimizer orphaned (a mutation whose
-    return value was inlined): no field consumes them, so they are added to the run
-    targets here to RUN FOR EFFECT in this bucket — their output column is discarded but
-    the write executes. With the default identity optimize `effect_steps` is empty, so
-    the targets and the run reduce to just the plan-field steps.
+    Returns a dict `step.id -> output column` (or a coroutine resolving to it when an async
+    load is in the sub-DAG), or `None` for a bucket with no steps to run (the pure
+    legacy-resolver path, or a boundary-less bucket) — unchanged from before the de-fusion.
     """
-    if plan.layer.parent_step is None:
+    if layer.parent_step is None or not layer.run_steps:
         return None
-    targets = [fp.step for fp in plan.fields if fp.step is not None]
-    targets.extend(plan.layer.effect_steps)
-    if not targets:
-        return None
-
-    boundary = {plan.layer.parent_step.id}
-    ordered = order_steps_within(targets, boundary)
-    seed = {plan.layer.parent_step.id: parents}
+    seed = {layer.parent_step.id: parents}
     return run_steps(
         len(parents),
-        ordered,
+        layer.ordered_steps,
         context.is_awaitable,
         seed=seed,
         on_step_batch=getattr(context, "_grafast_on_step_batch", None),
@@ -94,25 +84,26 @@ def execute_object_plan(
     parents: List[Any],
     parent_paths: List[Path],
 ):
-    """Execute an ObjectPlan over a bucket.
+    """Execute an ObjectPlan over a bucket: run its LayerPlan, then walk its output.
 
     Returns a list (one entry per parent) of either an output dict or a `Bubble`
     (when a non-null subfield nulled that parent). Returns a coroutine resolving
     to that list when any field involves an awaitable.
 
-    The bucket's plan-resolver steps are run ONCE up front (`run_bucket_steps`), and
-    each plan field reads its already-batched value column from `step_columns` instead
-    of re-entering a resolver per parent; legacy fields keep the per-parent adapter.
+    The two halves are DE-FUSED: `run_layer` produces the bucket store (step.id -> column)
+    from the LayerPlan alone, and `walk_output` serialises THIS object plan against that
+    store — each plan field reads its already-batched value column instead of re-entering a
+    resolver per parent; legacy fields keep the per-parent adapter.
     """
-    step_columns = run_bucket_steps(context, plan, parents)
-    if context.is_awaitable(step_columns):
+    store = run_layer(context, plan.layer, parents)
+    if context.is_awaitable(store):
 
         async def after_steps():
-            cols = await step_columns
-            return _complete_bucket(context, plan, parents, parent_paths, cols)
+            cols = await store
+            return walk_output(context, plan, parents, parent_paths, cols)
 
         return _await_bucket(context, after_steps())
-    return _complete_bucket(context, plan, parents, parent_paths, step_columns)
+    return walk_output(context, plan, parents, parent_paths, store)
 
 
 def _await_bucket(context, awaitable):
@@ -127,19 +118,25 @@ def _await_bucket(context, awaitable):
     return run()
 
 
-def _complete_bucket(
+def walk_output(
     context,
     plan: ObjectPlan,
     parents: List[Any],
     parent_paths: List[Path],
-    step_columns: Optional[Dict[int, List[Any]]],
+    store: Optional[Dict[int, List[Any]]],
 ):
+    """Serialise one object plan against an ALREADY-PRODUCED bucket store.
+
+    Walks `plan.fields`, completing each against `store` (the `run_layer` result). Does NOT
+    run this bucket's layer — the caller did — so it can be driven with any conforming
+    store, which is what de-fuses serialization from execution.
+    """
     state = FieldCompletion(len(parents))
 
     pending = []
     for field_plan in plan.fields:
         maybe = complete_field(
-            context, field_plan, parents, parent_paths, state, step_columns
+            context, field_plan, parents, parent_paths, state, store
         )
         if maybe is not None:
             pending.append(maybe)
