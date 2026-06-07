@@ -1,4 +1,4 @@
-"""Value-agnostic WHERE placeholders: dedup-by-source and cross-request re-use (Wave 4).
+"""Value-agnostic WHERE placeholders: dedup-by-source and cross-request re-use.
 
 A host inlines a plan-time LITERAL arg value (``column("status") == args["status"]``) and
 gets a VALUE-discriminated dedup key (two values -> two keys -> never merge). When the value
@@ -7,9 +7,8 @@ field_args.source("status"), args["status"])`` — a source-tagged bindparam tha
 request's value (so it still rides ``compiled.params`` at execute) but is dedup-keyed by its
 STABLE source tag, never by its runtime value.
 
-This module gates the CRUX (the highest-risk item of the whole project): the four
-placeholder dedup behaviours, proven both directions through ``dag.Plan.deduplicate()`` with
-NO DB:
+This module gates the CRUX of value-agnostic placeholders: the four placeholder dedup
+behaviours, proven both directions through ``dag.Plan.deduplicate()`` with NO DB:
 
   1. two steps over the SAME placeholder source MERGE;
   2. two steps over DIFFERENT placeholder sources do NOT merge;
@@ -268,8 +267,8 @@ def test_placeholder_step_and_literal_step_do_not_merge():
 def test_literal_only_steps_dedup_exactly_as_before():
     """CRUX 4 end-to-end: literal-only steps keep their value-discriminated merge/no-merge.
 
-    The regression gate from ``test_pg_where`` re-asserted under the placeholder-aware code:
-    identical literals merge; different literals do not.
+    The literal-path behaviour holds alongside the placeholder-aware code: identical literals
+    merge; different literals do not.
     """
     a = make_step(column("status") == "published")
     b = make_step(column("status") == "published")
@@ -422,7 +421,7 @@ def test_connection_placeholder_participates_in_key_by_source():
 async def test_placeholder_result_byte_identical_to_inlined_literal(seeded):
     """NO-REGRESSION: a placeholder filter returns the SAME rows + SAME count as inlining.
 
-    The old supported path inlines ``column("status") == "draft"``; the new path wraps the
+    The literal path inlines ``column("status") == "draft"``; the placeholder path wraps the
     value as a placeholder. Same one batched statement, same rows — the placeholder changes
     only the dedup key, never the executed result.
     """

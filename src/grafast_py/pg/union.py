@@ -96,8 +96,8 @@ class PgUnionMember:
 
     NOTE: a member resource's ``select_customizer`` is NOT auto-applied by the union (only
     PgSelect auto-applies its resource's auth scope; pgUnionAll requires host-supplied member
-    scoping — upstream pgUnionAll parity). A scoped member (soft-delete / tenant / visibility)
-    must RESTATE that predicate here via ``where=``; the union will not add it for you.
+    scoping). A scoped member (soft-delete / tenant / visibility) must RESTATE that predicate
+    here via ``where=``; the union will not add it for you.
 
     Frozen + hashable so the member tuple folds straight into the union step's dedup key;
     ``where`` is excluded from the dataclass identity (Core predicates have no stable hash —
@@ -311,9 +311,9 @@ class PgUnionAllStep(Step):
 
         The step keeps a SINGLE set of match columns (the first member's) and uses those
         names for the page-window PARTITION/ORDER, the Python SCATTER (``grouping_key``) and
-        the COUNT projection — a ONE-window design (we deliberately do NOT port upstream's
-        per-identifier LATERAL machinery). So a member whose match columns differ in NAME or
-        ORDER from the first member's would be partitioned/grouped/counted under columns it
+        the COUNT projection — a ONE-window design (no per-identifier LATERAL machinery). So a
+        member whose match columns differ in NAME or ORDER from the first member's would be
+        partitioned/grouped/counted under columns it
         does not project: its rows would group under ``None`` and be silently dropped from
         the page, and the count leg would project a column that member lacks (a Postgres
         ``column ... does not exist`` error). Likewise a match column that is not SHARED is
@@ -369,7 +369,7 @@ class PgUnionAllStep(Step):
     def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
         """Re-point this union's page-size, CURSOR and per-member WHERE placeholders to a cached request.
 
-        The plan-cache rebind hook for a pgUnionAll (Wave 4): unlike a plain select the union
+        The plan-cache rebind hook for a pgUnionAll: unlike a plain select the union
         subclasses :class:`~grafast_py.step_model.Step` directly (not ``PgCustomizable``), so it
         does not inherit the WHERE rebind — it re-points all three placeholder surfaces itself,
         mirroring :meth:`PgConnectionStep.rebind_placeholders`:
@@ -790,7 +790,7 @@ class PgUnionAllStep(Step):
         agnostic, so two requests of the same document share one key (a cache hit) while two
         different sources never merge. A literal cursor keeps its decoded VALUES (list ->
         tuple, hashable) so two pages differing only by a literal ``after``/``before`` get
-        different keys, as before. ``None`` (unpaged on this side) keys as ``None``; the source
+        different keys. ``None`` (unpaged on this side) keys as ``None``; the source
         path is tagged (``("var", source)``) so it never collides with a same-shaped tuple.
         """
         if source is not None:
