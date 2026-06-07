@@ -329,26 +329,18 @@ class RootStep(Step):
     """The DAG root: a 0-dependency source whose column is the current bucket.
 
     Built once at plan time as every root field's ``$parent``. At execute time the
-    executor seeds its per-bucket column (the root value, or a child bucket's parent
-    objects) before running steps; ``execute`` returns that column verbatim. The
-    column is bound per bucket via :meth:`seed`, so one RootStep is reused across
-    buckets without being rebuilt.
+    executor binds this bucket's parent column (the root value, or a child bucket's
+    parent objects) by seeding ``step.id`` in :func:`run_steps` and excluding the step
+    from the ordered list, so ``execute`` is never invoked. One RootStep is reused
+    across buckets without being rebuilt or mutated.
     """
 
     is_sync_and_safe = True
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._column: Optional[List[Any]] = None
-
-    def seed(self, column: List[Any]) -> None:
-        """Bind this bucket's parent column for the next ``execute``."""
-        self._column = column
-
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
-        if self._column is None:
-            raise AssertionError("RootStep executed before its bucket was seeded")
-        return self._column
+        raise AssertionError(
+            "RootStep is seeded at the bucket boundary and excluded from execution"
+        )
 
     @property
     def peer_key(self) -> str:
