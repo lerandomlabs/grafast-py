@@ -203,9 +203,14 @@ def test_cache_key_differs_by_plan_affecting_config():
     # a NON-plan-affecting knob (timeout) does NOT re-key — those configs share an entry.
     d = GrafastConfig(placeholders=True, cache_plans=True, execution_timeout_s=5.0)
     assert compute_cache_key(schema, op, None, a) == compute_cache_key(schema, op, None, d)
-    # the fingerprint is exactly the three plan-affecting flags, in (inline, placeholders, cache) order.
-    assert config_fingerprint(a) == (False, True, True)
-    assert config_fingerprint(None) == (False, False, False)
+    # hoist changes the finalized LayerPlan run_steps/boundary, so it re-keys too — else a
+    # hoist=True request could be served a non-hoisted cached plan (or vice-versa).
+    e = GrafastConfig(placeholders=True, cache_plans=True, hoist=True)
+    assert compute_cache_key(schema, op, None, a) != compute_cache_key(schema, op, None, e)
+    # the fingerprint is exactly the four plan-affecting flags, in (inline, placeholders, cache, hoist) order.
+    assert config_fingerprint(a) == (False, True, True, False)
+    assert config_fingerprint(None) == (False, False, False, False)
+    assert config_fingerprint(e) == (False, True, True, True)
 
 
 def test_two_configs_sharing_default_cache_do_not_bleed():

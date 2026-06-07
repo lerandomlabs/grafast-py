@@ -25,7 +25,12 @@ from typing import Any, Dict, List, NamedTuple, Optional
 from graphql.pyutils import Path
 
 from .bubble import Bubble
-from .completion import NonNullCompleter, complete_values
+from .completion import (
+    HoistBridge,
+    NonNullCompleter,
+    complete_values,
+    find_object_completer,
+)
 from .dag import order_steps_within
 from .plan import FieldPlan, LayerPlan, ObjectPlan
 from .step_model import run_steps
@@ -366,12 +371,19 @@ def complete_field(
 
     live_parents = [parents[i] for i in live_idx]
     live_paths = [parent_paths[i] for i in live_idx]
+    bridge = None
     if step_columns is not None:
         # batched path: this field's value column is already in the bucket store
         # (a plan step or a resolver-adapter ResolveStep — read uniformly).
         outcome = plan_field_outcome(
             context, field_plan, live_idx, live_paths, step_columns
         )
+        # P4 hoist channel: when this field descends into a child layer that had steps hoisted
+        # OUT of it, build the bridge carrying THIS bucket's store (where the hoisted columns
+        # now live) + the per-value parent-bucket owner (`live_idx`), so the child seeds those
+        # columns instead of re-running the hoisted steps. None when nothing was hoisted (the
+        # default — byte-identical: `complete_values` never threads it).
+        bridge = hoist_bridge_for_field(field_plan, step_columns, live_idx)
     else:
         # serial (mutation) path: no bucket-level columns were precomputed, so run
         # just this field's step sub-DAG over the live parents — keeping each
@@ -408,6 +420,7 @@ def complete_field(
         outcome.infos,
         field_plan.field_nodes,
         field_plan.field_label,
+        bridge,
     )
 
     if not context.is_awaitable(completed):
@@ -418,6 +431,23 @@ def complete_field(
         scatter(context, field_plan, await completed, live_idx, outcome.paths, state)
 
     return finish()
+
+
+def hoist_bridge_for_field(field_plan, step_columns, live_idx):
+    """Build the P4 :class:`HoistBridge` for a field that descends into a hoist-affected child.
+
+    Returns a bridge carrying this bucket's store (`step_columns`, where any step hoisted out
+    of the child layer was produced) and `live_idx` as the per-outcome-value parent-bucket-owner
+    map, but ONLY when the field's leaf object child plan actually has hoisted-out steps. When no
+    step was hoisted out of the child (the default / hoist-off path), returns `None` so
+    completion never threads a bridge and is byte-identical.
+    """
+    child = find_object_completer(field_plan.completer)
+    if child is None or child.child_plan is None:
+        return None
+    if not child.child_plan.layer.hoisted_out_ids:
+        return None
+    return HoistBridge(parent_store=step_columns, value_owner=live_idx)
 
 
 def run_effect_steps(context, plan: ObjectPlan, parents: List[Any]):

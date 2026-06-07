@@ -28,7 +28,7 @@ config-fingerprint)``:
     the same structure — but folded in for safety/clarity, so a key never collides across
     two structurally different documents that happen to print-hash alike.
   * the config fingerprint (the PLAN-AFFECTING ``GrafastConfig`` fields — ``inline_relations``,
-    ``placeholders``, ``cache_plans``) so two context classes serving the SAME schema under
+    ``placeholders``, ``cache_plans``, ``hoist``) so two context classes serving the SAME schema under
     DIFFERENT configs, both leaving ``plan_cache=None`` (and so both sharing the process-global
     ``default_cache``), never collide on one entry. Without it a plan built under config A would
     be served to a config-B request on a hit, with that request's own ``args.is_variable``
@@ -109,7 +109,7 @@ class CachedPlan(NamedTuple):
 
 # the plan-affecting GrafastConfig fields folded into the cache key: a plan built under one
 # combination must not be served to a request under another (see config_fingerprint).
-ConfigFingerprint = Tuple[bool, bool, bool]
+ConfigFingerprint = Tuple[bool, bool, bool, bool]
 
 # the cache key: (schema identity, document-text hash, operation name, variable fingerprint,
 # config fingerprint).
@@ -124,17 +124,20 @@ def config_fingerprint(config: Any) -> ConfigFingerprint:
     Only the fields that change the SHAPE of the planned DAG (and so what a cached plan is
     valid for) belong here: ``inline_relations`` (whether relations fold into LATERAL joins),
     ``placeholders`` (whether variable provenance is threaded, so a resolver placeholders vs
-    inlines), and ``cache_plans`` (which gates the cache itself). The limit/concurrency/tracing
-    knobs do not change the plan, so they are excluded — two configs differing only in those
-    SHARE a cache entry, as they should. A ``None`` config (a direct unit-test key) fingerprints
-    as all-False, matching the default config.
+    inlines), ``cache_plans`` (which gates the cache itself), and ``hoist`` (whether the
+    cross-parent hoist pass relocates steps, which changes each LayerPlan's run_steps/boundary
+    and so the finalized DAG shape). The limit/concurrency/tracing knobs do not change the plan,
+    so they are excluded — two configs differing only in those SHARE a cache entry, as they
+    should. A ``None`` config (a direct unit-test key) fingerprints as all-False, matching the
+    default config.
     """
     if config is None:
-        return (False, False, False)
+        return (False, False, False, False)
     return (
         bool(config.inline_relations),
         bool(config.placeholders),
         bool(config.cache_plans),
+        bool(config.hoist),
     )
 
 

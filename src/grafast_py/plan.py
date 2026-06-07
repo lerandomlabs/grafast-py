@@ -20,7 +20,12 @@ from enum import Enum
 from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 from graphql.execution.values import get_argument_values
-from graphql.language import FieldNode, OperationDefinitionNode, VariableNode
+from graphql.language import (
+    FieldNode,
+    OperationDefinitionNode,
+    OperationType,
+    VariableNode,
+)
 from graphql.pyutils import Path
 from graphql.type import GraphQLField, GraphQLObjectType, GraphQLOutputType
 
@@ -108,6 +113,22 @@ class LayerPlan(NamedTuple):
     never reads the output shape (`fields`/completers) to decide what to run. They are
     empty/None until finalize; every executed plan is finalized, so the executor always
     sees them populated.
+
+    `hoisted_in`/`hoisted_out_ids` are the P4 cross-parent hoisting annotations, set by the
+    `hoist_steps` pass (only when the `hoist` flag is on; both empty otherwise, so the
+    default path is byte-identical):
+
+    * `hoisted_in` — steps LIFTED INTO this (shallower) layer from a deeper child bucket
+      because their inputs are constant across that child. `populate_layers` appends them to
+      this layer's `run_steps`, so they run once here (in the parent bucket) instead of
+      once-per-child-bucket.
+    * `hoisted_out_ids` — ids of steps lifted OUT of this (deeper) layer into a shallower
+      one. `populate_layers` adds them to this layer's boundary set so `order_steps_within`
+      STOPS at each — they are excluded from this layer's `ordered_steps` and never re-run
+      here. The executor instead threads each one's column DOWN from the parent bucket as a
+      `parent_store` seed (the column is produced once in the parent, read here, not
+      recomputed). This drop-and-seed coupling is what makes hoisting fire-once with no
+      double-run.
     """
 
     reason: LayerReason
@@ -115,6 +136,8 @@ class LayerPlan(NamedTuple):
     effect_steps: List[Step] = []
     run_steps: List[Step] = []
     ordered_steps: Optional[List[Step]] = None
+    hoisted_in: List[Step] = []
+    hoisted_out_ids: FrozenSet[int] = frozenset()
 
 
 class ObjectPlan(NamedTuple):
@@ -367,6 +390,12 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     # inlined by value.
     plan.placeholders = config.placeholders
     plan.cache_plans = config.cache_plans
+    # plan-level hoisting decision, threaded off the SAME config: gates the cross-parent
+    # hoist pass in `finalize_plan`. Default-OFF => the pass is never called, byte-identical.
+    plan.hoist = config.hoist
+    # record whether this is a mutation so `finalize_plan` can disable hoisting under a
+    # mutation root (its fields run serially and must not be reordered across layers).
+    plan.is_mutation = operation.operation == OperationType.MUTATION
     root_step = RootStep()
     plan.add_step(root_step)
 
@@ -518,10 +547,17 @@ def finalize_plan(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:
     tree (post-survivor) so tree-shake measures reachability against the steps the
     executor will actually consume.
 
-    With the default identity `Step.optimize` (a step that does not optimize returns itself
-    unchanged), `optimize` returns an empty remap, `deduplicate` sees the original DAG, every
-    step stays reachable from a `FieldPlan.step`, and tree-shake keeps everything — so the
-    finalized plan equals the planned one.
+    With the shipped default identity `Step.optimize`, `optimize` returns an empty remap,
+    `deduplicate` behaves exactly as before, every step stays reachable from a
+    `FieldPlan.step`, and tree-shake keeps everything — a byte-identical no-op.
+
+    Cross-parent hoisting (P4) slots in AFTER effect-attach and BEFORE `populate_layers`:
+    when `plan.hoist` is on (and this is not a mutation), `hoist_steps` annotates the
+    ObjectPlan tree's layers with which steps are LIFTED into a shallower layer; the
+    `populate_layers` call below then materialises that relocation (the lifted step joins the
+    parent layer's `run_steps` and is excluded from the child's `ordered_steps`). With
+    `hoist` off (default) `hoist_steps` is never called, the layers carry empty hoist
+    annotations, and `populate_layers` runs exactly as before — a byte-identical no-op.
     """
     opt_remap = plan.optimize()
     dedup_remap = plan.deduplicate()
@@ -531,9 +567,11 @@ def finalize_plan(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:
     orphaned_effects = plan.tree_shake(roots)
     if orphaned_effects:
         object_plan = attach_effect_steps(object_plan, orphaned_effects)
+    if plan.hoist and not plan.is_mutation:
+        object_plan = hoist_steps(plan, object_plan)
     # materialise each bucket's self-contained run set onto its LayerPlan, LAST — after
-    # every step is final (post optimize/dedup/tree-shake/effect-attach) — so the executor
-    # runs a bucket from its layer alone, never reading the output shape.
+    # every step is final (post optimize/dedup/tree-shake/effect-attach/hoist) — so the
+    # executor runs a bucket from its layer alone, never reading the output shape.
     object_plan = populate_layers(object_plan)
     return object_plan
 
@@ -547,6 +585,13 @@ def populate_layers(object_plan: ObjectPlan) -> ObjectPlan:
     used to derive per-bucket at run time from `plan.fields`. Computing it once here lets
     `run_layer` read the LayerPlan alone (the de-fusion). Walks the tree like
     `remap_object_plan`, rebuilding child completers so nested layers are populated too.
+
+    Cross-parent hoisting (P4) folds into this same computation via the layer's hoist
+    annotations: a step LIFTED INTO this layer (`hoisted_in`) joins `run_steps` so it runs
+    once here, and a step lifted OUT (`hoisted_out_ids`) is added to the boundary set so
+    `order_steps_within` stops at it — excluding it from this layer's `ordered_steps` (the
+    child no longer re-runs it; its column is threaded down via `parent_store`). Both default
+    empty (hoisting off / no candidate), so the path is byte-identical otherwise.
     """
     new_fields: List[FieldPlan] = []
     for fp in object_plan.fields:
@@ -559,13 +604,184 @@ def populate_layers(object_plan: ObjectPlan) -> ObjectPlan:
     layer = object_plan.layer
     run_steps = [fp.step for fp in new_fields if fp.step is not None]
     run_steps.extend(layer.effect_steps)
+    # steps lifted INTO this layer from a deeper bucket run once here (in the parent bucket).
+    run_steps.extend(layer.hoisted_in)
+    # the boundary set excludes both the parent_step AND every step lifted OUT of this layer,
+    # so `order_steps_within` stops at each hoisted-out step (it is seeded from parent_store,
+    # not re-run here).
+    boundary_ids = (
+        {layer.parent_step.id} | layer.hoisted_out_ids
+        if layer.parent_step is not None
+        else set()
+    )
     ordered_steps = (
-        order_steps_within(run_steps, {layer.parent_step.id})
+        order_steps_within(run_steps, boundary_ids)
         if layer.parent_step is not None and run_steps
         else None
     )
     new_layer = layer._replace(run_steps=run_steps, ordered_steps=ordered_steps)
     return object_plan._replace(fields=new_fields, layer=new_layer)
+
+
+def hoist_steps(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:
+    """Lift each request-/parent-constant child step to a shallower layer (cross-parent hoist).
+
+    The P4 pass: a step S owned by a child bucket whose inputs are ALL constant across that
+    bucket (its dependencies live at or above the parent layer, and it does not depend on the
+    child's per-child boundary) is LIFTED into the parent layer, so it runs once-per-parent
+    instead of once-per-child-bucket. Hoisting changes WHERE a step runs, never WHETHER — no
+    step is replaced, no `FieldPlan.step` reference moves; only the layer that OWNS (runs) the
+    step changes, recorded as `hoisted_in`/`hoisted_out_ids` annotations on the LayerPlan that
+    `populate_layers` materialises. Data is byte-identical to the naive plan.
+
+    The walk is bottom-up: for each child layer it computes which of the child's owned steps
+    can move OUT, annotates the child (`hoisted_out_ids`) and the parent (`hoisted_in`), and —
+    because a step lifted one level may be liftable again — re-examines each lifted step at the
+    next-shallower layer (the fixpoint mirror of upstream's recursive `hoistStep`). A lifted
+    step's column becomes available at the parent boundary, so the parent's boundary set is
+    extended with the lifted ids when judging whether the parent's own steps can move further.
+
+    Only ever called with `plan.hoist` on and outside a mutation (see `finalize_plan`).
+    """
+    rebuilt, _ = _hoist_layer(object_plan, frozenset(), is_top=True)
+    return rebuilt
+
+
+def _hoist_layer(op: ObjectPlan, available_above: FrozenSet[int], is_top: bool = False):
+    """Rebuild `op`'s subtree, lifting eligible child steps up; return (op, lifted_to_parent).
+
+    `available_above` is the set of step ids whose columns are produced AT OR ABOVE this
+    layer's parent boundary — the ancestor boundaries plus any step already hoisted into an
+    ancestor — i.e. the constants a step owned by THIS layer may depend on and still be liftable
+    OUT of it. `lifted_to_parent` is the list of steps that moved OUT of `op` into its parent
+    (the caller appends them to the parent's `hoisted_in` and may lift them further still).
+
+    `is_top` marks the operation/subtree ROOT layer: there is no shallower layer to receive a
+    lifted step, so the top layer NEVER lifts out (it keeps everything, including steps hoisted
+    into it from below) — `lifted_to_parent` is always empty for it.
+    """
+    layer = op.layer
+    # boundary ids available to a step owned by THIS layer when it runs here: everything above,
+    # plus this layer's own parent boundary (the per-child boundary, NOT liftable past).
+    here_boundary = available_above
+    if layer.parent_step is not None:
+        here_boundary = here_boundary | {layer.parent_step.id}
+
+    # this layer's own candidate steps: the FULL set this bucket runs — the field value steps
+    # and effect steps PLUS every intermediate step between them and the boundary (e.g. a
+    # constant feeding a load). `order_steps_within` returns exactly that (deps-first, boundary
+    # excluded), which is what `populate_layers` will run here; a step shared across fields
+    # appears once. We consider ALL of them for hoisting, not just the field steps — the
+    # hoistable one is often an intermediate (a request-constant key feeding a load).
+    targets = [fp.step for fp in op.fields if fp.step is not None]
+    targets.extend(layer.effect_steps)
+    own_steps: Dict[int, Step] = {}
+    if layer.parent_step is not None:
+        for step in order_steps_within(targets, here_boundary):
+            own_steps[step.id] = step
+    own_ids = set(own_steps.keys())
+
+    # recurse into children FIRST (bottom-up): a child may lift steps into THIS layer, which
+    # then become this layer's own (potentially further-liftable) steps. The set of ids a CHILD
+    # may treat as available-above (constants it can depend on yet still hoist OUT of itself) is
+    # `here_boundary` plus this layer's own step ids — EXCEPT the child's own per-child boundary
+    # (`child_plan.layer.parent_step`, which IS this child's field step and so lives in our
+    # own_ids). A child step depending on its boundary depends on the per-child column and must
+    # NOT be hoisted; removing the boundary from the child's available-above enforces that (the
+    # `id` access on each row depends on the row boundary — it stays in the child).
+    available_here = here_boundary | own_ids
+    hoisted_in: List[Step] = list(layer.hoisted_in)
+    new_fields: List[FieldPlan] = []
+    for fp in op.fields:
+        new_completer = fp.completer
+        child = find_object_completer(new_completer)
+        if child is not None and child.child_plan is not None:
+            child_boundary = child.child_plan.layer.parent_step
+            available_for_child = available_here
+            if child_boundary is not None:
+                available_for_child = available_here - {child_boundary.id}
+            rebuilt_child, lifted = _hoist_layer(child.child_plan, frozenset(available_for_child))
+            # the child lifted these into THIS layer: they now run once per parent here.
+            for step in lifted:
+                if step.id not in own_steps:
+                    own_steps[step.id] = step
+                    own_ids.add(step.id)
+                    hoisted_in.append(step)
+            new_completer = attach_child_plan(new_completer, rebuilt_child)
+        new_fields.append(fp._replace(completer=new_completer))
+
+    # now decide which of THIS layer's own steps (incl. ones just hoisted in) can move OUT into
+    # the parent. A step is hoistable iff every dependency lives at/above the parent boundary
+    # (`available_above`) and it is not itself immovable / boundary-dependent.
+    lift_out: List[Step] = []
+    lift_out_ids: Set[int] = set()
+    # the operation/subtree ROOT has no shallower layer to receive a lifted step, so it never
+    # lifts out — it keeps every step (incl. ones hoisted into it from below), which is exactly
+    # the fire-once-per-request payoff (a step hoisted to the root runs over the single root
+    # bucket). A non-top layer may still move its constants further up to its own parent.
+    if not is_top:
+        # iterate to a fixpoint: lifting step A out may make step B (whose only in-layer dep was
+        # A) newly liftable, since A's column is now available above.
+        changed = True
+        while changed:
+            changed = False
+            liftable_above = available_above | lift_out_ids
+            for step_id, step in own_steps.items():
+                if step_id in lift_out_ids:
+                    continue
+                if _is_hoistable(step, here_boundary, own_ids, liftable_above):
+                    lift_out.append(step)
+                    lift_out_ids.add(step_id)
+                    changed = True
+
+    # the steps that stayed are this layer's run set; the ones lifted out leave the layer (the
+    # parent's boundary already produces their column — they will be excluded from this layer's
+    # ordered_steps and seeded via parent_store).
+    new_hoisted_in = [s for s in hoisted_in if s.id not in lift_out_ids]
+    new_layer = layer._replace(
+        hoisted_in=new_hoisted_in,
+        hoisted_out_ids=layer.hoisted_out_ids | frozenset(lift_out_ids),
+    )
+    new_op = op._replace(fields=new_fields, layer=new_layer)
+    return new_op, lift_out
+
+
+def _is_hoistable(
+    step: Step,
+    here_boundary: FrozenSet[int],
+    own_ids: Set[int],
+    liftable_above: Set[int],
+) -> bool:
+    """Whether `step` (owned by some layer L) may be lifted OUT of L into its parent.
+
+    `here_boundary` is the boundary set L runs against (ancestors + L's own parent_step);
+    `own_ids` are the steps owned by L; `liftable_above` is the ids whose columns are produced
+    at/above the PARENT boundary (ancestors + already-lifted siblings) — the constants `step`
+    may depend on and still move out.
+
+    The strict subset of upstream's hoistability rule we port:
+      1. NOT side-effecting (`dedupable`) — a write/resolver must run where the planner put it.
+      2. NOT a RootStep / ItemStep — a RootStep IS a boundary; an ItemStep is a transient
+         EachStep-internal source (never in a main plan DAG, but guarded for parity).
+      3. does NOT depend on L's per-child boundary (`parent_step`) — upstream's nullable-
+         boundary "unless it depends on the root step of the boundary" rule.
+      4. EVERY dependency lives at/above the PARENT boundary (`liftable_above`) — upstream's
+         "none of its deps are in the same bucket" guard. A dep that is an in-layer step NOT
+         already lifted pins `step` to this bucket, so it is not hoistable.
+    """
+    from .core_steps import ItemStep, RootStep
+
+    if not step.dedupable:
+        return False
+    if isinstance(step, (RootStep, ItemStep)):
+        return False
+    for dep in step.dependencies:
+        if dep.id in liftable_above:
+            continue  # produced at/above the parent boundary — a true constant for the child
+        # a dependency that is this layer's own (and not lifted) keeps `step` in this bucket;
+        # any other in-bucket dependency (incl. the parent_step boundary itself) does too.
+        return False
+    return True
 
 
 def collect_consumption_root_steps(object_plan: ObjectPlan) -> List[Step]:

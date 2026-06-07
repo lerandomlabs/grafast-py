@@ -54,6 +54,21 @@ class Plan:
         # True and may be cached. Only consulted when `cache_plans` is on (default-off => the
         # cache is never read/written, so the flag is inert and the planning path is unaffected).
         self.cacheable: bool = True
+        # plan-level hoisting decision (one operation = one decision): the
+        # `GrafastConfig.hoist` flag, stashed here by `plan_operation` /
+        # `abstract_child_plan` so `finalize_plan` can run the cross-parent hoist pass
+        # without plumbing the whole execution context. Default `False` so a `Plan`
+        # built without a config (e.g. unit tests) never hoists — the finalize pass is a
+        # byte-identical no-op (nothing is lifted, `populate_layers` sees empty
+        # `hoisted_in`/`hoisted_out_ids` and runs exactly as before).
+        self.hoist: bool = False
+        # whether this plan was built for a MUTATION operation. Hoisting is disabled under
+        # mutations (the mutation root runs its fields serially and must not be reordered),
+        # so `finalize_plan` gates the hoist pass on `not is_mutation`. Set by
+        # `plan_operation` from the operation type; left `False` for abstract concrete-type
+        # subtrees (which finalize against their own ROOT plan and are reached only from a
+        # query/event walk).
+        self.is_mutation: bool = False
         # SIDE replacements an `optimize` hook records beyond the one step it returns.
         # A `Step.optimize` rewrites only ITSELF (its return value), but a DEPENDENT-
         # absorbing optimizer (the LATERAL inliner) must ALSO rewrite the children it

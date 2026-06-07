@@ -27,7 +27,19 @@ The plan-caching + runtime-placeholder switches do the same via the sibling
   be A/B'd separately — placeholders can be exercised suite-wide without caching.
 
 Both are OFF by default; a plain `uv run pytest tests` and the conformance run are
-unaffected.
+unaffected (caching + placeholders ship dark).
+
+The P4 step-9 switch does the same for cross-parent hoisting, via :func:`hoist_suite_toggle`:
+
+- `GRAFAST_HOIST=1` forces `hoist=True` across the suite. Hoisting only LIFTS a step whose
+  inputs are constant across a child bucket to a shallower layer — it changes WHERE a step
+  runs, never WHETHER it runs, so the data stays BYTE-IDENTICAL. The existing corpus contains
+  no hoistable shape (every plan-resolver field builds its step from the child boundary, so
+  nothing is request-/parent-constant inside a deeper bucket), so `GRAFAST_HOIST=1` is
+  byte-identical INCLUDING fetchCounts; the dedicated `tests/test_hoist.py` is what constructs
+  a hoistable shape and proves the ON path (relocation + fire-once + guards). It is OFF by
+  default, so a plain `uv run pytest tests` and the conformance run are unaffected (hoisting
+  ships dark).
 """
 
 import os
@@ -61,6 +73,11 @@ INLINE_ENV_VAR = "GRAFAST_INLINE_RELATIONS"
 CACHE_ENV_VAR = "GRAFAST_CACHE_PLANS"
 PLACEHOLDERS_ENV_VAR = "GRAFAST_PLACEHOLDERS"
 
+# the P4 step-9 switch: when set (CI job `hoist-on`), the autouse fixture below flips the BASE
+# GrafastExecutionContext's config to hoist=True for the whole suite, so the EXISTING
+# result-asserting suite becomes the broadest byte-identical oracle for hoisting.
+HOIST_ENV_VAR = "GRAFAST_HOIST"
+
 
 def _env_flag(name: str) -> bool:
     """Whether env var ``name`` is set to a truthy value (unset / 0 / false => off)."""
@@ -85,6 +102,11 @@ def placeholders_enabled() -> bool:
     it on WITHOUT caching, so the two can be A/B'd independently.
     """
     return _env_flag(PLACEHOLDERS_ENV_VAR) or cache_plans_enabled()
+
+
+def hoist_enabled() -> bool:
+    """Whether the P4 switch asked for cross-parent hoisting ON across the whole suite."""
+    return _env_flag(HOIST_ENV_VAR)
 
 
 def pytest_configure(config):
@@ -117,6 +139,17 @@ def pytest_configure(config):
         "markers",
         "cache_off: keep plan caching OFF for this test even under GRAFAST_CACHE_PLANS "
         "(it asserts the exact plan-build count, which a cache hit reduces)",
+    )
+    # the `hoist_off` marker pins a test to the naive (per-child-bucket) layout even under the
+    # CI hoist-on switch: a test that asserts the EXACT per-bucket fetchCount for a shape a
+    # legal hoist would lift (firing FEWER times by design) opts out. The data oracle still
+    # holds for it; only the count would differ. No corpus test needs it today (the corpus has
+    # no hoistable shape), but it keeps the global byte-identical-fetchCounts invariant intact
+    # if a future corpus addition introduces one.
+    config.addinivalue_line(
+        "markers",
+        "hoist_off: keep hoisting OFF for this test even under GRAFAST_HOIST "
+        "(it asserts the exact per-child-bucket fetchCount, which a hoist reduces)",
     )
 
 
@@ -212,6 +245,47 @@ def cache_plans_suite_toggle(request):
         yield
     finally:
         default_cache().clear()
+        if previous is None:
+            del GrafastExecutionContext.grafast_config
+        else:
+            GrafastExecutionContext.grafast_config = previous
+
+
+@pytest.fixture(autouse=True)
+def hoist_suite_toggle(request):
+    """Flip cross-parent hoisting ON for the whole suite under `GRAFAST_HOIST=1`.
+
+    The P4 step-9 "broadest oracle" — the sibling of :func:`inline_relations_suite_toggle`:
+    run the EXISTING result-asserting suite with hoisting forced on, proving it changes only
+    WHERE a step runs (lifting a request-/parent-constant step to a shallower layer), never the
+    data — so the whole result-asserting suite stays BYTE-IDENTICAL. We monkeypatch the BASE
+    :class:`GrafastExecutionContext`'s class-level ``grafast_config`` to ``hoist=True`` and
+    restore it after each test.
+
+    Surgical, exactly like the inlining/caching toggles:
+
+    - A NO-OP unless ``GRAFAST_HOIST`` is set, so the default run and the conformance run are
+      untouched — hoisting ships dark.
+    - A test that defines its OWN ``grafast_config`` on a context subclass (e.g.
+      ``tests/test_hoist.py`` uses ``GrafastConfig(hoist=True)`` explicitly) shadows this base
+      attribute, so its explicit config wins — we never fight an intentional config.
+    - A test marked ``hoist_off`` (it asserts the EXACT per-child-bucket fetchCount, which a
+      legal hoist reduces) is left on the naive layout; its data oracle still holds, only its
+      count would differ. No corpus test needs this today (the corpus has no hoistable shape),
+      so under ``GRAFAST_HOIST=1`` the whole suite is byte-identical INCLUDING counts.
+    """
+    if not hoist_enabled() or request.node.get_closest_marker("hoist_off"):
+        yield
+        return
+
+    from grafast_py.config import GrafastConfig
+    from grafast_py.context import GrafastExecutionContext
+
+    previous = GrafastExecutionContext.__dict__.get("grafast_config")
+    GrafastExecutionContext.grafast_config = GrafastConfig(hoist=True)
+    try:
+        yield
+    finally:
         if previous is None:
             del GrafastExecutionContext.grafast_config
         else:

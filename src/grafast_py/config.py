@@ -143,6 +143,22 @@ class GrafastConfig:
         :func:`~grafast_py.cache.default_cache` (one shared bounded cache for the process); a
         host wanting its own bound, or an inspectable instance, sets
         ``plan_cache=PlanCache(max_entries=...)``. Inert when ``cache_plans`` is off.
+    hoist
+        Cross-parent step hoisting: when ON, ``finalize_plan`` runs a pass that LIFTS a
+        step whose inputs are constant across a child bucket (its dependencies all live at
+        or above a shallower layer, and it does not depend on the child's per-child
+        boundary) UP into that shallower layer, so it runs once-per-request (or
+        once-per-few-parents) instead of once-per-child-bucket. It is a pure optimization:
+        hoisting changes WHERE a step runs, never WHETHER it runs — no step is replaced,
+        no ``FieldPlan.step`` reference moves, only the column's production layer shifts —
+        so the data is byte-identical to the naive plan. The hoisted column is produced in
+        the parent bucket and threaded DOWN to the child bucket as an additional
+        ``parent_store`` seed (so the child reads it, never re-runs it). Like
+        ``inline_relations`` this is a PLAN-LEVEL constant (one operation = one decision)
+        read once via ``type(context).grafast_config`` and stashed on the plan; it is
+        DISABLED entirely under mutation operations (a mutation root runs serially and must
+        not be reordered). ``False`` (default) ships it dark — the finalize pass is a no-op
+        and every executed result is byte-identical to a build without this flag.
     placeholders
         Per-argument variable provenance for value-agnostic predicates: when ON,
         ``plan_operation`` computes which field arguments originated from a GraphQL
@@ -179,6 +195,7 @@ class GrafastConfig:
     inline_relations: bool = False
     cache_plans: bool = False
     placeholders: bool = False
+    hoist: bool = False
 
     # the bounded-LRU plan cache the operation reads/writes when ``cache_plans`` is on. Left
     # ``None`` (the default), the process-global ``cache.default_cache()`` is used so every
