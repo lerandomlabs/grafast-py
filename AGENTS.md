@@ -66,10 +66,10 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        executor.py (request-scoped PgExecutor + pg_request_context[_async], pgSettings/RLS,
                          opt-in shared_txn REPEATABLE READ mode),
                        from_sqlalchemy.py (derive PgResource descriptors from ORM models),
-                       inline.py (Wave 3b LATERAL relation inlining: InlineSpec + NestedExtractStep +
+                       inline.py (LATERAL relation inlining: InlineSpec + NestedExtractStep +
                          the equivalence-preserving safety predicate; opt-in via
                          GrafastConfig.inline_relations, default OFF, per-table opt_out_inline),
-                       placeholders.py (Wave 4 runtime placeholders: pg_placeholder builds a
+                       placeholders.py (runtime placeholders: pg_placeholder builds a
                          value-agnostic bindparam tagged with a SOURCE identity — "var:<name>" —
                          so a WHERE/pagination value dedups by source, NEVER by runtime value;
                          literals still inline + dedup by value unchanged).
@@ -77,7 +77,7 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        + runtime placeholders (all default OFF; ship dark).
                        Deferred: HAVING on aggregates.
 
-src/grafast_py/cache.py  Wave 4 cross-request plan cache (core, sqlalchemy-free): a bounded-LRU
+src/grafast_py/cache.py  cross-request plan cache (core, sqlalchemy-free): a bounded-LRU
                        process cache of finalized plans keyed by (id(schema), document-text hash,
                        operation name, variable-arg fingerprint); a HIT re-binds each placeholder
                        to THIS request's variables by source tag via render-injection — it NEVER
@@ -100,14 +100,15 @@ scripts/               dev tooling (fetch_conformance.py)
 
 ```bash
 uv run pytest tests                                   # our suite (fast)
-GRAFAST_INLINE_RELATIONS=1 uv run pytest tests -m pg  # CI inline-on oracle: whole pg suite
-                                                      # re-run with LATERAL inlining forced on,
-                                                      # proving byte-identical data everywhere
-GRAFAST_CACHE_PLANS=1 uv run pytest tests             # CI cache-on oracle: whole suite re-run
-                                                      # with cross-request plan caching (+ runtime
-                                                      # placeholders) forced on — a hit changes only
-                                                      # WHETHER planning re-runs, so byte-identical
-GRAFAST_PLACEHOLDERS=1 uv run pytest tests            # CI placeholders-on oracle: the variable
+GRAFAST_INLINE_RELATIONS=1 uv run pytest tests -m pg  # suite-wide inlining oracle: the whole pg
+                                                      # suite re-run with LATERAL inlining forced on,
+                                                      # asserting byte-identical data everywhere
+GRAFAST_CACHE_PLANS=1 uv run pytest tests             # suite-wide caching oracle: the whole suite
+                                                      # re-run with cross-request plan caching (+
+                                                      # runtime placeholders) forced on — a hit
+                                                      # changes only WHETHER planning re-runs, so
+                                                      # the result is byte-identical
+GRAFAST_PLACEHOLDERS=1 uv run pytest tests            # suite-wide placeholders oracle: the variable
                                                       # provenance + placeholder dedup path forced
                                                       # on WITHOUT caching (A/B'd independently)
 GRAFAST_HOIST=1 uv run pytest tests                   # CI hoist-on oracle: cross-parent hoisting

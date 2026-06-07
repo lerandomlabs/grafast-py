@@ -1,15 +1,14 @@
-"""Threading the inlining flag onto the Plan (Wave 3b, step 2).
+"""Threading the inlining flag onto the Plan.
 
-Step 1 added the two opt-in toggles (``GrafastConfig.inline_relations`` and the
-per-resource ``opt_out_inline``) but nothing read them. This step PLUMBS the global
-flag from the execution context's config onto the operation's step DAG as
-``Plan.inline_relations`` — set in BOTH finalize entry points, the operation root
-(``plan_operation``) and every abstract concrete-type subtree
-(``completion.abstract_child_plan``) — so a future pg step's ``optimize(self, plan)``
-can read one plan-level constant instead of plumbing the whole context.
+The global ``GrafastConfig.inline_relations`` toggle (and the per-resource
+``opt_out_inline``) is plumbed from the execution context's config onto the operation's
+step DAG as ``Plan.inline_relations`` — set in BOTH finalize entry points, the operation
+root (``plan_operation``) and every abstract concrete-type subtree
+(``completion.abstract_child_plan``) — so a pg step's ``optimize(self, plan)`` can read one
+plan-level constant instead of plumbing the whole context.
 
-It is still a NO-OP: no step's ``optimize`` reads ``plan.inline_relations`` yet, so the
-executed result is byte-identical with the flag on or off. These tests pin the wiring
+The flag is purely declarative when no step's ``optimize`` reads ``plan.inline_relations``:
+the executed result is byte-identical with the flag on or off. These tests pin the wiring
 (the flag lands on the right Plan, defaults off, and the abstract subtree inherits it)
 without asserting any behaviour change — the byte-identical execution under both flag
 states is the proof there is none.
@@ -52,7 +51,7 @@ def build_operation_plan(schema, query: str, config: GrafastConfig):
     """Run `plan_operation` under a context carrying `config`; return its Plan.
 
     Mirrors the `build_plan` idiom in test_plan_finalize / test_optimize_substrate but
-    threads an explicit config so we can read the flag the context stamped onto the DAG.
+    threads an explicit config so the flag the context stamped onto the DAG can be read.
     """
     document = parse(query)
     operation = document.definitions[0]
@@ -187,8 +186,8 @@ def test_abstract_child_plan_inherits_flag(monkeypatch):
 def test_abstract_dispatch_byte_identical_under_both_flag_states():
     """No-op proof: union execution is byte-identical with the flag on vs off.
 
-    Nothing reads `plan.inline_relations` yet, so flipping it must not change the result —
-    the equivalence oracle this whole step preserves.
+    Nothing reads `plan.inline_relations` while the flag is purely declarative, so flipping
+    it must not change the result — the equivalence oracle the flag wiring preserves.
     """
     from graphql import graphql_sync
 

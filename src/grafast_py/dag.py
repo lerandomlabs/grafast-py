@@ -32,7 +32,7 @@ class Plan:
         # `GrafastConfig.inline_relations` flag, stashed here by `plan_operation` /
         # `abstract_child_plan` so a pg step's `optimize(self, plan)` can read it
         # without plumbing the whole execution context. Default `False` so a `Plan`
-        # built without a config (e.g. unit tests) never inlines — the Wave 3a no-op
+        # built without a config (e.g. unit tests) never inlines — the no-op
         # invariant holds: every step's `optimize` short-circuits to identity.
         self.inline_relations: bool = False
         # plan-level placeholder/caching decisions (one operation = one decision each),
@@ -41,8 +41,8 @@ class Plan:
         # constant instead of plumbing the whole execution context. `placeholders` gates
         # whether the planner computes per-argument variable provenance and threads it
         # into `FieldArgs`; `cache_plans` gates the cross-request plan cache. Both default
-        # `False` so a `Plan` built without a config (e.g. unit tests) ships dark — no
-        # provenance is computed and nothing is cached, byte-identical to pre-Wave-4.
+        # `False` so a `Plan` built without a config (e.g. unit tests) computes no
+        # provenance and caches nothing — both features stay dark.
         self.placeholders: bool = False
         self.cache_plans: bool = False
         # whether this finalized plan is VALUE-INDEPENDENT and so safe to cache across
@@ -52,7 +52,7 @@ class Plan:
         # would serve the wrong value). A value-agnostic plan — every SQL-affecting variable
         # value is either a same-every-request literal or a source-tagged placeholder — stays
         # True and may be cached. Only consulted when `cache_plans` is on (default-off => the
-        # cache is never read/written, so the flag is inert and the path is byte-identical).
+        # cache is never read/written, so the flag is inert and the planning path is unaffected).
         self.cacheable: bool = True
         # plan-level hoisting decision (one operation = one decision): the
         # `GrafastConfig.hoist` flag, stashed here by `plan_operation` /
@@ -136,7 +136,7 @@ class Plan:
         `child -> NestedExtractStep`); those are drained into `replaced` right after the
         hook runs, so the same rewire repoints every reference to a folded child.
 
-        With the shipped default identity `Step.optimize`, the loop runs exactly once, no
+        With the default identity `Step.optimize`, the loop runs exactly once, no
         replacement is recorded, no rewire fires, and the returned remap is empty — a
         provable no-op over the finalized plan.
         """

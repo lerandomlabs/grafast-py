@@ -1,5 +1,5 @@
 """Cross-request plan cache: the bounded-LRU core module + its no-regression / anti-corruption
-gates (Wave 4, step 7).
+gates.
 
 Steps 1-6 added the opt-in flags, the ``FieldArgs`` variable provenance, the plan-level flag
 threading, and the pg placeholder surfaces (WHERE + pagination). This step adds the reuse
@@ -216,10 +216,11 @@ def test_cache_key_differs_by_plan_affecting_config():
 def test_two_configs_sharing_default_cache_do_not_bleed():
     """END-TO-END: two configs on ONE schema (both default cache) never serve each other's plan.
 
-    The cross-config bleed: ``compute_cache_key`` carried no config component, so a plan built
-    under config A and a config-B request of the SAME document collided on one default-cache
-    entry — B got a HIT and was served A's plan, its own ``is_variable`` plan resolver bypassed.
-    Folding the config fingerprint into the key turns B's lookup into a MISS (it plans its own).
+    The cross-config bleed this guards: if ``compute_cache_key`` carried no config component, a
+    plan built under config A and a config-B request of the SAME document would collide on one
+    default-cache entry — B would get a HIT and be served A's plan, its own ``is_variable`` plan
+    resolver bypassed. The config fingerprint is folded into the key, so B's lookup is a MISS (it
+    plans its own).
     """
     from grafast_py.schema import make_grafast_schema
 
@@ -476,10 +477,10 @@ def test_plan_using_a_placeholder_stays_cacheable():
 def test_inlining_a_variable_is_not_cacheable_even_with_placeholders_off():
     """cache_plans WITHOUT placeholders still detects an inlined $variable -> non-cacheable.
 
-    The bug: with placeholders off, provenance was not computed, so an inlined variable went
-    unrecorded and the value-pinned plan was cached — a later request bled the first value.
-    Caching now forces provenance (placeholders OR cache_plans), so the inline is detected and
-    the plan re-plans per request.
+    With placeholders off, provenance would not otherwise be computed, so an inlined variable
+    would go unrecorded and the value-pinned plan would be cached — a later request bleeding the
+    first value. Caching forces provenance (placeholders OR cache_plans), so the inline is
+    detected and the plan re-plans per request.
     """
     from grafast_py.schema import make_grafast_schema
 
@@ -531,7 +532,7 @@ def test_all_literal_plan_is_cacheable():
     assert plan.cacheable is True
 
 
-# -------------------------------------- abstract-field cacheability + provenance (issue #6)
+# -------------------------------------- abstract-field cacheability + provenance
 
 
 ABSTRACT_SDL = """
@@ -582,11 +583,11 @@ def test_operation_owning_an_abstract_field_is_not_cacheable():
 
 
 def test_abstract_subtree_threads_placeholder_provenance():
-    """ISSUE #6 (A): a $variable arg UNDER a concrete type sees its provenance (is_variable True).
+    """A $variable arg UNDER a concrete type sees its provenance (is_variable True).
 
     Without threading ``plan.placeholders`` onto the abstract subtree's own Plan, a field under a
     concrete type would see empty provenance and inline the variable as a literal even with
-    placeholders enabled. The fix threads the flag so the subtree plans like the operation root.
+    placeholders enabled. The flag is threaded so the subtree plans like the operation root.
     """
     seen = {}
 
@@ -609,11 +610,11 @@ def test_abstract_subtree_threads_placeholder_provenance():
 
 
 def test_abstract_field_no_cross_request_value_bleed_under_cache():
-    """ISSUE #6 end-to-end: two requests of an abstract-field op get THEIR OWN value (no bleed).
+    """END-TO-END: two requests of an abstract-field op get THEIR OWN value (no bleed).
 
-    The bug: request 1 inlined its $variable under a concrete type, the operation was cached as
-    cacheable, and request 2 hit the cache and was served request 1's value. With the operation
-    marked non-cacheable, each request re-plans and gets its own value.
+    The failure mode this guards against: request 1 inlines its $variable under a concrete type,
+    the operation is cached as cacheable, and request 2 hits the cache and is served request 1's
+    value. With the operation marked non-cacheable, each request re-plans and gets its own value.
     """
     def echo_plan(parent, args, info):
         return constant(args["v"])  # inlines the variable value (raw read)
@@ -818,9 +819,9 @@ async def test_cached_plan_serves_two_variable_values_correctly(seeded):
 async def test_cached_plan_has_no_cross_request_bleed_under_concurrency(seeded):
     """ANTI-CORRUPTION under CONCURRENCY: many interleaved cache hits, different values, no bleed.
 
-    The worst failure mode the Wave 4 review found (the shared-rebind race): a cache HIT must
-    isolate a per-request copy BEFORE re-binding its placeholder, or two concurrent requests of
-    the SAME cached plan with DIFFERENT variables overwrite each other's bound value mid-flight.
+    The shared-rebind race this guards against: a cache HIT must isolate a per-request copy
+    BEFORE re-binding its placeholder, or two concurrent requests of the SAME cached plan with
+    DIFFERENT variables overwrite each other's bound value mid-flight.
     Warm the cache once, then fire 16 interleaved requests (alternating status) through
     ``asyncio.gather``; each must return ITS OWN correct rows. A shared in-place rebind would
     surface here as some request seeing another's status rows.

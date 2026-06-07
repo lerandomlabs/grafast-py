@@ -428,7 +428,7 @@ one-per-layer. It is **opportunistic and equivalence-preserving**: with inlining
 result is **byte-identical** to the batched path (same data, same list order, same `[]` /
 `null` for empty children) — it changes only the *number* of SQL statements, never the data.
 
-It is **experimental and ships dark this wave** (`inline_relations` defaults to `False`).
+It is **experimental and ships dark** (`inline_relations` defaults to `False`).
 Turn it on globally on the context class:
 
 ```python
@@ -439,8 +439,8 @@ class InlinedContext(GrafastExecutionContext):
 ```
 
 With the flag off (the default) the optimize pass is a **no-op** — every pg step's
-`optimize` short-circuits to identity, so a build with no host action is byte-identical to
-one compiled without the feature at all.
+`optimize` short-circuits to identity, so the executed plan is byte-identical to one
+compiled without the feature at all.
 
 ### Per-resource opt-out
 
@@ -462,7 +462,7 @@ Inlining is **conservative by construction**: a child is folded **only** when *e
 safety condition is provably met; on *any* unmet or uncertain condition the child is
 **SKIPPED** — it stays a standalone batched `= ANY($1)` statement, exactly as the planner
 built it. Unsafe-but-skipped is always correct (a redundant extra statement, never wrong
-data); the predicate never inlines when in doubt. Inlined **this wave**:
+data); the predicate never inlines when in doubt. Currently inlined:
 
 - **hasOne** (e.g. `Post.author`) — folded as `to_jsonb(child) … LIMIT 1`, scattered as the
   single row or `null`.
@@ -474,7 +474,7 @@ data); the predicate never inlines when in doubt. Inlined **this wave**:
   statement (the optimize pass runs to a fixpoint, so a parent re-folds after its own child
   folded).
 
-**SKIPPED this wave** (kept on the batched path, still byte-identical via fallback):
+**Not inlined** (kept on the batched path, still byte-identical via fallback):
 
 - **paginated / keyset connections** (`PgConnectionStep`: `first` / `offset` / `after` /
   `before`, `totalCount`, aggregates) — always skipped.
@@ -485,7 +485,7 @@ data); the predicate never inlines when in doubt. Inlined **this wave**:
   the `LATERAL` with a proven-identical customization signature is deferred); an *unfiltered*
   child folds.
 - **composite (multi-column) FK relations** — skipped (only single-column FK correlation is
-  folded this wave).
+  currently folded).
 - **non-JSON-stable codecs** — a child is folded only when every projected column survives
   the `to_jsonb → JSON → to_py` round-trip to the *same* Python value as the batched row
   decode; a column whose codec is not on the json-safe allowlist (e.g. some
@@ -644,7 +644,7 @@ in this engine — do it in your validation layer (see above).
 
 **Deferred in the `grafast_py.pg` data source**: `HAVING` on aggregates is not yet exposed.
 
-**Experimental / opt-in this wave**: opportunistic `LATERAL` relation inlining
+**Experimental / opt-in**: opportunistic `LATERAL` relation inlining
 (`inline_relations`, default **OFF**), cross-request **plan caching** (`cache_plans`, default
 **OFF**), runtime **placeholders** (`placeholders`, default **OFF**), and cross-parent step
 **hoisting** (`hoist`, default **OFF**). With all of them off — the default — each resource layer
