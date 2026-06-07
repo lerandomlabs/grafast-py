@@ -1,11 +1,11 @@
-"""Metamorphic + type-identity tests for P7 @defer / @stream incremental delivery.
+"""Metamorphic + type-identity tests for @defer / @stream incremental delivery.
 
 These run ONLY on graphql-core 3.3 (the @defer/@stream directives do not exist on 3.2);
 the whole module is skipped on the 3.2 line via ``_compat.supports_incremental()``, so the
 3.2 baseline is unaffected.
 
 Metamorphic relations (independent of byte-level wire shape, so they hold even where the
-exact payload grouping is still a P7 partial):
+exact payload grouping is only partially implemented):
 
 * defer == inline-merge: a query with ``@defer`` yields the SAME merged data as the query
   with the ``@defer`` stripped.
@@ -312,7 +312,7 @@ def test_async_stream_equals_inline_list():
 def test_stream_threads_hoisted_columns_into_streamed_items():
     """@stream + hoist=True: streamed child objects still seed their hoisted-out columns.
 
-    Regression for the P7/P4 interaction (C6): a @stream'd list of objects whose child plan has a
+    Regression for the @stream + hoisting interaction: a @stream'd list of objects whose child plan has a
     request-constant step HOISTED OUT of its layer must thread the HoistBridge into BOTH the inline
     head AND the per-item tail producer — otherwise the streamed Person items run their child layer
     without the hoisted ``tag`` column. ``Person.tag = load_one(constant, …)`` is request-constant

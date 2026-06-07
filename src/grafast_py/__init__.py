@@ -240,7 +240,7 @@ def __getattr__(name: str):
 # whichever of these modules actually exists — a missing one is skipped, not an error.
 _GRAPHQL_MODULES = ("graphql.execution.execute", "graphql.execution.subscribe")
 _saved_execution_contexts: dict = {}
-# P7: on graphql-core 3.3 the conformance defer/stream/subscribe tests call the MODULE
+# On graphql-core 3.3 the conformance defer/stream/subscribe tests call the MODULE
 # functions ``experimental_execute_incrementally`` / ``subscribe`` (and ``execute``) directly,
 # bypassing the ExecutionContext swap. So under install() we additionally replace those
 # functions on the real execute module (3.3 only); uninstall() restores them. The originals are
@@ -284,7 +284,7 @@ def install() -> None:
         _saved_execution_contexts.setdefault(name, module.ExecutionContext)
         module.ExecutionContext = GrafastExecutionContext
 
-    # P7: route the module-level incremental entry points through grafast on 3.3 (the
+    # route the module-level incremental entry points through grafast on 3.3 (the
     # conformance defer/stream/subscribe tests call them directly). 3.2 lacks these names, so
     # the leg is skipped and 3.2 install is unchanged.
     from . import _compat

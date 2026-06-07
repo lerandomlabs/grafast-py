@@ -1,6 +1,6 @@
-"""The executable definition of P4 — cross-parent hoisting.
+"""The executable definition of cross-parent hoisting.
 
-Conformance byte-identity is NECESSARY but INSUFFICIENT to prove this phase: with the
+Conformance byte-identity is NECESSARY but INSUFFICIENT to prove this property: with the
 flag OFF (the default) the finalize pass is a no-op, so the suite would pass even if the
 hoist pass did nothing useful. This module proves the actual deliverable — a step whose
 inputs are constant across a child bucket is LIFTED to a shallower layer so it runs

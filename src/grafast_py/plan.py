@@ -67,7 +67,7 @@ class FieldPlan(NamedTuple):
     # step now; `step is None` only in the (unreachable) no-plan-no-parent guard case.
     plan_fn: Optional[Callable] = None
     step: Optional[Step] = None
-    # P7 stream marker: ``(initial_count, label)`` when this list field carries `@stream`,
+    # stream marker: ``(initial_count, label)`` when this list field carries `@stream`,
     # else None. Default None for every non-streamed field → byte-identical NamedTuple on 3.2
     # and on any 3.3 field without the directive.
     stream: Optional[Tuple[int, Optional[str]]] = None
@@ -76,19 +76,18 @@ class FieldPlan(NamedTuple):
 class LayerReason(Enum):
     """Why a bucket is a batch boundary (a *layer*).
 
-    P1 enumerates only the reasons that have a real, distinct construction site in the
+    This enumerates only the reasons that have a real, distinct construction site in the
     planner TODAY: the operation root (and the structurally-identical abstract
     concrete-type subtree, which is its own ``RootStep``-seeded bucket), and a nested
     object field's bucket. Reasons that exist only at execution time (a mutation field
     runs the root layer serially) or only at completion time (a list item) are NOT
-    distinct plan-time layers yet, so they get no member here — they arrive with the
-    later phases that give them their own layer. Nothing branches on ``reason`` in P1;
-    it only records what used to be implicit.
+    distinct plan-time layers, so they get no member here. Nothing branches on ``reason``;
+    it only records what is otherwise implicit.
     """
 
     ROOT = "root"
     NESTED = "nested"
-    # P7: a @defer'd fragment-spread / inline-fragment and a @stream'd list field each become
+    # a @defer'd fragment-spread / inline-fragment and a @stream'd list field each become
     # a detachable subtree planned as its own self-contained layer (own RootStep, own DAG),
     # run later from the host's (parent value column, index_map). Distinct reasons so a future
     # consumer can branch, though nothing branches on them today.
@@ -99,8 +98,8 @@ class LayerReason(Enum):
 class LayerPlan(NamedTuple):
     """The reason-tagged batch boundary for one bucket (execution-only state).
 
-    Owns what `ObjectPlan` used to carry as bucket-boundary state, split out from its
-    output shape so the two can diverge in later phases (the OutputPlan/LayerPlan port).
+    Owns the bucket-boundary state, split out from the object's output shape so the
+    OutputPlan and LayerPlan can diverge.
 
     `parent_step` is the step whose per-bucket output column IS this bucket's parent
     objects (the operation `RootStep` at the root; an enclosing plan field's step for a
@@ -125,7 +124,7 @@ class LayerPlan(NamedTuple):
     empty/None until finalize; every executed plan is finalized, so the executor always
     sees them populated.
 
-    `hoisted_in`/`hoisted_out_ids` are the P4 cross-parent hoisting annotations, set by the
+    `hoisted_in`/`hoisted_out_ids` are the cross-parent hoisting annotations, set by the
     `hoist_steps` pass (only when the `hoist` flag is on; both empty otherwise, so the
     default path is byte-identical):
 
@@ -152,7 +151,7 @@ class LayerPlan(NamedTuple):
 
 
 class DeferPlan(NamedTuple):
-    """The @defer execution plan hanging off an object level (P7) — upstream parity.
+    """The @defer execution plan hanging off an object level — upstream parity.
 
     A transcription of upstream's per-level ``build_execution_plan`` output + the new defer
     usages minted at this level. ``new_groups`` is a list of ``(defer_usage_set, field_map)``
@@ -174,7 +173,7 @@ class ObjectPlan(NamedTuple):
     `parent_type` and `fields` are the output shape; `layer` is the reason-tagged batch
     boundary (`parent_step`/`effect_steps`) the executor seeds and runs this bucket from.
 
-    `deferred` (P7) holds the @defer execution plan hanging off THIS object level — a
+    `deferred` holds the @defer execution plan hanging off THIS object level — a
     :class:`DeferPlan` (the per-level ``build_execution_plan`` new-grouped-field-sets + the
     new defer usages). On 3.2 (and any 3.3 selection with no @defer) it is an empty DeferPlan,
     so the NamedTuple is byte-identical and the executor's deferred-record capture is a no-op.
@@ -208,7 +207,7 @@ def plan_object(
     field WITHOUT one builds a `ResolveStep` adapter that ALSO depends on `parent_step`
     — every field gets a step and passes it down as `$parent` for its sub-selection.
 
-    `deferred` (P7) is the list of @defer'd grouped-field-sets that hang off THIS object
+    `deferred` is the list of @defer'd grouped-field-sets that hang off THIS object
     level (partitioned out of the collected fields by the caller via the incremental
     collection seam); it is stored on the returned ObjectPlan for the driver to capture
     as deferred jobs at completion time. None / empty on 3.2 and on any selection without
@@ -288,7 +287,7 @@ def plan_object(
                     # resolver reading a `$variable`-derived arg would serve a later request
                     # the FIRST request's value, and a ResolveStep has no placeholder to
                     # re-point. Refuse to cache a plan carrying any variable-derived resolver
-                    # arg (re-plan per request); flipping this to cacheable is deferred to P5.
+                    # arg (re-plan per request); such a plan is not cacheable.
                     legacy_variable_args, _ = variable_provenance(field_nodes[0])
                     if legacy_variable_args:
                         plan.cacheable = False
@@ -298,7 +297,7 @@ def plan_object(
         # guard leaves `field_step` None, in which case the inherited step is passed.
         child_parent_step = field_step if field_step is not None else parent_step
 
-        # P7 stream marker: a @stream'd list field completes only items[:initial_count]
+        # stream marker: a @stream'd list field completes only items[:initial_count]
         # inline and the driver streams the rest. Read off the field AST; None on 3.2 and
         # on any non-streamed list (byte-identical default). A @stream argument coercion error
         # (non-integer initialCount / non-string label) is captured as a ``StreamError`` marker
@@ -315,7 +314,7 @@ def plan_object(
         completer = build_completer(context, return_type, field_nodes)
         object_completer = find_object_completer(completer)
         if object_completer is not None:
-            # P7: collect this field's subfields WITH its defer-usage context (the FieldDetails
+            # collect this field's subfields WITH its defer-usage context (the FieldDetails
             # for this response key, when incremental) so a deferred subfield splits correctly;
             # falls back to the plain node-collection seam off (byte-identical).
             field_details = (
@@ -366,7 +365,7 @@ def plan_object(
 def collect_subfields_partitioned(
     context, plan, object_type, field_nodes, field_details=None
 ):
-    """Collect an object field's subfields, splitting off @defer'd groups (P7).
+    """Collect an object field's subfields, splitting off @defer'd groups.
 
     Returns ``(initial_node_map, initial_details_map, defer_plan)``. When incremental is OFF
     (3.2, or a 3.3 operation with no @defer/@stream anywhere) this is exactly the legacy
@@ -495,7 +494,7 @@ def plan_operation(
     each placeholder from that map into the compiled `params` at render. A MISS plans normally
     and, if the result is cacheable (no variable value was inlined as a literal), stores it.
     With `cache_plans` off (the default) the cache is never touched, so the path below the
-    cache block is byte-identical to pre-Wave-4.
+    cache block is byte-identical.
     """
     from .core_steps import RootStep
 
@@ -536,7 +535,7 @@ def plan_operation(
     # record whether this is a mutation so `finalize_plan` can disable hoisting under a
     # mutation root (its fields run serially and must not be reordered across layers).
     plan.is_mutation = operation.operation == OperationType.MUTATION
-    # P7: when the operation carries @defer/@stream (only possible on 3.3), the planner
+    # when the operation carries @defer/@stream (only possible on 3.3), the planner
     # partitions each object level into initial vs deferred groups and reads @stream markers.
     # Off (the default, and always on 3.2) => the legacy collection seam runs, byte-identical.
     plan.incremental = incremental
@@ -706,7 +705,7 @@ def finalize_plan(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:
     `deduplicate` behaves exactly as before, every step stays reachable from a
     `FieldPlan.step`, and tree-shake keeps everything — a byte-identical no-op.
 
-    Cross-parent hoisting (P4) slots in AFTER effect-attach and BEFORE `populate_layers`:
+    Cross-parent hoisting slots in AFTER effect-attach and BEFORE `populate_layers`:
     when `plan.hoist` is on (and this is not a mutation), `hoist_steps` annotates the
     ObjectPlan tree's layers with which steps are LIFTED into a shallower layer; the
     `populate_layers` call below then materialises that relocation (the lifted step joins the
@@ -741,7 +740,7 @@ def populate_layers(object_plan: ObjectPlan) -> ObjectPlan:
     `run_layer` read the LayerPlan alone (the de-fusion). Walks the tree like
     `remap_object_plan`, rebuilding child completers so nested layers are populated too.
 
-    Cross-parent hoisting (P4) folds into this same computation via the layer's hoist
+    Cross-parent hoisting folds into this same computation via the layer's hoist
     annotations: a step LIFTED INTO this layer (`hoisted_in`) joins `run_steps` so it runs
     once here, and a step lifted OUT (`hoisted_out_ids`) is added to the boundary set so
     `order_steps_within` stops at it — excluding it from this layer's `ordered_steps` (the
@@ -781,7 +780,7 @@ def populate_layers(object_plan: ObjectPlan) -> ObjectPlan:
 def hoist_steps(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:
     """Lift each request-/parent-constant child step to a shallower layer (cross-parent hoist).
 
-    The P4 pass: a step S owned by a child bucket whose inputs are ALL constant across that
+    The pass: a step S owned by a child bucket whose inputs are ALL constant across that
     bucket (its dependencies live at or above the parent layer, and it does not depend on the
     child's per-child boundary) is LIFTED into the parent layer, so it runs once-per-parent
     instead of once-per-child-bucket. Hoisting changes WHERE a step runs, never WHETHER — no

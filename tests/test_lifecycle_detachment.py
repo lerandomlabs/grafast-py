@@ -1,6 +1,6 @@
-"""The executable definition of P2.5 — lifecycle detachment.
+"""The executable definition of lifecycle detachment.
 
-Conformance byte-identity is NECESSARY but INSUFFICIENT to prove this phase: the
+Conformance byte-identity is NECESSARY but INSUFFICIENT to prove this property: the
 inline completion path is unchanged, so the suite would pass even if a child layer
 still secretly required the live parent walk to materialise its seed. This module
 proves the actual deliverable — a child object layer is runnable from
@@ -20,7 +20,7 @@ The seed projection is ``[parent_column[o] for o in index_map]``, which equals t
 transient ``keep_objs``/``objs`` the inline path materialises element-for-element —
 so the IDENTICAL child step DAG runs over the IDENTICAL bucket.
 
-Three cases cover the three descent shapes that P2.5 generalises:
+Three cases cover the three descent shapes that lifecycle detachment generalises:
 nested singular object, flattened LIST item, and abstract concrete-type GROUP. The
 index_map indexes the FLATTENED item column for the list case, and the abstract
 group's ``parent_step`` is a FRESH ``RootStep`` (not in the operation's outer store),

@@ -336,7 +336,7 @@ class PgCustomizable(Step):
     def where_params(self, source_values: Mapping[str, Any]) -> Dict[str, Any]:
         """The execute-time params for this step's WHERE placeholder binds (name -> value).
 
-        The deepcopy-free render seam (Wave 4 / P5): a ``pg_placeholder`` bind is value-LESS,
+        The deepcopy-free render seam: a ``pg_placeholder`` bind is value-LESS,
         so its runtime value is supplied per request in the compiled statement's ``params``
         rather than baked on the SHARED bind. This maps each placeholder bind's NAME to THIS
         request's value, resolved by the bind's stable SOURCE tag against ``source_values``

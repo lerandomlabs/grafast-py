@@ -3,7 +3,7 @@
 These assert the contract the rest of the engine relies on — the feature probe resolves,
 the field-def / field-collection shims return the version-INDEPENDENT
 ``{response_name: [FieldNode]}`` shape the planner consumes, and the raw-collection accessor
-(the P7 @defer opt-in) exists. The probe value is asserted against the installed graphql-core
+(the @defer opt-in) exists. The probe value is asserted against the installed graphql-core
 version so the test is meaningful under BOTH the 3.2 baseline (.venv) and the 3.3 leg (.venv33).
 """
 

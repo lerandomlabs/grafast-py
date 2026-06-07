@@ -27,9 +27,9 @@ The plan-caching + runtime-placeholder switches do the same via the sibling
   be A/B'd separately — placeholders can be exercised suite-wide without caching.
 
 Both are OFF by default; a plain `uv run pytest tests` and the conformance run are
-unaffected (caching + placeholders ship dark).
+unaffected (caching + placeholders are off by default).
 
-The P4 step-9 switch does the same for cross-parent hoisting, via :func:`hoist_suite_toggle`:
+The hoisting switch does the same for cross-parent hoisting, via :func:`hoist_suite_toggle`:
 
 - `GRAFAST_HOIST=1` forces `hoist=True` across the suite. Hoisting only LIFTS a step whose
   inputs are constant across a child bucket to a shallower layer — it changes WHERE a step
@@ -39,7 +39,7 @@ The P4 step-9 switch does the same for cross-parent hoisting, via :func:`hoist_s
   byte-identical INCLUDING fetchCounts; the dedicated `tests/test_hoist.py` is what constructs
   a hoistable shape and proves the ON path (relocation + fire-once + guards). It is OFF by
   default, so a plain `uv run pytest tests` and the conformance run are unaffected (hoisting
-  ships dark).
+  is off by default).
 """
 
 import os
@@ -73,7 +73,7 @@ INLINE_ENV_VAR = "GRAFAST_INLINE_RELATIONS"
 CACHE_ENV_VAR = "GRAFAST_CACHE_PLANS"
 PLACEHOLDERS_ENV_VAR = "GRAFAST_PLACEHOLDERS"
 
-# the P4 step-9 switch: when set (CI job `hoist-on`), the autouse fixture below flips the BASE
+# the cross-parent hoisting switch: when set (CI job `hoist-on`), the autouse fixture below flips the BASE
 # GrafastExecutionContext's config to hoist=True for the whole suite, so the EXISTING
 # result-asserting suite becomes the broadest byte-identical oracle for hoisting.
 HOIST_ENV_VAR = "GRAFAST_HOIST"
@@ -105,7 +105,7 @@ def placeholders_enabled() -> bool:
 
 
 def hoist_enabled() -> bool:
-    """Whether the P4 switch asked for cross-parent hoisting ON across the whole suite."""
+    """Whether the hoisting switch asked for cross-parent hoisting ON across the whole suite."""
     return _env_flag(HOIST_ENV_VAR)
 
 
@@ -255,7 +255,7 @@ def cache_plans_suite_toggle(request):
 def hoist_suite_toggle(request):
     """Flip cross-parent hoisting ON for the whole suite under `GRAFAST_HOIST=1`.
 
-    The P4 step-9 "broadest oracle" — the sibling of :func:`inline_relations_suite_toggle`:
+    The cross-parent hoisting "broadest oracle" — the sibling of :func:`inline_relations_suite_toggle`:
     run the EXISTING result-asserting suite with hoisting forced on, proving it changes only
     WHERE a step runs (lifting a request-/parent-constant step to a shallower layer), never the
     data — so the whole result-asserting suite stays BYTE-IDENTICAL. We monkeypatch the BASE
@@ -265,7 +265,7 @@ def hoist_suite_toggle(request):
     Surgical, exactly like the inlining/caching toggles:
 
     - A NO-OP unless ``GRAFAST_HOIST`` is set, so the default run and the conformance run are
-      untouched — hoisting ships dark.
+      untouched — hoisting is off by default.
     - A test that defines its OWN ``grafast_config`` on a context subclass (e.g.
       ``tests/test_hoist.py`` uses ``GrafastConfig(hoist=True)`` explicitly) shadows this base
       attribute, so its explicit config wins — we never fight an intentional config.

@@ -121,14 +121,14 @@ def test_finalize_plan_is_idempotent_when_reapplied():
 
 
 def test_run_layer_and_walk_output_are_independently_callable():
-    """P2 de-fusion acceptance: execution and serialization are separable.
+    """De-fusion acceptance: execution and serialization are separable.
 
     `run_layer` reads ONLY the LayerPlan (its boundary + finalize-materialised
     `ordered_steps`) to produce the bucket store; `walk_output` consumes a store to
     serialize, with NO dependency on having just run the layer. Composed they equal the
-    fused `execute_object_plan` — proving the split is genuine, not cosmetic. (This is the
-    SHAPE-level detachment P2 delivers; the child layers still run during the output walk's
-    descent — full lifecycle detachment is P2.5.)
+    fused `execute_object_plan` — proving the split is genuine, not cosmetic. (This is
+    SHAPE-level detachment; the child layers still run during the output walk's
+    descent — full lifecycle detachment is a separate property.)
     """
     from grafast_py.execute import execute_object_plan, run_layer, walk_output
 

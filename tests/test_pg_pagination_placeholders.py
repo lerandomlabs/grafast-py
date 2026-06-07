@@ -1,5 +1,5 @@
 """Value-agnostic pagination placeholders: the value-LESS ``Placeholder`` sentinel for
-``first`` / ``offset`` / ``after`` / ``before`` when variable-derived (Wave 4 / P5).
+``first`` / ``offset`` / ``after`` / ``before`` when variable-derived.
 
 A WHERE value is a Core ``ColumnElement`` the host wraps as a :func:`pg_placeholder`
 bindparam (see ``test_pg_placeholders``); a PAGINATION value is a plain Python scalar (an
@@ -9,7 +9,7 @@ on the step. The step binds these as PARAMETERS at execute time (``window_slice`
 ALREADY value-agnostic — the ONLY thing that carries the literal is the DEDUP KEY.
 
 The :class:`Placeholder` sentinel makes that key value-AGNOSTIC for a variable-derived value.
-Under the deepcopy-free cache (P5) the sentinel itself is value-LESS — it lives on the SHARED
+Under the deepcopy-free cache the sentinel itself is value-LESS — it lives on the SHARED
 cached step and carries no request value; the runtime value is resolved per request from the
 ``BucketExtra.source_values`` map at SQL-render time (:func:`resolve_placeholder`) and injected
 into the compiled statement's ``params``, never bound onto the shared step. Its ``__eq__`` /

@@ -32,7 +32,7 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
   execute.py           bucket executor (batched layer-by-layer; serial mutation path)
   incremental.py       the @defer/@stream incremental-delivery driver (3.3 only): a driver-owned
                        record graph + a publisher emitting the 3.3 pending/incremental/completed
-                       wire protocol; subscriptions ride this path (P7)
+                       wire protocol; subscriptions ride this path
   completion.py        wrapping-type completers (leaf/object/list/non-null/abstract) + null-bubbling;
                        abstract dispatch groups values by concrete type and plans each group as a
                        self-contained step subtree (its own RootStep), so pg interfaces/unions ride
@@ -42,7 +42,7 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        resolve_type bridges for pg interfaces/unions (resolve_type_from_discriminator /
                        resolve_type_from_tag, attach_type_resolvers) — host wiring, no pg import
   config.py            GrafastConfig (execution timeout, concurrency, logging, tracing; the opt-in
-                       ship-dark optimizer flags inline_relations / cache_plans / placeholders /
+                       optimizer flags inline_relations / cache_plans / placeholders /
                        hoist, all default OFF) + error class (query cost/depth limiting is a
                        validation-layer concern, not here)
   pg/                  Postgres data source — the optional `[pg]` extra (SQLAlchemy/asyncpg):
@@ -74,14 +74,14 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                          so a WHERE/pagination value dedups by source, NEVER by runtime value;
                          literals still inline + dedup by value unchanged).
                        Experimental/opt-in: LATERAL relation inlining + cross-request plan caching
-                       + runtime placeholders (all default OFF; ship dark).
+                       + runtime placeholders (all default OFF).
                        Deferred: HAVING on aggregates.
 
 src/grafast_py/cache.py  cross-request plan cache (core, sqlalchemy-free): a bounded-LRU
                        process cache of finalized plans keyed by (id(schema), document-text hash,
                        operation name, variable-arg fingerprint); a HIT re-binds each placeholder
                        to THIS request's variables by source tag via render-injection — it NEVER
-                       deepcopies or mutates the shared plan (P5: per-request values are injected at
+                       deepcopies or mutates the shared plan (per-request values are injected at
                        execute time, so the cached plan is safe to share across concurrent requests).
                        Opt-in via GrafastConfig.cache_plans (default OFF); only a value-agnostic
                        (placeholder-bearing / all-literal) plan is cacheable across values, so a plan

@@ -49,8 +49,8 @@ That single decision defines what this library is and isn't — read it before a
 - The gap vs upstream Grafast is **constant-factor** (round-trips, a few redundant step
   runs), **not asymptotic** — and the optimizers (LATERAL inlining, cross-parent hoisting,
   plan caching) intentionally cover fewer cases and **fall back** to the batched path on any
-  uncertain shape. Inlining and hoisting **ship dark** (opt-in `GrafastConfig` flags) this
-  wave.
+  uncertain shape. Inlining and hoisting are **off by default** (opt-in `GrafastConfig`
+  flags).
 - We remain **coupled to graphql-core's type system, validation and execution semantics**
   (the deliberate reuse), and to its release lines: incremental delivery / subscriptions
   ride the **graphql-core 3.3 alpha** line (the 3.2 line has no incremental delivery).
@@ -428,14 +428,14 @@ one-per-layer. It is **opportunistic and equivalence-preserving**: with inlining
 result is **byte-identical** to the batched path (same data, same list order, same `[]` /
 `null` for empty children) — it changes only the *number* of SQL statements, never the data.
 
-It is **experimental and ships dark** (`inline_relations` defaults to `False`).
+It is **experimental and off by default** (`inline_relations` defaults to `False`).
 Turn it on globally on the context class:
 
 ```python
 from grafast_py import GrafastConfig, GrafastExecutionContext
 
 class InlinedContext(GrafastExecutionContext):
-    grafast_config = GrafastConfig(inline_relations=True)   # default False (ships dark)
+    grafast_config = GrafastConfig(inline_relations=True)   # default False
 ```
 
 With the flag off (the default) the optimize pass is a **no-op** — every pg step's
@@ -506,7 +506,7 @@ requests of the same document with different variable values produce *different*
 the correctness baseline: a literal still inlines and **dedups by value**, so two steps that differ
 only by a filter value get different dedup keys and never merge.
 
-Two opt-in flags (both default **OFF**, both ship dark) let a host reuse a plan across requests:
+Two opt-in flags (both default **OFF**) let a host reuse a plan across requests:
 
 - **`placeholders`** turns on per-argument *variable provenance*. The planner walks each field's
   AST and records which arguments came from a `$variable`; a plan resolver can then ask
@@ -565,7 +565,7 @@ caching — every existing exact-data **and** statement-count assertion still ho
 hit changes only whether planning re-runs and a placeholder changes only how a value-agnostic value
 is dedup-keyed, never the SQL or the data.
 
-## Cross-parent step hoisting (experimental, opt-in, ships dark)
+## Cross-parent step hoisting (experimental, opt-in)
 
 `hoist` (a `GrafastConfig` field, default **OFF**) is a pure optimization that **lifts** a step
 whose inputs are constant across a child bucket up into a shallower layer, so it runs
@@ -581,7 +581,7 @@ finalize pass is a no-op.
 from grafast_py import GrafastConfig, GrafastExecutionContext
 
 class HoistContext(GrafastExecutionContext):
-    grafast_config = GrafastConfig(hoist=True)   # default False (ships dark)
+    grafast_config = GrafastConfig(hoist=True)   # default False
 ```
 
 Like inlining/caching, you can flip it on suite-wide as a byte-identical oracle:
@@ -659,15 +659,15 @@ once instead of once-per-child-bucket. All four ship **dark** and are gated so t
 byte-identical (see
 [LATERAL relation inlining](#lateral-relation-inlining-experimental-opt-in),
 [Plan caching + runtime placeholders](#plan-caching--runtime-placeholders-experimental-opt-in), and
-[Cross-parent step hoisting](#cross-parent-step-hoisting-experimental-opt-in-ships-dark) above).
+[Cross-parent step hoisting](#cross-parent-step-hoisting-experimental-opt-in) above).
 
-Previously deferred, now built (this engine-port wave): the explicit two-tree
+The engine provides: the explicit two-tree
 `LayerPlan`/`OutputPlan` model (execution de-fused from serialization); resolver-unification
 (every field is a step, one execution path); the function-level `grafast_execute()` /
 `grafast_subscribe()` seam + the `GrafastExecutionContext` drop-in shim; dual graphql-core 3.2
 **and** 3.3 support; `@defer`/`@stream`/subscriptions as the 3.3-only tier (with the 7-case caveat
-above); cross-parent hoisting (`hoist`, ships dark); and the deepcopy-free plan cache. Earlier waves
-also built: multi-column (composite) relation keys, the single-shared-request-transaction mode,
+above); cross-parent hoisting (`hoist`, off by default); and the deepcopy-free plan cache. The
+Postgres data source also provides: multi-column (composite) relation keys, the single-shared-request-transaction mode,
 connection `GROUP BY` / aggregates, a codec type library (recursive arrays / ranges / enums /
 composites), and GraphQL **interfaces / unions** backed by Postgres — column-discriminator
 single-table inheritance (a `resolve_type` bridge on the discriminator column) and cross-table

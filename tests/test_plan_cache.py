@@ -1,11 +1,11 @@
 """Cross-request plan cache: the bounded-LRU core module + its no-regression / anti-corruption
 gates.
 
-Steps 1-6 added the opt-in flags, the ``FieldArgs`` variable provenance, the plan-level flag
-threading, and the pg placeholder surfaces (WHERE + pagination). This step adds the reuse
-layer: :mod:`grafast_py.cache` — a bounded-LRU process cache keyed by ``(id(schema),
+The reuse layer builds on the opt-in flags, the ``FieldArgs`` variable provenance, the
+plan-level flag threading, and the pg placeholder surfaces (WHERE + pagination):
+:mod:`grafast_py.cache` — a bounded-LRU process cache keyed by ``(id(schema),
 document-text hash, operation name, variable-arg fingerprint)`` storing the finalized
-ObjectPlan + RootStep + Plan, served as the SHARED entry on a hit (DEEPCOPY-FREE, P5) with a
+ObjectPlan + RootStep + Plan, served as the SHARED entry on a hit (DEEPCOPY-FREE) with a
 per-request SOURCE MAP rendered into the compiled statement's params — wired into
 ``plan_operation`` behind ``GrafastConfig.cache_plans`` (default off).
 

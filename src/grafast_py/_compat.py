@@ -6,7 +6,7 @@ the type system, the `values` coercion helpers, leaf serialize, `GraphQLResolveI
 between the 3.2 line and the 3.3 alpha line; this module isolates exactly those so the
 rest of the engine never imports a version-specific symbol directly.
 
-The differences P6 has to bridge (all verified empirically against 3.2.8 and 3.3.0a12):
+The differences this module bridges (all verified empirically against 3.2.8 and 3.3.0a12):
 
 - ``get_field_def`` is a module function in ``graphql.execution.execute`` on 3.2 but was
   removed on 3.3, where the equivalent logic lives on ``GraphQLSchema.get_field``.
@@ -177,12 +177,13 @@ def collect_subfields(
 def collect_subfields_raw(
     context, object_type: GraphQLObjectType, field_nodes: List[FieldNode]
 ):
-    """Expose the UN-unwrapped subfield collection for a later @defer-aware phase (P7).
+    """Expose the UN-unwrapped subfield collection for the @defer-aware path.
 
     On 3.2 this is the same ``{response_name: [FieldNode]}`` map (3.2 has no defer
     bookkeeping); on 3.3 it returns the raw ``CollectedFields`` (whose ``grouped_field_set``
-    holds ``FieldDetails`` carrying ``defer_usage``). P6 does not consume this — it exists
-    so P7 can opt into incremental delivery without re-deriving the collection.
+    holds ``FieldDetails`` carrying ``defer_usage``). The non-incremental path does not consume
+    this — it exists so the incremental path can opt into delivery without re-deriving the
+    collection.
     """
     if IS_32:
         from graphql.execution.collect_fields import collect_sub_fields
@@ -208,13 +209,13 @@ def collect_subfields_raw(
 
 
 def collect_root_fields_raw(context, root_type: GraphQLObjectType, operation):
-    """Expose the UN-unwrapped root-field collection for the @defer-aware phase (P7).
+    """Expose the UN-unwrapped root-field collection for the @defer-aware path.
 
     On 3.2 this is a plain ``{response_name: [FieldNode]}`` map (no defer bookkeeping);
     on 3.3 it returns the raw ``CollectedFields`` (whose ``grouped_field_set`` holds
     ``FieldDetails`` carrying ``defer_usage`` plus the operation's ``new_defer_usages``).
     The non-incremental path keeps using :func:`collect_root_fields`; this is the feed
-    P7's incremental driver partitions into initial vs deferred groups.
+    the incremental driver partitions into initial vs deferred groups.
     """
     if IS_32:
         from graphql.execution.collect_fields import collect_fields
@@ -239,7 +240,7 @@ def collect_root_fields_raw(context, root_type: GraphQLObjectType, operation):
 
 
 def collect_subfields_details(context, object_type: GraphQLObjectType, field_group):
-    """Collect subfields of a field group, PRESERVING each field's ``defer_usage`` (P7, 3.3).
+    """Collect subfields of a field group, PRESERVING each field's ``defer_usage`` (3.3).
 
     Unlike :func:`collect_subfields_raw` (which wraps raw nodes with a None defer_usage), this
     feeds the field group's actual ``FieldDetails`` to upstream ``collect_subfields`` so each
@@ -380,8 +381,9 @@ def make_result(
 def supports_incremental() -> bool:
     """Whether the underlying graphql-core supports @defer/@stream incremental delivery.
 
-    True only on 3.3+. P7 consumes it to opt into ``experimental_execute_incrementally``
-    for deferred/streamed payloads and to gate the entire incremental driver off on 3.2,
+    True only on 3.3+. The incremental driver consumes it to opt into
+    ``experimental_execute_incrementally`` for deferred/streamed payloads and to gate the
+    entire incremental driver off on 3.2,
     where the @defer/@stream directives do not exist (so the 3.2 path is byte-identical).
     """
     return not IS_32
@@ -443,7 +445,7 @@ def partition_defer(collected, parent_defer_usages=None):
 
 
 def build_execution_plan_groups(collected, parent_defer_usages=None):
-    """Port of upstream ``build_execution_plan`` over the engine's group shape (P7, 3.3).
+    """Port of upstream ``build_execution_plan`` over the engine's group shape (3.3).
 
     Returns ``(initial_details, initial_nodes, new_groups, new_defer_usages)``:
 
@@ -500,7 +502,7 @@ def build_execution_plan_groups(collected, parent_defer_usages=None):
 
 
 def nest_deferred_groups(deferred, parent_defer_usages=None):
-    """Arrange this object level's deferred groups into a parent/child forest (P7, 3.3).
+    """Arrange this object level's deferred groups into a parent/child forest (3.3).
 
     ``deferred`` is the flat ``[(usage_set, field_map), ...]`` from :func:`partition_defer`.
     A group is a ROOT at this level when none of the deferred usages of ANY group at this

@@ -96,14 +96,14 @@ def run_layer(
 
     `parent_store` is the GENERIC request-state seam: an optional `step.id -> column` dict
     whose entries are seeded as ADDITIONAL boundary columns alongside `parent_step`. This is
-    one channel three phases share rather than three parallel ones: (1) P2.5 child-layer
-    detachment — a child object layer is seeded directly from a parent value column + index
+    one channel three uses share rather than three parallel ones: (1) child-layer
+    detachment seeds a child object layer directly from a parent value column + index
     map, decoupled from the parent walk (exercised by tests/test_lifecycle_detachment.py);
-    (2) P5 a per-request placeholder-value map; (3) P7 a deferred-job continuation re-reading
+    (2) per-request placeholder-value maps; (3) deferred-job continuations re-reading
     a parent column. INVARIANT: every `parent_store` key MUST already be a boundary excluded
     from `layer.ordered_steps` — which was precomputed against `{parent_step.id}` at finalize
-    (`populate_layers`). Seeding `parent_step.id` itself (the only key P2.5 uses) always
-    satisfies this; a future phase seeding a NON-boundary column would have to recompute the
+    (`populate_layers`). Seeding `parent_step.id` itself (the only key child-layer detachment
+    uses) always satisfies this; seeding a NON-boundary column would have to recompute the
     order (`order_steps_within`) for that call. We do NOT recompute the order per call here —
     that would be a perf regression and is unnecessary for the boundary-only keys used today.
 
@@ -147,8 +147,8 @@ def execute_object_plan(
     already-batched value column from the store, read uniformly.
 
     `parent_store` is forwarded GENERICALLY to `run_layer` as the request-state seam (see
-    its docstring): additional `step.id -> column` boundary seeds shared by P2.5 child-layer
-    detachment, P5 placeholder-value maps and P7 deferred continuations. Nothing here
+    its docstring): additional `step.id -> column` boundary seeds shared by child-layer
+    detachment, placeholder-value maps and deferred continuations. Nothing here
     special-cases a consumer — the dict is the only channel.
     """
     store = run_layer(context, plan.layer, parents, parent_paths, parent_store)
@@ -165,7 +165,7 @@ def execute_object_plan(
 def run_child_layer_from_store(context, child_plan, parent_store, index_map, child_paths):
     """Run a child object layer seeded from a parent store column + an index map.
 
-    The decisive simplification P2.5 makes possible: a child object layer is runnable from
+    The decisive simplification here: a child object layer is runnable from
     its parent's value column ALONE, without re-entering the parent walk. `parent_store`
     holds `child_plan.layer.parent_step.id -> parent value column`; `index_map` (which IS the
     completion-time `keep_origin`/`origin` scatter list) projects each child-bucket position
@@ -211,7 +211,7 @@ def walk_output(
     """
     state = FieldCompletion(len(parents))
 
-    # P7: mint this level's deferred fragment records BEFORE walking fields, so an INITIAL
+    # mint this level's deferred fragment records BEFORE walking fields, so an INITIAL
     # object field's deeper @defer groups (captured mid-walk) can resolve a parent record minted
     # at THIS level (e.g. a root-fragment @defer whose only field merged into the initial data).
     # No-op off the incremental path (no defer sink). Group CREATION still happens after the walk
@@ -226,7 +226,7 @@ def walk_output(
         if maybe is not None:
             pending.append(maybe)
 
-    # P7 early execution: capture this level's @defer groups right after the SYNC field pass
+    # early execution: capture this level's @defer groups right after the SYNC field pass
     # (before awaiting async siblings), so a fast deferred resolver runs before a slow initial
     # one — matching upstream's collect_execution_groups firing during the walk. Liveness uses
     # the post-sync-pass state (a parent already bubbled here is dropped; a later async bubble
@@ -271,7 +271,7 @@ def walk_output(
 def premint_defer_records(context, plan, parents, parent_paths, state) -> None:
     """Mint this level's deferred fragment records (per parent path) BEFORE the field walk.
 
-    P7 seam: records must exist before descending into INITIAL object fields, so a deeper @defer
+    Records must exist before descending into INITIAL object fields, so a deeper @defer
     group captured mid-walk resolves a parent record minted at this level. Group CREATION still
     happens after the walk (it needs live parents). No defer sink (the default / non-incremental
     path) => no-op, byte-identical. Mints for every parent path (liveness is not yet known; a
@@ -291,7 +291,7 @@ def premint_defer_records(context, plan, parents, parent_paths, state) -> None:
 def capture_deferred_jobs(context, plan, parents, parent_paths, state) -> None:
     """Record this bucket's @defer'd execution groups for the incremental driver.
 
-    P7 seam: when ``plan.deferred`` carries new grouped-field-sets AND the context carries a
+    When ``plan.deferred`` carries new grouped-field-sets AND the context carries a
     deferred-group sink (set only by the incremental entry on graphql-core 3.3), record — per
     LIVE parent — the deferred fragment records minted from this level's new defer usages and an
     execution group per new grouped-field-set. A parent is live when its output dict survived
@@ -444,7 +444,7 @@ def complete_field(
         outcome = plan_field_outcome(
             context, field_plan, live_idx, live_paths, step_columns
         )
-        # P4 hoist channel: when this field descends into a child layer that had steps hoisted
+        # hoist channel: when this field descends into a child layer that had steps hoisted
         # OUT of it, build the bridge carrying THIS bucket's store (where the hoisted columns
         # now live) + the per-value parent-bucket owner (`live_idx`), so the child seeds those
         # columns instead of re-running the hoisted steps. None when nothing was hoisted (the
@@ -478,7 +478,7 @@ def complete_field(
 
             return finish_serial()
 
-    # P7 @stream: a @stream'd list field completes items[:initialCount] inline (into the
+    # @stream: a @stream'd list field completes items[:initialCount] inline (into the
     # initial data) and hands items[initialCount:] to a stream producer the driver drains
     # item-by-item. Only when a stream sink is present (the incremental entry on 3.3); else
     # the field completes whole, byte-identical.
@@ -526,7 +526,7 @@ def complete_stream_field(context, field_plan, outcome, live_idx, state, bridge)
     pending = []
     for k, value in enumerate(outcome.values):
         i = live_idx[k]
-        # P4 hoist channel for the streamed items: every one of THIS parent's list items
+        # hoist channel for the streamed items: every one of THIS parent's list items
         # (head completed inline + tail drained by the producer) descends into the child layer
         # owned by parent bucket row `bridge.value_owner[k]`, so each must seed the columns
         # hoisted OUT of that layer. Carry a per-parent seed — a 1-element `value_owner` the head
@@ -557,7 +557,7 @@ def complete_one_stream_value(
 ):
     """Complete ONE parent's @stream'd list value (sync → None / async → coroutine).
 
-    `item_bridge` is the per-parent P4 hoist seed (a 1-element ``value_owner``) threaded down to
+    `item_bridge` is the per-parent hoist seed (a 1-element ``value_owner``) threaded down to
     the head + tail item completion so streamed child objects seed their hoisted-out columns.
     """
     stream = field_plan.stream
@@ -599,7 +599,7 @@ def drive_stream_value(
 ):
     """Complete the head + register the stream producer for one resolved list value.
 
-    `item_bridge` (per-parent P4 hoist seed) threads into BOTH the inline head completion and the
+    `item_bridge` (per-parent hoist seed) threads into BOTH the inline head completion and the
     producer that drains the tail, so streamed child objects seed their hoisted-out columns.
     """
     from .incremental import AsyncStreamProducer, SyncStreamProducer
@@ -737,7 +737,7 @@ def info_of(producer):
 def complete_stream_head(context, field_plan, item_completer, head_raw, path, info, item_bridge=None):
     """Complete the head items (items[:initialCount]) through the list item completer.
 
-    `item_bridge` is the per-parent P4 hoist seed (a 1-element ``value_owner``); since every head
+    `item_bridge` is the per-parent hoist seed (a 1-element ``value_owner``); since every head
     item shares the same parent-bucket owner, expand it to one entry per head item so the child
     object completer projects the hoisted column for each.
     """
@@ -786,7 +786,7 @@ def find_list_completer(completer):
 
 
 def hoist_bridge_for_field(field_plan, step_columns, live_idx):
-    """Build the P4 :class:`HoistBridge` for a field that descends into a hoist-affected child.
+    """Build the :class:`HoistBridge` for a field that descends into a hoist-affected child.
 
     Returns a bridge carrying this bucket's store (`step_columns`, where any step hoisted out
     of the child layer was produced) and `live_idx` as the per-outcome-value parent-bucket-owner
