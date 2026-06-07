@@ -31,9 +31,12 @@ classifiers = [
 # batch steps work against anything). The Postgres data source is the `pg` extra.
 # Dual-version: the engine no longer depends on the 3.2-vs-3.3 shape of graphql-core's
 # ExecutionContext. Version-specific differences (get_field_def, collect_fields,
-# error-sort) are isolated behind a feature-probed seam in grafast_py._compat, so the
-# engine runs on both the 3.2 line and the 3.3 alpha line. Incremental delivery
-# (@defer/@stream, 3.3-only) is not yet wired — that is a later phase.
+# error-sort, the incremental classes) are isolated behind a feature-probed seam in
+# grafast_py._compat, so the engine runs on both the 3.2 line and the 3.3 alpha line.
+# Incremental delivery (@defer/@stream, 3.3-only) IS wired — via
+# entry.experimental_execute_incrementally / grafast_subscribe, gated on
+# _compat.supports_incremental() — as a 3.3-only tier with 7 documented payload-grouping
+# caveats (data byte-identical, chunk-grouping differs; see the README @defer/@stream tier).
 dependencies = [
     "graphql-core>=3.2.8",
 ]
