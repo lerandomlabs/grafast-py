@@ -1,4 +1,4 @@
-"""End-to-end gate for the Wave 3a optimizer substrate through the real pipeline.
+"""End-to-end gate for the optimizer substrate through the real pipeline.
 
 `test_dag_optimize.py` exercises `Plan.optimize`/`tree_shake`/`dependents_of` in
 isolation and `test_plan_finalize.py` checks the shared `finalize_plan` helper. This
@@ -7,9 +7,9 @@ plan-then-execute path (`plan_operation` → `finalize_plan` → the executor), 
 Step subclass that overrides `optimize` rewrites a real operation's DAG and the
 EXECUTED result is what gets asserted.
 
-The defining property gated here is the NO-OP SAFETY INVARIANT: with the shipped
-default identity `Step.optimize`, the optimize pass + tree-shake leave the executed
-result byte-identical (same `data`, same `errors`) — the same oracle the graphql-core
+The defining property gated here is the NO-OP SAFETY INVARIANT: with the default
+identity `Step.optimize`, the optimize pass + tree-shake leave the executed result
+byte-identical (same `data`, same `errors`) — the same oracle the graphql-core
 conformance suite enforces at scale, asserted here at the unit level. A TOY optimizer
 (installed as a real plan resolver) then proves the hook + tree-shake actually rewrite
 THROUGH finalize while keeping execution correct, and a side-effecting (`dedupable=False`)
@@ -49,11 +49,11 @@ CONFIG: Dict[str, Any] = {"name": "grafast", "answer": 42}
 class FoldableConstStep(Step):
     """A toy 1-dependency passthrough whose `optimize` folds a constant dependency.
 
-    Stands in for the future query-inlining optimizer: when its single dependency is
-    a `ConstantStep`, it ABSORBS it by returning a fresh `ConstantStep` of the same
+    Stands in for the query-inlining optimizer: when its single dependency is a
+    `ConstantStep`, it ABSORBS it by returning a fresh `ConstantStep` of the same
     value, which orphans the folded constant so tree-shake drops it. Over a
     non-constant dependency it is identity (returns `self`), so it is a faithful
-    passthrough on the legacy path. `execute` mirrors the dependency's column so the
+    passthrough on the batched path. `execute` mirrors the dependency's column so the
     unfolded form is itself correct end-to-end.
     """
 
@@ -279,7 +279,7 @@ class RecordingWriteStep(ConstantStep):
 class InlineAbsorbingStep(Step):
     """Folds to a fresh ConstantStep, orphaning its side-effecting source dependency.
 
-    Models the future query-inlining optimizer: it inlines the source's value into a bare
+    Models the query-inlining optimizer: it inlines the source's value into a bare
     constant and drops the dependency, so the side-effecting source is left unconsumed.
     """
 
@@ -336,7 +336,7 @@ def test_finalize_never_shakes_unconsumed_side_effecting_step():
     assert source.id in surviving_ids
     assert source not in collect_consumption_root_steps(object_plan)
     # ... and force-kept STRUCTURALLY is not enough: it must be attached to a bucket as an
-    # effect step so the executor has a run target for it (issue #1's fix).
+    # effect step so the executor has a run target for it.
     assert any(source in op_effect for op_effect in _all_effect_steps(object_plan))
 
 

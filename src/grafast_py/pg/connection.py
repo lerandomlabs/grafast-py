@@ -656,7 +656,7 @@ class PgConnectionStep(PgCustomizable):
         row's aggregate values are surfaced flat under ``aggregates``; with an extra GROUP BY
         each bucket's group_by key columns AND aggregate values are surfaced under
         ``aggregateGroups``. Both are absent (``None``) when no aggregate is selected, so an
-        unaggregated connection is byte-identical to before.
+        unaggregated connection's shape is byte-identical to one built with aggregates off.
         """
         # the active page size as a runtime int (unwrapping a variable-derived Placeholder),
         # so the one-extra-row probe is computed against the real size.

@@ -1,19 +1,17 @@
-"""Plan-caching / placeholder config knobs (Wave 4): the two opt-in toggles + their CI oracle
-switches.
+"""Plan-caching / placeholder config knobs: the two opt-in toggles + their oracle switches.
 
-The config step added the toggles for cross-request plan caching and per-argument variable
-provenance (the placeholder enabling surface): ``GrafastConfig.cache_plans`` and
-``GrafastConfig.placeholders`` both default OFF. These tests pin the defaults (so the no-op
-invariant is visible) and that an explicit override is honoured. The byte-identical behaviour
-of the wider suite under the default-off flags is the real proof there is no behaviour change;
-this file documents the surface.
+The toggles control cross-request plan caching and per-argument variable provenance (the
+placeholder enabling surface): ``GrafastConfig.cache_plans`` and ``GrafastConfig.placeholders``
+both default OFF. These tests pin the defaults (so the no-op invariant is visible) and that an
+explicit override is honoured. The byte-identical behaviour of the wider suite under the
+default-off flags is the real proof there is no behaviour change; this file documents the surface.
 
-The step-9 CI oracle switches (``GRAFAST_CACHE_PLANS`` / ``GRAFAST_PLACEHOLDERS``) are the
-sibling of the Wave 3b ``GRAFAST_INLINE_RELATIONS`` switch: an autouse fixture in
-``tests/conftest.py`` flips the whole suite's base config on when the env var is set, so the
-existing result-asserting suite becomes the broadest byte-identical oracle. The META tests at
-the bottom pin the predicate those fixtures read (driven purely by the env var, with caching
-implying placeholders), independent of the ambient base-config the fixture legitimately mutates.
+The suite-wide oracle switches (``GRAFAST_CACHE_PLANS`` / ``GRAFAST_PLACEHOLDERS``) are the
+sibling of the ``GRAFAST_INLINE_RELATIONS`` switch: an autouse fixture in ``tests/conftest.py``
+flips the whole suite's base config on when the env var is set, so the existing result-asserting
+suite becomes the broadest byte-identical oracle. The META tests at the bottom pin the predicate
+those fixtures read (driven purely by the env var, with caching implying placeholders),
+independent of the ambient base-config the fixture legitimately mutates.
 """
 
 import pytest
@@ -24,7 +22,7 @@ from .conftest import cache_plans_enabled, placeholders_enabled
 
 
 def test_cache_plans_defaults_off():
-    """The plan cache ships dark: default config has it False."""
+    """The plan cache is off by default: default config has it False."""
     assert GrafastConfig().cache_plans is False
     assert DEFAULT_CONFIG.cache_plans is False
 
@@ -35,7 +33,7 @@ def test_cache_plans_can_be_enabled():
 
 
 def test_placeholders_defaults_off():
-    """The variable-provenance surface ships dark: default config has it False."""
+    """The variable-provenance surface is off by default: default config has it False."""
     assert GrafastConfig().placeholders is False
     assert DEFAULT_CONFIG.placeholders is False
 
@@ -46,7 +44,7 @@ def test_placeholders_can_be_enabled():
 
 
 def test_new_toggles_independent_of_other_knobs():
-    """The Wave 4 toggles do not disturb the existing default knobs (no-op on defaults)."""
+    """The caching / placeholder toggles do not disturb the other default knobs (no-op on defaults)."""
     config = GrafastConfig()
     assert config.cache_plans is False
     assert config.placeholders is False
@@ -55,7 +53,7 @@ def test_new_toggles_independent_of_other_knobs():
     assert config.max_step_concurrency is None
 
 
-# ----------------------------------------------- the CI oracle-switch predicates (no DB)
+# ----------------------------------------------- the oracle-switch predicates (no DB)
 
 
 @pytest.mark.parametrize(
@@ -76,8 +74,8 @@ def test_cache_switch_reads_env(monkeypatch, value, expected):
     """``cache_plans_enabled`` (the cache-on predicate) is driven purely by ``GRAFAST_CACHE_PLANS``.
 
     This is the gate the autouse ``cache_plans_suite_toggle`` reads: unset/falsey leaves the
-    suite on per-request planning (dark ship), any truthy value flips the whole suite to
-    cache-on. We clear the placeholders var so this check is isolated to the cache predicate.
+    suite on per-request planning, any truthy value flips the whole suite to cache-on. We clear
+    the placeholders var so this check is isolated to the cache predicate.
     """
     monkeypatch.delenv("GRAFAST_PLACEHOLDERS", raising=False)
     if value is None:
@@ -109,7 +107,7 @@ def test_caching_implies_placeholders(monkeypatch):
 
 
 def test_both_switches_off_by_default(monkeypatch):
-    """With neither env var set, both oracle predicates are off — the dark-ship default."""
+    """With neither env var set, both oracle predicates are off — the default."""
     monkeypatch.delenv("GRAFAST_CACHE_PLANS", raising=False)
     monkeypatch.delenv("GRAFAST_PLACEHOLDERS", raising=False)
     assert cache_plans_enabled() is False

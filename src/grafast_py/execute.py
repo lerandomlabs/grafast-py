@@ -216,7 +216,7 @@ def execute_object_plan_serially(
     return value) are run FOR EFFECT up front: a mutation whose result is not selected
     still must write. If that run is async the whole serial pass becomes a coroutine that
     awaits the effects before completing any field. With the default identity optimize
-    `effect_steps` is empty, so this is skipped and the path is byte-identical.
+    `effect_steps` is empty, so this step is skipped entirely.
     """
     state = FieldCompletion(len(parents))
 

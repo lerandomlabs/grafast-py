@@ -14,17 +14,17 @@ expression over the table columns, projected as an extra labelled column in the 
 batched SELECT — never a separate statement, never request data. An attribute WITHOUT an
 expression is a stored table column (selectable directly).
 
-Computed columns are PROJECTION-ONLY in v1: a SELECT-list alias cannot be referenced in
+Computed columns are PROJECTION-ONLY: a SELECT-list alias cannot be referenced in
 ``row_number() OVER (ORDER BY ...)`` or a keyset comparator, so ordering by one raises a
 clear error (:meth:`PgResource.assert_order_terms_stored`); to order or filter, use a
-stored column or inline the SQL expression. Orderable/filterable computed columns are
-deferred.
+stored column or inline the SQL expression. Ordering or filtering by a computed column is
+not supported.
 
-A bare string in ``columns`` is sugar for ``PgColumn(name=str)`` — so the historical
-``columns=["id", "name"]`` form keeps working unchanged, and ``resource.columns`` still
-returns the ordered list of TABLE-column names (the stored, selectable ones; computed
-attributes are excluded). ``resource.attributes`` is the full descriptor map (incl.
-computed) and ``resource.computed`` the names whose attribute has an expression.
+A bare string in ``columns`` is sugar for ``PgColumn(name=str)`` — so the plain
+``columns=["id", "name"]`` form works directly, and ``resource.columns`` returns the
+ordered list of TABLE-column names (the stored, selectable ones; computed attributes are
+excluded). ``resource.attributes`` is the full descriptor map (incl. computed) and
+``resource.computed`` the names whose attribute has an expression.
 
 Resources register in a :class:`PgRegistry` so relations resolve their target by
 name regardless of declaration order.
@@ -51,9 +51,10 @@ from .ordering import OrderTerm
 # scoping / visibility). Resolved once per planned step against the per-request context.
 SelectCustomizer = Callable[[Any], Sequence[Any]]
 
-# The PROVABLY-json-stable SQL type classes for the inlining fold (Wave 3b condition 8). A
-# folded column's value travels to_jsonb -> JSON -> Python BEFORE any decode, so it may only
-# fold when that round-trip yields the SAME raw value the batched asyncpg row-decode sees.
+# The PROVABLY-json-stable SQL type classes for the inlining fold (the json-stability
+# condition of the inlining safety predicate). A folded column's value travels
+# to_jsonb -> JSON -> Python BEFORE any decode, so it may only fold when that round-trip
+# yields the SAME raw value the batched asyncpg row-decode sees.
 # Only these survive identically: integers (int2/4/8 — JSON renders an exact int), boolean
 # (true/false), the string family (text/varchar/char — verbatim), and json/jsonb (its JSON
 # form IS its Python form). DELIBERATELY EXCLUDED, because their JSON form differs from the
@@ -97,7 +98,7 @@ class PgCodec:
     step's peer_key / dedup_params (decode is dedup-neutral).
 
     ``json_stable`` gates whether a column carrying this codec may be folded into a parent's
-    LATERAL by the inlining safety predicate (Wave 3b). A folded column's value travels
+    LATERAL by the inlining safety predicate. A folded column's value travels
     through ``to_jsonb`` -> JSON -> Python BEFORE ``to_py`` runs, so the codec is only safe to
     inline when that json round-trip yields the SAME raw value ``to_py`` would have seen on the
     batched (asyncpg row-decode) path. ``None`` (the default) DERIVES the answer from
@@ -139,8 +140,8 @@ class PgColumn:
     column is json-stable native — without it a codec-less column is UNKNOWN-typed and the
     predicate cannot prove it foldable (fails safe). A NON-native ``sql_type`` also feeds the
     resource ``column_types`` keyset CAST, exactly like a codec's ``sql_type``. ``not_null`` /
-    ``has_default`` are metadata flags (populated e.g. from an ORM model) used by mutations
-    later; they do not affect reads. ``expression``, when set, marks the attribute COMPUTED:
+    ``has_default`` are metadata flags (populated e.g. from an ORM model) used by mutations;
+    they do not affect reads. ``expression``, when set, marks the attribute COMPUTED:
     a host-authored Core SQL expression (over the table columns) projected as
     ``expression.label(name)`` — so a computed attribute is NOT a stored table column and is
     excluded from :attr:`PgResource.columns`.
@@ -365,11 +366,10 @@ class PgResource:
     def columns(self) -> List[str]:
         """The ordered list of STORED table-column names (computed attributes excluded).
 
-        This is the selectable-column list every ``build_query`` iterates as ``column(c)``
-        — kept name-for-name identical to the historical ``columns`` list so all existing
-        select paths (and the from_sqlalchemy parity test) are unchanged. Computed
-        attributes (those with an ``expression``) are projected separately, never as a
-        plain ``column(name)``, so they are not here.
+        This is the selectable-column list every ``build_query`` iterates as ``column(c)``,
+        name-for-name the stored columns declared in ``columns``, so all select paths emit
+        the same column list. Computed attributes (those with an ``expression``) are
+        projected separately, never as a plain ``column(name)``, so they are not here.
         """
         return [a.name for a in self.attributes.values() if not a.is_computed]
 
@@ -459,10 +459,10 @@ class PgResource:
     def is_inline_json_safe(self) -> bool:
         """Whether EVERY attribute survives the LATERAL json round-trip identically.
 
-        Condition 8 of the inlining safety predicate: a child relation may only be folded
-        into a parent's ``json_agg`` / ``to_jsonb`` LATERAL when every folded column decodes
-        to the SAME Python value off the json column as it would off a standalone batched
-        row. Per attribute, in order:
+        The json-stability condition of the inlining safety predicate: a child relation may
+        only be folded into a parent's ``json_agg`` / ``to_jsonb`` LATERAL when every folded
+        column decodes to the SAME Python value off the json column as it would off a
+        standalone batched row. Per attribute, in order:
 
         - a CODEC present -> :attr:`PgCodec.is_json_stable` (the host's explicit declaration,
           deriving native-vs-not from the codec's ``sql_type`` or an explicit override);

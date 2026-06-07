@@ -114,7 +114,7 @@ async def test_delete_post_removes_row_and_missing_pk_is_none(demo_schema):
     """deletePost removes a row (RETURNING the deleted row); a missing PK returns None.
 
     Deletes a post we INSERT (the seed posts are referenced by comments via FK, so
-    deleting one would violate the constraint — a separate concern from this v1 scope).
+    deleting one would violate the constraint).
     """
     insert = await run(
         demo_schema,
@@ -225,10 +225,11 @@ async def test_insert_not_null_no_default_omitted_fails_loud():
 @pytest.mark.inline_off
 @pytest.mark.asyncio
 async def test_read_path_untouched_by_mutations(demo_schema):
-    """The batched read path stays O(depth) after the mutation work — a sanity gate.
+    """The batched read path stays O(depth) — a sanity gate.
 
     Mutations are a SEPARATE serial path; a nested read still issues one batched
-    statement per resource-layer (here authors + posts = 2), unchanged by Phase 8.
+    statement per resource-layer (here authors + posts = 2), unaffected by the
+    mutation seam.
     """
     from grafast_py.pg.engine import count_sql
 
