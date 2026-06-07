@@ -1,22 +1,22 @@
 """Threading the placeholder/caching flags onto the Plan and computing per-argument
-variable provenance (Wave 4, step 3).
+variable provenance.
 
-Step 1 added the two opt-in toggles (``GrafastConfig.placeholders`` /
-``GrafastConfig.cache_plans``) and step 2 grew ``FieldArgs`` a provenance surface
-(``variable_args`` / ``is_variable`` / ``source``) but nothing populated it. This step:
+The two opt-in toggles (``GrafastConfig.placeholders`` / ``GrafastConfig.cache_plans``)
+and the ``FieldArgs`` provenance surface (``variable_args`` / ``is_variable`` /
+``source``) are connected here:
 
-  * PLUMBS both flags from the execution context's config onto the operation's step DAG
-    as ``Plan.placeholders`` / ``Plan.cache_plans`` (mirroring ``Plan.inline_relations``),
-    set in ``plan_operation``.
-  * Walks each field's argument AST in ``plan_object`` when ``Plan.placeholders`` is on,
+  * Both flags are plumbed from the execution context's config onto the operation's step
+    DAG as ``Plan.placeholders`` / ``Plan.cache_plans`` (mirroring
+    ``Plan.inline_relations``), set in ``plan_operation``.
+  * When ``Plan.placeholders`` is on, ``plan_object`` walks each field's argument AST,
     computing the SET of ``$variable``-derived argument names and the arg-name ->
     variable-name mapping, and threads them into the ``FieldArgs`` the plan resolver sees.
 
-It is still a NO-OP on the default path: with ``placeholders`` off (the default) the
-planner threads NO provenance, so ``FieldArgs.is_variable`` is always False and a host
-inlines literals exactly as before. These tests pin the wiring (flags land on the right
-Plan; provenance reaches the resolver only when the flag is on; literals are never marked
-as variables) plus the byte-identical execution under both flag states.
+This is a NO-OP on the default path: with ``placeholders`` off (the default) the planner
+threads NO provenance, so ``FieldArgs.is_variable`` is always False and a host inlines
+literals just as it does without the flag. These tests pin the wiring (flags land on the
+right Plan; provenance reaches the resolver only when the flag is on; literals are never
+marked as variables) plus the byte-identical execution under both flag states.
 """
 
 import grafast_py.plan as plan_module
@@ -212,7 +212,8 @@ def test_plan_object_does_not_walk_ast_when_flag_off(monkeypatch):
     """The AST walk is skipped entirely on the default path (no wasted work, no surprises).
 
     Provenance computation is purely additive; with the flag off the planner must not even
-    call `variable_provenance`, so the default path is byte-identical to pre-Wave-4.
+    call `variable_provenance`, so the default path is byte-identical to when placeholders
+    are disabled.
     """
     calls = []
     real = plan_module.variable_provenance
@@ -238,8 +239,8 @@ def test_plan_object_does_not_walk_ast_when_flag_off(monkeypatch):
 def test_execution_byte_identical_under_both_flag_states():
     """No-op proof: result data is identical with placeholders/caching on vs off.
 
-    Nothing CONSUMES the threaded provenance yet (no host builds a placeholder here), so
-    flipping the flags must not change the result — the equivalence oracle this step keeps.
+    Nothing here CONSUMES the threaded provenance (no host builds a placeholder), so
+    flipping the flags must not change the result — the equivalence oracle this guards.
     """
     schema = make_schema()
     query = "query Q($s: String) { things(status: $s, limit: 10) { id } }"

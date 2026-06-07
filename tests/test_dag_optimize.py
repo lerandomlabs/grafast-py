@@ -1,15 +1,15 @@
-"""Tests for the Wave 3a optimizer substrate on the plan DAG.
+"""Tests for the optimizer substrate on the plan DAG.
 
 `Plan.optimize` runs each step's `optimize(plan)` hook to a fixpoint, rewiring every
 reference to a replaced step through the same survivor-chain machinery `deduplicate`
 uses. `Plan.tree_shake(roots)` trims steps that are neither reachable from the
 consumption roots NOR side-effecting. `Plan.dependents_of(step)` inverts the
-dependency edges so the future inlining optimizer can find (and absorb) its consumers.
+dependency edges so the inlining optimizer can find (and absorb) its consumers.
 
-The DEFINING property gated here is the NO-OP SAFETY INVARIANT: with the shipped
-default identity `Step.optimize`, optimize + tree-shake leave the finalized plan
-byte-identical — the real behaviour change (query inlining) is a separate later wave,
-so the substrate is validated here only with a TOY optimizer.
+The DEFINING property gated here is the NO-OP SAFETY INVARIANT: with the default
+identity `Step.optimize`, optimize + tree-shake leave the finalized plan
+byte-identical — query inlining is a separate behaviour, so the substrate is
+validated here only with a TOY optimizer.
 """
 
 from typing import Any, List
@@ -44,7 +44,7 @@ class DoubleStep(Step):
 class ConstFoldDouble(DoubleStep):
     """A toy optimizer: a DoubleStep over a ConstantStep folds to a single constant.
 
-    Stands in for the future query-inlining optimizer — it ABSORBS its dependency by
+    Stands in for the query-inlining optimizer — it ABSORBS its dependency by
     returning a replacement (a ConstantStep of the doubled value), which orphans the
     folded ConstantStep so tree-shake can drop it.
     """

@@ -1,7 +1,7 @@
 """DB-backed foundation tests for single-table Postgres polymorphism.
 
-The single-table shape (the ``foundation`` feature of the polymorphism wave) is one
-``grafast_demo.media`` table carrying a ``kind`` discriminator (``'image'`` / ``'video'``):
+The single-table shape is one ``grafast_demo.media`` table carrying a ``kind``
+discriminator (``'image'`` / ``'video'``):
 every row is some ``Media`` (interface) — an ``Image`` or a ``Video`` — and a
 ``resolve_type_from_discriminator`` bridge keyed on ``kind`` resolves each row's concrete
 type at COMPLETION time. This composes with the EXISTING completion-time abstract dispatch
@@ -25,10 +25,10 @@ These tests drive the real engine against the live ``grafast_py_test`` scratch D
 
 The no-DB bridge/wiring unit layer and the broader example-schema parity tests live in
 ``test_poly_resolve_type.py`` / ``test_poly_schema.py``; this module is the single-table
-DB foundation suite. There is no new pg step here (the shape rides the existing
+DB suite. There is no dedicated pg step here (the shape rides the existing
 ``PgSelectAllStep`` / ``get_single`` / ``find``), so the DEDUP CORRECTNESS INVARIANT has
-nothing SQL-affecting to fold at this layer — the cross-table ``PgUnionAllStep`` ships its
-own dedup-correctness test in the pgUnionAll feature.
+nothing SQL-affecting to fold at this layer — the cross-table ``PgUnionAllStep`` carries
+its own dedup-correctness test (``pgUnionAll``).
 """
 
 import pytest

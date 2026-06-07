@@ -48,8 +48,8 @@ class FieldArgs:
     argument value (NOT a step — plan resolvers treat args as plain values and lift
     them with ``constant`` when a step is needed). ``raw`` exposes the whole coerced dict.
 
-    Provenance (Wave 4 placeholders)
-    --------------------------------
+    Provenance (placeholders)
+    -------------------------
     graphql-core's ``get_argument_values`` coerces a ``$variable`` argument to its
     runtime value before a plan resolver ever runs, so ``raw`` alone "cannot tell a
     literal from a variable". The seam is the field AST: an argument whose value node is
@@ -65,12 +65,12 @@ class FieldArgs:
     per-request id), so two requests of the same document produce the same key and share
     one cached plan, while two different variable sources never merge.
 
-    The old single-argument constructor ``FieldArgs(args)`` keeps working: ``variable_args``
+    The single-argument constructor ``FieldArgs(args)`` is supported: ``variable_args``
     defaults to empty, so ``is_variable`` is always ``False`` and every host falls back to
-    literal inlining — byte-identical to pre-Wave-4 behaviour.
+    literal inlining (the behaviour when no provenance is threaded in).
 
-    Cacheability tracking (Wave 4 plan cache)
-    -----------------------------------------
+    Cacheability tracking (plan cache)
+    ----------------------------------
     A plan is only safe to cache across requests when every SQL-affecting ``$variable`` value
     is VALUE-AGNOSTIC (a source-tagged placeholder), never INLINED as a plan-time literal. The
     seam is HOW a host reads a variable-derived arg: building a placeholder reads ``source()``
@@ -141,7 +141,7 @@ class FieldArgs:
         """True iff argument ``name`` originated from a GraphQL ``$variable``.
 
         Always ``False`` when no provenance was threaded in (the default / placeholders
-        off), so a host always sees literals and inlines exactly as before.
+        off), so a host then sees every arg as a literal and inlines it by value.
         """
         return name in self.variable_args
 

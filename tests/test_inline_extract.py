@@ -1,4 +1,4 @@
-"""Unit tests for the inline substrate (Wave 3b, step 3): InlineSpec + NestedExtractStep.
+"""Unit tests for the inline substrate: InlineSpec + NestedExtractStep.
 
 These pin the two data structures the LATERAL fold survives into execution as, in
 ISOLATION — no optimize wiring, no DB. A :class:`NestedExtractStep` is fed FAKE parent
@@ -11,9 +11,9 @@ the child rows the standalone batched path WOULD have scattered:
 - codecs decode through the SAME ``resource.decode_rows`` as the batched path, so a
   codec'd column round-trips identically.
 
-The byte-identical equivalence-vs-batched proof is a later DB-backed step; here we only
-prove the extract step reproduces the scatter shape and the decode, since that is the
-contract the fold rests on.
+The byte-identical equivalence-vs-batched proof is DB-backed and lives elsewhere; here
+we only prove the extract step reproduces the scatter shape and the decode, since that
+is the contract the fold rests on.
 """
 
 import pytest
