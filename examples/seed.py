@@ -218,7 +218,7 @@ async def setup_things_table() -> None:
 async def setup_keyset_table() -> None:
     """Create + seed ``grafast_demo.keyset_rows`` for keyset-cursor tests idempotently.
 
-    A dedicated fixture for Phase-6 keyset paging over NULLABLE / DESC / multi-key / and
+    A dedicated fixture for keyset paging over NULLABLE / DESC / multi-key / and
     non-native (timestamptz, numeric) columns, modelled on the keyset probe. ``rank`` is
     nullable (3 NULLs) with duplicate values (so duplicate-rank cursors and the NULL
     boundary are exercised); ``created`` (timestamptz) and ``price`` (numeric) exercise the
@@ -273,7 +273,7 @@ async def setup_keyset_table() -> None:
 async def setup_widgets_table() -> None:
     """Create + seed ``grafast_demo.widgets`` (a soft-delete / status fixture) idempotently.
 
-    A dedicated fixture for Phase 4 WHERE-customization: ``deleted_at`` is nullable (a
+    A dedicated fixture for WHERE-customization: ``deleted_at`` is nullable (a
     soft-delete flag) and ``status`` is a categorical column (tenant/visibility scoping),
     so resource-customizer and per-plan ``.where()`` predicates have observable effects.
     ``owner_id`` groups rows so a hasMany-style ``match_column`` lookup is exercisable.
@@ -330,7 +330,7 @@ async def setup_widgets_table() -> None:
 async def setup_settings_probe_view() -> None:
     """Create ``grafast_demo.setting_probe``: a view exposing a per-request GUC as a column.
 
-    A Phase-5 pgSettings fixture independent of RLS: each row carries
+    A pgSettings fixture independent of RLS: each row carries
     ``current_setting('app.demo', true)`` in its ``demo`` column, so any step type that
     selects it OBSERVES the GUC the executor set for the request — proving the
     ``set_config`` is applied in the SAME transaction as the query, regardless of the
@@ -358,7 +358,7 @@ async def setup_settings_probe_view() -> None:
 async def setup_rls_table() -> None:
     """Create + seed ``grafast_demo.secret_notes`` with ROW LEVEL SECURITY idempotently.
 
-    A Phase-5 RLS fixture: rows are owned by ``owner`` (1 or 2) and the table ENABLEs +
+    An RLS fixture: rows are owned by ``owner`` (1 or 2) and the table ENABLEs +
     FORCEs row level security with a policy that admits only rows whose ``owner`` equals
     the per-request GUC ``current_setting('app.owner', true)``. So a query run with
     ``settings={'app.owner': '1'}`` should see only owner-1 rows — IF the connecting role
@@ -415,7 +415,7 @@ async def setup_rls_table() -> None:
 async def setup_labels_table() -> None:
     """Create + seed ``grafast_demo.labels`` (a codec / computed-column fixture) idempotently.
 
-    A Phase-7 fixture for the minimal per-attribute codec and computed columns: ``code`` is
+    A fixture for the minimal per-attribute codec and computed columns: ``code`` is
     a lowercase text value a ``to_py`` hook can uppercase, and a computed attribute can
     derive e.g. ``upper(code)`` over it. ``owner_id`` groups rows so the same table serves a
     hasMany-style relation AND a Relay connection lookup (so the codec/computed projection is

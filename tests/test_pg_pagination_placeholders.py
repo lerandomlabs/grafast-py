@@ -1,5 +1,5 @@
 """Value-agnostic pagination placeholders: the ``Placeholder`` sentinel for ``first`` /
-``offset`` / ``after`` / ``before`` when variable-derived (Wave 4, step 6).
+``offset`` / ``after`` / ``before`` when variable-derived.
 
 A WHERE value is a Core ``ColumnElement`` the host wraps as a :func:`pg_placeholder`
 bindparam (see ``test_pg_placeholders``); a PAGINATION value is a plain Python scalar (an
@@ -218,8 +218,8 @@ def test_select_offset_placeholder_keys_by_source():
 def test_select_literal_first_offset_unchanged():
     """CRUX 4: literal-only ``first`` / ``offset`` keep their value-discriminated dedup.
 
-    The regression gate from ``test_pg_pagination`` re-asserted under the placeholder-aware
-    code: identical literals merge; different literal sizes do not.
+    The literal-path behaviour holds alongside the placeholder-aware key path: identical
+    literals merge; different literal sizes do not.
     """
     a = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"], first=2)
     b = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"], first=2)
@@ -254,13 +254,13 @@ def test_root_collection_placeholder_emits_value_agnostic_sql():
 
 
 def test_root_collection_literal_sql_unchanged():
-    """A literal root LIMIT/OFFSET inlines exactly as before — ``run_params`` is ``None``."""
+    """A literal root LIMIT/OFFSET inlines its values directly — ``run_params`` is ``None``."""
     lit = PgSelectAllStep(make_posts(), order_by=["id"], first=5, offset=3).for_parent(
         constant(None)
     )
     sql = str(lit.build_query())
     # SQLAlchemy renders the inlined literal as an auto-named bound (value baked on), so
-    # no explicit per-request params are needed — byte-identical to pre-Wave-4.
+    # no explicit per-request params are needed — byte-identical to the placeholder-free path.
     assert ":root_first" not in sql and ":root_offset" not in sql
     assert lit.run_params() is None
 
@@ -346,8 +346,8 @@ def test_connection_after_cursor_placeholder_crux():
 def test_connection_literal_cursor_unchanged():
     """CRUX 4: literal ``after`` cursors keep their value-discriminated dedup (no regression).
 
-    Identical literal cursors merge; different literal cursors do not — the pre-Wave-4
-    behaviour, re-asserted under the placeholder-aware key path.
+    Identical literal cursors merge; different literal cursors do not — the literal-path
+    behaviour, preserved alongside the placeholder-aware key path.
     """
     posts = make_posts()
     cur1 = cursor_for(posts, 10)
@@ -493,9 +493,9 @@ def decode_for(step, cursor):
 async def test_placeholder_first_byte_identical_to_literal(seeded):
     """NO-REGRESSION: a placeholder ``first`` returns the SAME rows + SAME count as inlining.
 
-    The old path passes a literal ``first=2``; the new path wraps it as a ``Placeholder``.
-    Same one windowed statement, same rows — the placeholder changes only the dedup key,
-    never the executed page.
+    The literal path passes a literal ``first=2``; the placeholder path wraps it as a
+    ``Placeholder``. Same one windowed statement, same rows — the placeholder changes only
+    the dedup key, never the executed page.
     """
     engine = get_engine()
     with pg_request_context(SQLAlchemyExecutor(engine)):
@@ -553,9 +553,9 @@ async def test_same_placeholder_first_serves_two_sizes_correctly(seeded):
 async def test_root_collection_placeholder_byte_identical_to_literal(seeded):
     """NO-REGRESSION: a placeholder root LIMIT/OFFSET returns the SAME rows + count as inlining.
 
-    The root collection's plain LIMIT/OFFSET: the old path inlines ``first=2, offset=1``; the
-    new path wraps each as a ``Placeholder`` (bound as a value-less param). Same one statement,
-    same rows.
+    The root collection's plain LIMIT/OFFSET: the literal path inlines ``first=2, offset=1``;
+    the placeholder path wraps each as a ``Placeholder`` (bound as a value-less param). Same
+    one statement, same rows.
     """
     engine = get_engine()
     with pg_request_context(SQLAlchemyExecutor(engine)):

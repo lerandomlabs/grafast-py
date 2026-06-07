@@ -7,28 +7,27 @@ here so the suite is self-sufficient: a few tests import the `examples` package
 (the demo schema/seed fixtures live there), and that must resolve without relying
 on the (separate, conformance-only) root conftest.
 
-The `GRAFAST_INLINE_RELATIONS=1` switch (the Wave 3b step-9 CI job) flips LATERAL
-inlining ON for this whole suite via :func:`inline_relations_suite_toggle`, so the
-existing pg tests — every one of which already asserts EXACT result data — become the
-broadest possible byte-identical oracle for inlining. It is OFF by default, so a plain
-`uv run pytest tests` (and the conformance run, which has its own conftest and never
-sets this) is unaffected.
+The `GRAFAST_INLINE_RELATIONS=1` switch flips LATERAL inlining ON for this whole suite
+via :func:`inline_relations_suite_toggle`, so the existing pg tests — every one of which
+already asserts EXACT result data — become the broadest possible byte-identical oracle
+for inlining. It is OFF by default, so a plain `uv run pytest tests` (and the conformance
+run, which has its own conftest and never sets this) is unaffected.
 
-The Wave 4 step-9 switches do the same for plan caching + runtime placeholders, via the
-sibling :func:`cache_plans_suite_toggle`:
+The plan-caching + runtime-placeholder switches do the same via the sibling
+:func:`cache_plans_suite_toggle`:
 
 - `GRAFAST_CACHE_PLANS=1` forces `cache_plans=True` (and, because only a value-agnostic
   placeholder-bearing plan is cacheable across values, `placeholders=True` with it), so a
   cache hit changes only WHETHER planning re-runs — never the SQL or the data, hence the
   whole result-asserting suite stays byte-identical.
 - `GRAFAST_PLACEHOLDERS=1` forces ONLY `placeholders=True`, so the per-argument variable
-  provenance surface (and the placeholder dedup path) ships independently of caching: a
-  host that does not call `pg_placeholder` still inlines literals exactly as before, so the
-  suite again stays byte-identical (provenance is computed but unused). This lets the two
-  knobs be A/B'd separately — placeholders can be exercised suite-wide without caching.
+  provenance surface (and the placeholder dedup path) is exercised independently of caching:
+  a host that does not call `pg_placeholder` still inlines literals exactly, so the suite
+  again stays byte-identical (provenance is computed but unused). This lets the two knobs
+  be A/B'd separately — placeholders can be exercised suite-wide without caching.
 
 Both are OFF by default; a plain `uv run pytest tests` and the conformance run are
-unaffected (caching + placeholders ship dark).
+unaffected.
 """
 
 import os
@@ -46,13 +45,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # bakes in no database (see grafast_py.pg.engine).
 os.environ.setdefault("GRAFAST_PG_URL", "postgresql+asyncpg:///grafast_py_test")
 
-# the step-9 CI switch: when set (CI job `inline-on`), the autouse fixture below flips
-# the BASE GrafastExecutionContext's config to inline_relations=True for the whole suite.
+# the suite-wide inlining switch: when set, the autouse fixture below flips the BASE
+# GrafastExecutionContext's config to inline_relations=True for the whole suite.
 INLINE_ENV_VAR = "GRAFAST_INLINE_RELATIONS"
 
-# the Wave 4 step-9 switches: when set (CI jobs `cache-on` / `placeholders-on`), the autouse
-# fixture below flips the BASE GrafastExecutionContext's config for the whole suite, so the
-# EXISTING result-asserting suite becomes the broadest byte-identical oracle.
+# the suite-wide caching / placeholder switches: when set, the autouse fixture below flips
+# the BASE GrafastExecutionContext's config for the whole suite, so the EXISTING
+# result-asserting suite becomes the broadest byte-identical oracle.
 #   GRAFAST_CACHE_PLANS    -> cache_plans=True (a hit changes only WHETHER planning re-runs);
 #                            caching is only safe across values for a value-agnostic plan, so
 #                            placeholders are forced on with it.
@@ -69,17 +68,17 @@ def _env_flag(name: str) -> bool:
 
 
 def inline_relations_enabled() -> bool:
-    """Whether the step-9 CI switch asked for inlining ON across the whole suite."""
+    """Whether the suite-wide switch asked for inlining ON across the whole suite."""
     return _env_flag(INLINE_ENV_VAR)
 
 
 def cache_plans_enabled() -> bool:
-    """Whether the Wave 4 switch asked for plan caching ON across the whole suite."""
+    """Whether the suite-wide switch asked for plan caching ON across the whole suite."""
     return _env_flag(CACHE_ENV_VAR)
 
 
 def placeholders_enabled() -> bool:
-    """Whether the Wave 4 switch asked for the placeholder provenance surface ON suite-wide.
+    """Whether the suite-wide switch asked for the placeholder provenance surface ON.
 
     Caching implies placeholders (only a value-agnostic placeholder-bearing plan is cacheable
     across values), so ``GRAFAST_CACHE_PLANS`` turns this on too; ``GRAFAST_PLACEHOLDERS`` turns
@@ -101,19 +100,19 @@ def pytest_configure(config):
     # the `pg` marker tags DB-backed tests (they touch only the grafast_demo schema
     # of grafast_py_test) so a no-DB run can deselect them with `-m 'not pg'`.
     config.addinivalue_line("markers", "pg: database-backed test (grafast_demo schema)")
-    # the `inline_off` marker pins a test to the batched baseline even under the CI
-    # inline-on switch (it asserts the EXACT batched statement count, which inlining
-    # legitimately reduces — the data oracle still holds, but its count would not).
+    # the `inline_off` marker pins a test to the batched baseline even under the
+    # suite-wide inline-on switch (it asserts the EXACT batched statement count, which
+    # inlining legitimately reduces — the data oracle still holds, but its count would not).
     config.addinivalue_line(
         "markers",
         "inline_off: keep inlining OFF for this test even under GRAFAST_INLINE_RELATIONS "
         "(it asserts the exact batched statement count, which a fold reduces)",
     )
-    # the `cache_off` marker pins a test to per-request planning even under the CI cache-on
-    # switch: a test that asserts the EXACT number of plan BUILDS (which caching legitimately
-    # reduces on a hit), or that mutates a context's grafast_config mid-test in a way the
-    # shared base override would fight, opts out. The result/statement-count oracle still
-    # holds for it; only the plan-build count would differ.
+    # the `cache_off` marker pins a test to per-request planning even under the suite-wide
+    # cache-on switch: a test that asserts the EXACT number of plan BUILDS (which caching
+    # legitimately reduces on a hit), or that mutates a context's grafast_config mid-test in a
+    # way the shared base override would fight, opts out. The result/statement-count oracle
+    # still holds for it; only the plan-build count would differ.
     config.addinivalue_line(
         "markers",
         "cache_off: keep plan caching OFF for this test even under GRAFAST_CACHE_PLANS "
@@ -125,8 +124,8 @@ def pytest_configure(config):
 def inline_relations_suite_toggle(request):
     """Flip LATERAL inlining ON for the whole suite under `GRAFAST_INLINE_RELATIONS=1`.
 
-    The step-9 CI job's "broadest oracle": run the EXISTING pg suite — which already
-    asserts exact result data everywhere — with inlining forced on, proving the data is
+    The suite-wide "broadest oracle": run the EXISTING pg suite — which already asserts
+    exact result data everywhere — with inlining forced on, proving the data is
     BYTE-IDENTICAL to the batched baseline across the board. We monkeypatch the BASE
     :class:`GrafastExecutionContext`'s class-level ``grafast_config`` (the one every pg
     test's ``execution_context_class=GrafastExecutionContext`` reads) to
@@ -135,7 +134,7 @@ def inline_relations_suite_toggle(request):
     Three things keep this surgical:
 
     - It is a NO-OP unless ``GRAFAST_INLINE_RELATIONS`` is set, so the default run (and
-      the separate conformance run) is untouched — inlining ships dark.
+      the separate conformance run) is untouched.
     - A test that defines its OWN ``grafast_config`` on a context subclass (the inlining
       equivalence battery, the hardening tests) shadows this base attribute, so its
       explicit config wins — we never override an intentional config.
@@ -164,12 +163,12 @@ def inline_relations_suite_toggle(request):
 
 @pytest.fixture(autouse=True)
 def cache_plans_suite_toggle(request):
-    """Flip plan caching / placeholders ON for the whole suite under the Wave 4 switches.
+    """Flip plan caching / placeholders ON for the whole suite under the suite-wide switches.
 
-    The Wave 4 step-9 "broadest oracle" — the sibling of :func:`inline_relations_suite_toggle`:
-    run the EXISTING result-asserting suite with caching and/or the placeholder provenance
-    surface forced on, proving they change only WHETHER planning re-runs (a cache hit) and
-    WHICH provenance is computed (placeholders) — never the SQL or the data, so results AND
+    The "broadest oracle" — the sibling of :func:`inline_relations_suite_toggle`: run the
+    EXISTING result-asserting suite with caching and/or the placeholder provenance surface
+    forced on, proving they change only WHETHER planning re-runs (a cache hit) and WHICH
+    provenance is computed (placeholders) — never the SQL or the data, so results AND
     statement counts stay BYTE-IDENTICAL to the per-request baseline. We monkeypatch the BASE
     :class:`GrafastExecutionContext`'s class-level ``grafast_config`` and restore it after each
     test; the process-global plan cache is CLEARED around each test so no entry leaks across
@@ -186,7 +185,7 @@ def cache_plans_suite_toggle(request):
     Surgical, exactly like the inlining toggle:
 
     - A NO-OP unless at least one switch is set, so the default run and the conformance run are
-      untouched — caching + placeholders ship dark.
+      untouched.
     - A test with its OWN ``grafast_config`` on a context subclass shadows this base attribute,
       so its explicit config wins.
     - A test marked ``cache_off`` (it asserts the exact plan-BUILD count, which a hit reduces)

@@ -1,4 +1,4 @@
-"""DB-backed equivalence battery for LATERAL relation inlining (Wave 3b, step 6).
+"""DB-backed equivalence battery for LATERAL relation inlining.
 
 The DEFINING invariant of inlining is that it is an OPPORTUNISTIC, EQUIVALENCE-PRESERVING
 optimization: for ANY operation, the result with inlining ENABLED must be BYTE-IDENTICAL to
@@ -81,9 +81,9 @@ class HeldConnExecutor:
     statement, each with its own implicit snapshot, so a SIBLING test's committed INSERT
     (``Empty Author`` / a fixture row) landing between the two reads — visible across the
     process-global pool under function-scoped event loops — makes the second read see an extra
-    row the first did not (the historical ~33%-in-isolation flake). Pinning both reads to ONE
-    connection inside ONE ``REPEATABLE READ`` transaction gives them a SINGLE frozen snapshot,
-    so no concurrently-committed sibling row can drift between them — the assertion compares
+    row the first did not (an intermittent flake). Pinning both reads to ONE connection inside
+    ONE ``REPEATABLE READ`` transaction gives them a SINGLE frozen snapshot, so no
+    concurrently-committed sibling row can drift between them — the assertion compares
     inline-vs-batched on genuinely identical data. It is a pure read harness (rolled back on
     close); the product code is unchanged.
     """
@@ -246,7 +246,7 @@ async def test_has_many_unpaginated_folds_byte_identical(demo_schema):
 async def test_multi_level_single_fold_byte_identical(demo_schema):
     """authors -> posts -> comments: ONE fold (posts into authors); comments stays batched.
 
-    Nested LATERAL is unsupported this wave (a flat ``build_lateral``), so the deeper
+    Nested LATERAL is not currently supported (a flat ``build_lateral``), so the deeper
     comments relation falls back to its batched path off the extracted post rows — still
     byte-identical, only one fewer statement (3 -> 2), not two.
     """
@@ -390,7 +390,7 @@ async def null_empty_schema():
     and a hasOne whose FK matches no row must yield ``null`` — identical to the batched path.
 
     It ALSO seeds a deeper empty-hasMany (a post owning ZERO comments) so the same
-    ``coalesce(json_agg, '[]')`` empty scatter is proven one level down — the task's
+    ``coalesce(json_agg, '[]')`` empty scatter is proven one level down — the
     "a post with no comments" sub-case — alongside the top-level empty author.
     """
     await dispose_engine()
@@ -522,7 +522,7 @@ async def test_post_with_no_comments_folds_to_empty_list(null_empty_schema):
 
     The deeper empty-hasMany: ``authors -> posts -> comments`` where post 99 has no comments.
     posts folds into authors (1 fewer statement); the inner comments relation falls back
-    batched off the extracted post rows (a flat LATERAL this wave), so the saving is the one
+    batched off the extracted post rows (a flat LATERAL, not nested), so the saving is the one
     posts fold — but the empty post's ``comments`` must still scatter ``[]`` identically.
     """
     query = "{ authors { id posts { id comments { id } } } }"
@@ -684,12 +684,12 @@ async def test_non_unique_hasone_fold_picks_same_row(non_unique_hasone_schema):
 async def bare_non_native_schema():
     """A hasMany whose child has BARE numeric + timestamptz columns (no codec, no type).
 
-    The blocker-1 corruption vector: a codec-less ``numeric`` / ``timestamptz`` column whose
-    ``to_jsonb`` -> JSON form differs from the asyncpg row value (``12.5000`` -> lossy
-    ``12.5``; a UTC datetime -> a server-tz-shifted string). With no declared type the
-    predicate cannot prove the column native, so the fold SKIPS and the batched child stays —
-    keeping the data byte-identical. (A host who declares the types, e.g. via the ORM bridge,
-    gets the same SKIP through the type-aware branch.)
+    The corruption vector the safety predicate guards against: a codec-less ``numeric`` /
+    ``timestamptz`` column whose ``to_jsonb`` -> JSON form differs from the asyncpg row value
+    (``12.5000`` -> lossy ``12.5``; a UTC datetime -> a server-tz-shifted string). With no
+    declared type the predicate cannot prove the column native, so the fold SKIPS and the
+    batched child stays — keeping the data byte-identical. (A host who declares the types, e.g.
+    via the ORM bridge, gets the same SKIP through the type-aware branch.)
     """
     await dispose_engine()
     await setup_demo_schema()
@@ -1168,7 +1168,7 @@ async def test_self_relation_skips_but_identical(self_relation_schema):
 
 @pytest_asyncio.fixture
 async def composite_schema():
-    """A region -> stores hasMany over a COMPOSITE (org_id, region_id) FK; SKIPPED this wave."""
+    """A region -> stores hasMany over a COMPOSITE (org_id, region_id) FK; not inlined."""
     from examples.seed import setup_composite_tables
 
     await dispose_engine()
@@ -1224,7 +1224,7 @@ async def composite_schema():
 
 @pytest.mark.asyncio
 async def test_composite_key_relation_skips_but_identical(composite_schema):
-    """A composite-FK hasMany is SKIPPED this wave; count unchanged, data byte-identical."""
+    """A composite-FK hasMany is not inlined; count unchanged, data byte-identical."""
     query = "{ regions { label stores { id name } } }"
     await assert_inlined_equivalent(composite_schema, query, expected_saving=0)
 
@@ -1234,7 +1234,7 @@ async def test_composite_key_relation_skips_but_identical(composite_schema):
 
 @pytest_asyncio.fixture
 async def filtered_schema():
-    """Author.posts with a per-plan ``.where(title LIKE ...)`` filter; SKIPPED this wave."""
+    """Author.posts with a per-plan ``.where(title LIKE ...)`` filter; not inlined."""
     await dispose_engine()
     await setup_demo_schema()
 
@@ -1263,7 +1263,7 @@ async def filtered_schema():
 
     def posts_plan(parent, args, info):
         step = authors.related_many(parent, "posts")
-        # a host filter the LATERAL would have to reproduce — deferred, so it SKIPS.
+        # a host filter the LATERAL would have to reproduce — not supported, so the fold SKIPS.
         step.add_where(column("title").like("%author 1%"))
         return step
 
@@ -1285,7 +1285,7 @@ async def filtered_schema():
 
 @pytest.mark.asyncio
 async def test_filtered_child_skips_but_identical(filtered_schema):
-    """A filtered hasMany is SKIPPED this wave; count unchanged, data byte-identical."""
+    """A filtered hasMany is not inlined; count unchanged, data byte-identical."""
     query = "{ authors { id posts { id title } } }"
     batched, _bc, _ic = await assert_inlined_equivalent(
         filtered_schema, query, expected_saving=0
@@ -1321,7 +1321,7 @@ async def test_paginated_connection_skips_but_identical(demo_schema):
 
 @pytest.mark.asyncio
 async def test_per_parent_paginated_hasmany_skips_but_identical():
-    """A per-parent window-sliced hasMany (first:2) is SKIPPED this wave; data identical."""
+    """A per-parent window-sliced hasMany (first:2) is not inlined; data identical."""
     await dispose_engine()
     await setup_demo_schema()
 
