@@ -209,7 +209,7 @@ def test_toy_optimizer_orphan_is_tree_shaken_through_finalize():
     Before folding the plan holds {RootStep, ConstantStep(7) source, FoldableConstStep}.
     The fold replaces the FoldableConstStep with a NEW ConstantStep(7) that does not
     depend on the source, orphaning it; tree-shake removes the orphan but keeps the
-    consumed survivor. RootStep stays (a finalized ObjectPlan.parent_step is a
+    consumed survivor. RootStep stays (a finalized ObjectPlan.layer.parent_step is a
     consumption root even when no field step depends on it).
     """
     schema = make_folding_schema()
@@ -344,7 +344,7 @@ def _all_effect_steps(object_plan) -> List[List[Step]]:
     """Every `effect_steps` list across the (nested) ObjectPlan tree."""
     from grafast_py.completion import find_object_completer
 
-    out: List[List[Step]] = [object_plan.effect_steps]
+    out: List[List[Step]] = [object_plan.layer.effect_steps]
     for fp in object_plan.fields:
         child = find_object_completer(fp.completer)
         if child is not None and child.child_plan is not None:

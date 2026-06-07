@@ -225,7 +225,7 @@ def test_finalize_folds_hasmany_replaces_parent_and_rewrites_child():
     # the Author.posts child object bucket's parent_step is the NestedExtractStep the fold
     # rewrote the child relation step into (the remap repointed the bucket source).
     _posts_fp, posts_plan = find_child_plan(object_plan, "posts")
-    extract = posts_plan.parent_step
+    extract = posts_plan.layer.parent_step
     assert isinstance(extract, NestedExtractStep)
     assert extract.kind == KIND_HAS_MANY
     assert extract.alias == spec.nested_alias
@@ -248,7 +248,7 @@ def test_finalize_rewrites_child_field_steps_to_read_off_the_extract():
     )
 
     _posts_fp, posts_plan = find_child_plan(object_plan, "posts")
-    extract = posts_plan.parent_step
+    extract = posts_plan.layer.parent_step
     assert isinstance(extract, NestedExtractStep)
     # each leaf field in the posts bucket projects off the extract step.
     for fp in posts_plan.fields:
@@ -309,7 +309,7 @@ def test_finalize_consumption_roots_reach_extract_and_child_bucket_parent():
     root_ids = {s.id for s in roots}
 
     _posts_fp, posts_plan = find_child_plan(object_plan, "posts")
-    extract = posts_plan.parent_step
+    extract = posts_plan.layer.parent_step
     assert isinstance(extract, NestedExtractStep)
 
     # the child bucket's parent_step (the extract) is a consumption root (the seeded boundary).
@@ -344,7 +344,7 @@ def test_finalize_folds_hasone_through_the_pipeline():
     assert root_select.inline_specs[0].kind == KIND_HAS_ONE
 
     _author_fp, author_plan = find_child_plan(object_plan, "author")
-    extract = author_plan.parent_step
+    extract = author_plan.layer.parent_step
     assert isinstance(extract, NestedExtractStep)
     assert extract.kind == KIND_HAS_ONE
     assert extract.dependencies[0] is root_select
@@ -429,7 +429,9 @@ def test_finalize_default_off_keeps_batched_child():
     assert not any(isinstance(s, NestedExtractStep) for s in plan.steps)
 
     _posts_fp, posts_plan = find_child_plan(object_plan, "posts")
-    assert isinstance(posts_plan.parent_step, PgSelectStep)  # the batched child survives
+    assert isinstance(
+        posts_plan.layer.parent_step, PgSelectStep
+    )  # the batched child survives
     # TWO pg statements: authors root + posts batched child — the baseline statement count.
     assert len(pg_selects(plan)) == 2
 

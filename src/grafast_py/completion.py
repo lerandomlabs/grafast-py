@@ -777,7 +777,7 @@ def abstract_child_plan(context, completer, object_type):
     seeds this concrete-type group's row objects and every plan-resolver field (incl.
     nested pg relations) hangs its step off it, exactly as `plan_operation` does for the
     operation root. The subtree's DAG is deduplicated + remapped so the executor seeds
-    `child_plan.parent_step` (the RootStep) with the group's objects and runs the steps
+    `child_plan.layer.parent_step` (the RootStep) with the group's objects and runs the steps
     once per group. Cached per concrete type on the completer so repeated buckets of the
     same type reuse the plan.
 
@@ -790,7 +790,7 @@ def abstract_child_plan(context, completer, object_type):
     """
     from .core_steps import RootStep
     from .dag import Plan
-    from .plan import finalize_plan, plan_object
+    from .plan import LayerReason, finalize_plan, plan_object
 
     cached = completer.plan_cache.get(object_type.name)
     if cached is not None:
@@ -813,7 +813,12 @@ def abstract_child_plan(context, completer, object_type):
     root_step = RootStep()
     plan.add_step(root_step)
     child_plan = plan_object(
-        context, object_type, sub_fields, parent_step=root_step, plan=plan
+        context,
+        object_type,
+        sub_fields,
+        parent_step=root_step,
+        plan=plan,
+        reason=LayerReason.ROOT,
     )
     child_plan = finalize_plan(plan, child_plan)
 

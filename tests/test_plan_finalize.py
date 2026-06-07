@@ -4,7 +4,7 @@
 operation root (`plan_operation`) and every abstract/object child subtree
 (`completion.abstract_child_plan`) run, so abstract subtrees optimize identically to
 the root. `collect_consumption_root_steps` walks the finalized ObjectPlan tree to the
-executor's consumption surface (every `FieldPlan.step` + each `ObjectPlan.parent_step`,
+executor's consumption surface (every `FieldPlan.step` + each `ObjectPlan.layer.parent_step`,
 across transitively nested child plans) that tree-shake measures reachability against.
 
 With the default identity `Step.optimize`, the whole finalize is a no-op: the result of
@@ -100,7 +100,7 @@ def test_collect_consumption_roots_includes_nested_child_plan_steps():
     assert people_fp.step.id in root_ids
     assert name_fp.step.id in root_ids
     # ... and so is the root parent_step (the bucket boundary the executor seeds).
-    assert object_plan.parent_step.id in root_ids
+    assert object_plan.layer.parent_step.id in root_ids
 
 
 def test_finalize_plan_is_idempotent_when_reapplied():
