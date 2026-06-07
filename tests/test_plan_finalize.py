@@ -145,7 +145,7 @@ def test_run_layer_and_walk_output_are_independently_callable():
     root_value = {"people": [{"name": "Ann"}, {"name": "Bob"}]}
 
     # (a) run the root LayerPlan ALONE -> the bucket store. No output walk has happened.
-    store = run_layer(ctx, object_plan.layer, [root_value])
+    store = run_layer(ctx, object_plan.layer, [root_value], [None])
     assert isinstance(store, dict)
     assert object_plan.layer.parent_step.id in store
     for step in object_plan.layer.run_steps:

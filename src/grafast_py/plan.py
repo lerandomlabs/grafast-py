@@ -8,10 +8,12 @@ drives over a batch of resolved values.
 
 The planner builds a genuine native plan for EVERY GraphQL output shape: leaf
 (scalar/enum), object, abstract (interface/union), and arbitrarily nested
-List/NonNull wrappers of those. Every output-type kind plans natively; there is no
-fallback shape the planner cannot handle. Fields without a plan resolver take the
-per-parent resolver-adapter (`ResolveStep`) route, which the planner wires into the
-same step DAG, so a plain-resolver schema plans and runs the same way.
+List/NonNull wrappers of those. There is no deferral path — the engine is an
+unconditional drop-in. EVERY field carries a `FieldPlan.step`: a plan step for a
+plan-resolver field, or a `ResolveStep` (the resolver-adapter) for a plain-resolver
+field. Both live in the operation's step DAG and depend on the bucket parent_step,
+so the executor reads each field's value column uniformly from the bucket store —
+there is no `step is None` path and no separate per-parent resolver machine.
 """
 
 from enum import Enum
@@ -53,10 +55,10 @@ class FieldPlan(NamedTuple):
     field_label: str
     args: Optional[Dict[str, Any]]
     args_error: Optional[Exception]
-    # plan-resolver path: `plan_fn` is the field's plan resolver (or None for the
-    # legacy resolver-adapter path); `step` is the step it produced, registered in
-    # the operation's Plan. When `plan_fn` is None, `step` is None and the field
-    # takes the ResolveStep path so a plain-resolver schema runs unchanged.
+    # `plan_fn` is the field's plan resolver (or None for the resolver-adapter path).
+    # `step` is the field's value step registered in the operation's Plan — a plan step
+    # when `plan_fn` is set, otherwise a `ResolveStep` adapter. EVERY field carries a
+    # step now; `step is None` only in the (unreachable) no-plan-no-parent guard case.
     plan_fn: Optional[Callable] = None
     step: Optional[Step] = None
 
@@ -141,14 +143,16 @@ def plan_object(
     @include and fragment conditions are honoured before planning.
 
     `parent_step` is the step whose output is the bucket of parents for this object
-    (the root value's step at the operation root; an enclosing plan field's step for
-    a nested object). `plan` is the operation's step DAG; both are threaded so that a
-    field WITH a plan resolver builds a genuine step depending on `parent_step` and
-    passes that step down as `$parent` for its sub-selection. Fields WITHOUT a plan
-    resolver ignore `parent_step` and keep the legacy resolver-adapter path; their
-    object children inherit `parent_step` unchanged so a plan-resolver DESCENDANT
-    under a legacy parent still has a sensible source step.
+    (the root value's step at the operation root; an enclosing field's step for a
+    nested object). `plan` is the operation's step DAG; both are threaded so that a
+    field WITH a plan resolver builds a genuine step depending on `parent_step`, and a
+    field WITHOUT one builds a `ResolveStep` adapter that ALSO depends on `parent_step`
+    — every field gets a step and passes it down as `$parent` for its sub-selection.
     """
+    # function-local to break the plan.py <-> steps.py import cycle (steps.py imports
+    # FieldPlan from this module at module load).
+    from .steps import ResolveStep
+
     field_plans: List[FieldPlan] = []
     for response_name, field_nodes in fields.items():
         field_def = get_field_def(context.schema, parent_type, field_nodes[0])
@@ -201,20 +205,32 @@ def plan_object(
             # all-literal field leaves `cacheable` True.
             if field_args.inlined_variable_args():
                 plan.cacheable = False
-        elif plan is not None and plan.cache_plans and args_error is None:
-            # legacy resolver path (plan_fn is None): the coerced args are FROZEN onto
-            # FieldPlan.args from this request, and a cache HIT skips the planner and replays
-            # them — so a resolver reading a `$variable`-derived arg would serve a later
-            # request the FIRST request's value. A legacy resolver has no step to re-point, so
-            # the placeholder/cursor rebind cannot fix it; refuse to cache a plan carrying any
-            # variable-derived legacy arg (re-plan per request), the conservative analogue of
-            # the abstract-field bail-out.
-            legacy_variable_args, _ = variable_provenance(field_nodes[0])
-            if legacy_variable_args:
-                plan.cacheable = False
+        else:
+            # no-plan resolver field (plan_fn is None): the resolver-adapter now lives IN
+            # the operation plan as a ResolveStep depending on the bucket parent_step, so
+            # every field carries a FieldPlan.step and completion reads it uniformly from
+            # the bucket store. (`step is None` only survives in the impossible
+            # no-plan-no-parent case below, where it falls back to the inherited parent.)
+            if plan is not None and parent_step is not None:
+                field_step = ResolveStep(
+                    field_def, parent_type, field_nodes, response_name, args, args_error
+                )
+                field_step.add_dependency(parent_step)
+                plan.add_step(field_step)
+                if plan.cache_plans and args_error is None:
+                    # KEEP the legacy cacheability guard: the coerced args are FROZEN onto
+                    # FieldPlan.args from this request, and a cache HIT replays them — so a
+                    # resolver reading a `$variable`-derived arg would serve a later request
+                    # the FIRST request's value, and a ResolveStep has no placeholder to
+                    # re-point. Refuse to cache a plan carrying any variable-derived resolver
+                    # arg (re-plan per request); flipping this to cacheable is deferred to P5.
+                    legacy_variable_args, _ = variable_provenance(field_nodes[0])
+                    if legacy_variable_args:
+                        plan.cacheable = False
 
-        # an object/plan field passes its step down as the child bucket's parent;
-        # a legacy field (or a plan field over leaves) passes the inherited step.
+        # every field passes its step down as the child bucket's parent (a plan field's
+        # step, or a resolver field's ResolveStep); only the impossible no-plan-no-parent
+        # guard leaves `field_step` None, in which case the inherited step is passed.
         child_parent_step = field_step if field_step is not None else parent_step
 
         completer = build_completer(context, return_type, field_nodes)

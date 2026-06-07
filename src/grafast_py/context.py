@@ -11,9 +11,10 @@ The engine is FULLY NATIVE: every GraphQL output-type kind is handled by a
 completer (leaf, object, abstract interface/union, list, arbitrarily nested
 non-null), queries and subscription events run their root fields in parallel,
 mutations run them serially, and both sync and async resolvers are supported with
-native non-null null-bubbling and correct error ``path`` accumulation. Fields
-WITHOUT a plan resolver keep a per-parent resolver-adapter path (``ResolveStep``) so
-plain-resolver schemas — and the graphql-core conformance suite — run unchanged.
+native non-null null-bubbling and correct error ``path`` accumulation. Every field
+carries a step in the operation plan — a plan step, or a resolver-adapter
+(``ResolveStep``) for a plain-resolver field — so plain-resolver schemas, and the
+graphql-core conformance suite, run unchanged through the one unified path.
 
 Production hardening (execution timeout, bounded concurrency, structured logging,
 tracing hooks, configurable pg pool) is OPT-IN via a :class:`GrafastConfig` attached
