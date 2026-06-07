@@ -526,9 +526,17 @@ def complete_stream_field(context, field_plan, outcome, live_idx, state, bridge)
     pending = []
     for k, value in enumerate(outcome.values):
         i = live_idx[k]
+        # P4 hoist channel for the streamed items: every one of THIS parent's list items
+        # (head completed inline + tail drained by the producer) descends into the child layer
+        # owned by parent bucket row `bridge.value_owner[k]`, so each must seed the columns
+        # hoisted OUT of that layer. Carry a per-parent seed — a 1-element `value_owner` the head
+        # expands ×len and each tail item uses as-is. None when nothing was hoisted (byte-identical).
+        item_bridge = (
+            bridge._replace(value_owner=[bridge.value_owner[k]]) if bridge is not None else None
+        )
         result = complete_one_stream_value(
             context, field_plan, list_completer, value, outcome.paths[k],
-            outcome.infos[k], sink, build_stream_record, i, state,
+            outcome.infos[k], sink, build_stream_record, i, state, item_bridge,
         )
         if context.is_awaitable(result):
             pending.append(result)
@@ -545,9 +553,13 @@ def complete_stream_field(context, field_plan, outcome, live_idx, state, bridge)
 
 def complete_one_stream_value(
     context, field_plan, list_completer, value, path, info, sink,
-    build_stream_record, parent_index, state,
+    build_stream_record, parent_index, state, item_bridge=None,
 ):
-    """Complete ONE parent's @stream'd list value (sync → None / async → coroutine)."""
+    """Complete ONE parent's @stream'd list value (sync → None / async → coroutine).
+
+    `item_bridge` is the per-parent P4 hoist seed (a 1-element ``value_owner``) threaded down to
+    the head + tail item completion so streamed child objects seed their hoisted-out columns.
+    """
     stream = field_plan.stream
     if isinstance(stream, _compat.StreamError):
         error = located_error(stream.error, field_plan.field_nodes, path.as_list())
@@ -568,7 +580,7 @@ def complete_one_stream_value(
                 return
             inner = drive_stream_value(
                 context, field_plan, list_completer, resolved, path, info,
-                initial_count, label, sink, build_stream_record, parent_index, state,
+                initial_count, label, sink, build_stream_record, parent_index, state, item_bridge,
             )
             if context.is_awaitable(inner):
                 await inner
@@ -577,15 +589,19 @@ def complete_one_stream_value(
 
     return drive_stream_value(
         context, field_plan, list_completer, value, path, info,
-        initial_count, label, sink, build_stream_record, parent_index, state,
+        initial_count, label, sink, build_stream_record, parent_index, state, item_bridge,
     )
 
 
 def drive_stream_value(
     context, field_plan, list_completer, value, path, info, initial_count, label,
-    sink, build_stream_record, parent_index, state,
+    sink, build_stream_record, parent_index, state, item_bridge=None,
 ):
-    """Complete the head + register the stream producer for one resolved list value."""
+    """Complete the head + register the stream producer for one resolved list value.
+
+    `item_bridge` (per-parent P4 hoist seed) threads into BOTH the inline head completion and the
+    producer that drains the tail, so streamed child objects seed their hoisted-out columns.
+    """
     from .incremental import AsyncStreamProducer, SyncStreamProducer
 
     if initial_count < 0:
@@ -607,12 +623,12 @@ def drive_stream_value(
         iterator = value.__aiter__()
         early_return = getattr(iterator, "aclose", None)
         producer = AsyncStreamProducer(
-            context, field_plan, item_completer, path, info, iterator, initial_count
+            context, field_plan, item_completer, path, info, iterator, initial_count, item_bridge
         )
         # pull + complete the head (items[:initial_count]) inline into the initial data.
         return drain_async_head(
             context, field_plan, producer, path, sink, build_stream_record,
-            label, early_return, parent_index, state,
+            label, early_return, parent_index, state, item_bridge,
         )
 
     if not is_iterable(value):
@@ -630,11 +646,11 @@ def drive_stream_value(
     head_raw = items[:initial_count]
     tail_raw = items[initial_count:]
     producer = SyncStreamProducer(
-        context, field_plan, item_completer, path, info, tail_raw, initial_count
+        context, field_plan, item_completer, path, info, tail_raw, initial_count, item_bridge
     )
     stream_rec = build_stream_record(path, label, producer, None)
     completed_head = complete_stream_head(
-        context, field_plan, item_completer, head_raw, path, info
+        context, field_plan, item_completer, head_raw, path, info, item_bridge
     )
     if context.is_awaitable(completed_head):
 
@@ -659,7 +675,7 @@ def drive_stream_value(
 
 def drain_async_head(
     context, field_plan, producer, path, sink, build_stream_record, label,
-    early_return, parent_index, state,
+    early_return, parent_index, state, item_bridge=None,
 ):
     """Pull + complete the async iterator's head (items[:initialCount]) inline.
 
@@ -688,7 +704,8 @@ def drain_async_head(
             producer._index += 1
         if bubbled is None:
             completed_head = complete_stream_head(
-                context, field_plan, producer._item_completer, raw_head, path, info_of(producer)
+                context, field_plan, producer._item_completer, raw_head, path,
+                info_of(producer), item_bridge,
             )
             if context.is_awaitable(completed_head):
                 completed_head = await completed_head
@@ -717,15 +734,25 @@ def info_of(producer):
     return producer._info
 
 
-def complete_stream_head(context, field_plan, item_completer, head_raw, path, info):
-    """Complete the head items (items[:initialCount]) through the list item completer."""
+def complete_stream_head(context, field_plan, item_completer, head_raw, path, info, item_bridge=None):
+    """Complete the head items (items[:initialCount]) through the list item completer.
+
+    `item_bridge` is the per-parent P4 hoist seed (a 1-element ``value_owner``); since every head
+    item shares the same parent-bucket owner, expand it to one entry per head item so the child
+    object completer projects the hoisted column for each.
+    """
     if not head_raw:
         return []
     item_paths = [path.add_key(idx, None) for idx in range(len(head_raw))]
     item_infos = [info] * len(head_raw)
+    head_bridge = (
+        item_bridge._replace(value_owner=item_bridge.value_owner * len(head_raw))
+        if item_bridge is not None
+        else None
+    )
     return complete_values(
         context, item_completer, list(head_raw), item_paths, item_infos,
-        field_plan.field_nodes, field_plan.field_label,
+        field_plan.field_nodes, field_plan.field_label, head_bridge,
     )
 
 

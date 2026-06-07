@@ -309,6 +309,84 @@ def test_async_stream_equals_inline_list():
     assert stream_payloads > 1
 
 
+def test_stream_threads_hoisted_columns_into_streamed_items():
+    """@stream + hoist=True: streamed child objects still seed their hoisted-out columns.
+
+    Regression for the P7/P4 interaction (C6): a @stream'd list of objects whose child plan has a
+    request-constant step HOISTED OUT of its layer must thread the HoistBridge into BOTH the inline
+    head AND the per-item tail producer — otherwise the streamed Person items run their child layer
+    without the hoisted ``tag`` column. ``Person.tag = load_one(constant, …)`` is request-constant
+    (hoisted to root); ``Person.id`` reads the per-row boundary (stays). Asserts every head +
+    streamed item carries ``tag``, and hoist ON == hoist OFF (the control that always worked).
+    """
+    from grafast_py import (
+        GrafastExecutionContext,
+        access,
+        constant,
+        load_one,
+        make_grafast_schema,
+    )
+    from grafast_py._compat import collect_root_fields
+    from grafast_py.completion import find_object_completer
+    from grafast_py.plan import plan_operation
+
+    rows = [{"id": 1}, {"id": 2}, {"id": 3}]
+    sdl = "type Query { people: [Person!]! } type Person { id: Int! tag: Int! }"
+    query = "{ people @stream(initialCount: 1) { id tag } }"
+
+    def build_schema():
+        def plan_people(parent, args, info):
+            return load_one(constant("all"), lambda keys: [rows for _ in keys])
+
+        def plan_tag(parent, args, info):
+            return load_one(constant("k"), lambda keys: [100 for _ in keys])
+
+        return make_grafast_schema(
+            sdl,
+            {
+                "Query": {"people": plan_people},
+                "Person": {"id": lambda p, a, i: access(p, ("id",)), "tag": plan_tag},
+            },
+        )
+
+    # sanity: the scenario actually hoists Person.tag OUT of the child layer (so the stream path
+    # MUST thread the bridge to recover it) — otherwise this test wouldn't exercise C6 at all.
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = GrafastConfig(hoist=True)
+
+    document = parse(query)
+    operation = document.definitions[0]
+    plan_ctx = _Ctx.build(build_schema(), document)
+    root_fields = collect_root_fields(plan_ctx, plan_ctx.schema.query_type, operation)
+    plan = plan_operation(plan_ctx, operation, plan_ctx.schema.query_type, root_fields)
+    child = find_object_completer(plan.fields[0].completer).child_plan
+    tag_fp = next(fp for fp in child.fields if fp.response_name == "tag")
+    assert tag_fp.step.id in child.layer.hoisted_out_ids
+
+    async def collect(hoist):
+        from graphql.execution import ExperimentalIncrementalExecutionResults
+
+        result = experimental_execute_incrementally(
+            build_schema(), parse(query), None, config=GrafastConfig(hoist=hoist)
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+        assert isinstance(result, ExperimentalIncrementalExecutionResults)
+        items = list(result.initial_result.formatted["data"]["people"])
+        async for patch in result.subsequent_results:
+            for entry in patch.formatted.get("incremental", []) or []:
+                items.extend(entry["items"])
+        return items
+
+    on = asyncio.run(collect(hoist=True))
+    off = asyncio.run(collect(hoist=False))
+
+    expected = [{"id": 1, "tag": 100}, {"id": 2, "tag": 100}, {"id": 3, "tag": 100}]
+    # the bug dropped the bridge → streamed items lost `tag`. Now head + tail recover it: ON == OFF == full.
+    assert on == expected
+    assert off == expected
+
+
 # ----------------------------------------------------------- defer-batching proof
 def test_defer_relation_fires_same_batch_count_as_non_deferred():
     """A @defer'd loader relation over N parents fires the SAME number of batches as inline.

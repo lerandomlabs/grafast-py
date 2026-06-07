@@ -664,7 +664,7 @@ def build_stream_record(path, label, producer, early_return):
     return StreamRec(path, label, producer, early_return)
 
 
-def complete_stream_item(context, field_plan, item_completer, item, item_path, info):
+def complete_stream_item(context, field_plan, item_completer, item, item_path, info, item_bridge=None):
     """Complete ONE streamed item through the item completer → a :class:`StreamItemResult`.
 
     Replicates upstream ``complete_stream_item`` + ``build_stream_item_result``: a nullable-item
@@ -672,6 +672,10 @@ def complete_stream_item(context, field_plan, item_completer, item, item_path, i
     the whole stream (a terminal sentinel carrying the error). Deeper @defer groups revealed
     inside the item are captured as the item's ``children`` (per-item defer records). SYNC →
     a StreamItemResult; async → a coroutine resolving to one.
+
+    `item_bridge` is the per-parent P4 hoist seed (a 1-element ``value_owner``): completing this
+    single item descends into the child layer owned by that parent bucket row, so it seeds the
+    columns hoisted OUT of that layer. None (the default / hoist-off) leaves completion byte-identical.
     """
     from .completion import NonNullCompleter, complete_values
 
@@ -692,6 +696,7 @@ def complete_stream_item(context, field_plan, item_completer, item, item_path, i
         [info],
         field_plan.field_nodes,
         field_plan.field_label,
+        item_bridge,
     )
 
     def build(values):
@@ -793,7 +798,7 @@ class SyncStreamProducer:
     so each item is ensure_future'd only when the driver reaches it), then a terminal Undefined.
     """
 
-    def __init__(self, context, field_plan, item_completer, path, info, tail, initial_count):
+    def __init__(self, context, field_plan, item_completer, path, info, tail, initial_count, item_bridge=None):
         self._context = context
         self._field_plan = field_plan
         self._item_completer = item_completer
@@ -801,6 +806,7 @@ class SyncStreamProducer:
         self._info = info
         self._tail = tail
         self._initial_index = initial_count
+        self._item_bridge = item_bridge
         early = getattr(context, "_grafast_enable_early_execution", False)
         self.queue: List[Any] = []
         if early:
@@ -815,7 +821,8 @@ class SyncStreamProducer:
     def _item_executor(self, item, index):
         item_path = self._path.add_key(index, None)
         return complete_stream_item(
-            self._context, self._field_plan, self._item_completer, item, item_path, self._info
+            self._context, self._field_plan, self._item_completer, item, item_path, self._info,
+            self._item_bridge,
         )
 
     def _first_executor(self):
@@ -849,7 +856,7 @@ class AsyncStreamProducer:
     early so the next ``anext`` only fires when the driver reaches it.
     """
 
-    def __init__(self, context, field_plan, item_completer, path, info, iterator, initial_count):
+    def __init__(self, context, field_plan, item_completer, path, info, iterator, initial_count, item_bridge=None):
         self._context = context
         self._field_plan = field_plan
         self._item_completer = item_completer
@@ -857,6 +864,7 @@ class AsyncStreamProducer:
         self._info = info
         self._iterator = iterator
         self.initial_count = initial_count
+        self._item_bridge = item_bridge
         self._index = 0
         early = getattr(context, "_grafast_enable_early_execution", False)
         self._early = early
@@ -878,7 +886,8 @@ class AsyncStreamProducer:
             )
         item_path = self._path.add_key(index, None)
         completed = complete_stream_item(
-            self._context, self._field_plan, self._item_completer, item, item_path, self._info
+            self._context, self._field_plan, self._item_completer, item, item_path, self._info,
+            self._item_bridge,
         )
         result = await completed if self._context.is_awaitable(completed) else completed
         return StreamItemResult(item=result.item, errors=result.errors, children=result.children)
@@ -908,7 +917,8 @@ class AsyncStreamProducer:
             )
         item_path = self._path.add_key(index, None)
         completed = complete_stream_item(
-            self._context, self._field_plan, self._item_completer, item, item_path, self._info
+            self._context, self._field_plan, self._item_completer, item, item_path, self._info,
+            self._item_bridge,
         )
         # look-ahead: schedule the NEXT pull's entry before completing this one.
         self._append_next()
