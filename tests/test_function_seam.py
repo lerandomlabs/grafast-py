@@ -222,7 +222,7 @@ async def test_grafast_subscribe_round_trips_events():
 
     Covers the version-stable source-event-stream seam (3.2 ``create_source_event_stream``
     is a coroutine; 3.3 returns maybe-awaitable) and the map-async-iterable wrapper that
-    moved between versions. Full incremental subscription delivery is a later phase (P7).
+    moved between versions. Full incremental subscription delivery is not yet covered here.
     """
 
     async def numbers(root, info):

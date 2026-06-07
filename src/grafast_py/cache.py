@@ -4,7 +4,7 @@ Planning is per-request today (``plan.plan_operation`` builds the ObjectPlan tre
 step DAG fresh every request and stashes them on the context). When two requests run the
 SAME document, the plan they produce is identical EXCEPT for the per-request values that
 plan-time inlining baked into the SQL — and once the host expresses those values as
-value-agnostic PLACEHOLDERS (Wave 4), the plan is value-INDEPENDENT and reusable: the
+value-agnostic PLACEHOLDERS, the plan is value-INDEPENDENT and reusable: the
 cached SQL is shared and the per-request VALUES are supplied at SQL-RENDER time from a
 per-request source map, never stored on the shared step. This module is that reuse layer.
 

@@ -12,10 +12,10 @@ it tests graphql-core's *own* execution-context customization hook — graphql-c
 internals, not GraphQL semantics, so an alternative engine cannot satisfy it.
 
 On the 3.3 suite a small, enumerated set of tests is additionally skipped under GRAFAST.
-They fall into known buckets that are out of P6 scope (the function-seam port), not engine
+They fall into known buckets that are out of scope for the function-seam engine, not engine
 regressions — all 3.3-only features or an intentional divergence:
 
-* incremental delivery (``@defer`` / ``@stream``) — a later phase (P7); these tests live
+* incremental delivery (``@defer`` / ``@stream``); these tests live
   outside ``test_defer.py`` / ``test_stream.py`` (in mutations / subscribe / sync) but
   exercise the same incremental machinery.
 * async-iterable-as-list-value — a 3.3 feature where a field returning an async generator
@@ -62,19 +62,19 @@ def pytest_configure(config):
 # unique across the suite). Each maps to its bucket reason. Only consulted on the 3.3 leg.
 _GQL33_OUT_OF_SCOPE = {
     # mutation-with-@defer ordering — incremental delivery interacting with the serial mutation
-    # root; out of P7's @defer/@stream/subscribe scope (the deferred-fragment-in-mutation
-    # ordering guarantee is a deeper interaction). The bulk of the subscribe suite P7 implements;
-    # test_defer.py / test_stream.py run unskipped under P7.
+    # root; outside the @defer/@stream/subscribe support (the deferred-fragment-in-mutation
+    # ordering guarantee is a deeper interaction). The bulk of the subscribe suite is implemented;
+    # test_defer.py / test_stream.py run unskipped.
     "describe_execute_handles_mutation_execution_ordering::mutation_fields_with_defer_do_not_block_next_mutation": "incremental",
     "describe_execute_handles_mutation_execution_ordering::mutation_with_defer_is_not_executed_serially": "incremental",
     "describe_execute_sync::throws_if_encountering_async_iterable_execution_with_check_sync": "incremental",
     "describe_execute_sync::throws_if_encountering_async_iterable_execution_without_check_sync": "incremental",
     # @defer/@stream ON a subscription field: upstream surfaces these as a located field error
     # ("`@defer`/`@stream` directive not supported on subscription operations") nulling the
-    # field while still delivering the rest of the event. P7 delivers correct subscription
+    # field while still delivering the rest of the event. The engine delivers correct subscription
     # events but does not yet inject that subscription-specific defer/stream field error
     # (it needs the collect-time error located at the field whose subfields carry the
-    # directive). Documented P7 partial — see the phase report.
+    # directive). A known current limitation.
     "describe_subscription_publish_phase::subscribe_function_returns_errors_with_defer": "subscription-defer-error",
     "describe_subscription_publish_phase::subscribe_function_returns_errors_with_stream": "subscription-defer-error",
     # async-iterable-as-list-value — a 3.3 feature not yet implemented.
@@ -90,12 +90,12 @@ _GQL33_OUT_OF_SCOPE = {
     "describe_nulls_a_complex_tree_of_nullable_fields_each::throws": "error-sort-order",
 }
 
-# P7 partials: @defer multi-fragment-overlap subPath/dedup, and @stream's async-iterable /
-# per-item-await item-flushing. P7 makes the byte-identical core green (single-fragment defer,
-# nested defer, sync list stream, subscriptions); these remaining families need upstream's
-# subPath / record-graph dedup and the async stream item-batching, reported as the P7 partial.
+# Partial @defer/@stream cases: @defer multi-fragment-overlap subPath/dedup, and @stream's
+# async-iterable / per-item-await item-flushing. The byte-identical core is green (single-fragment
+# defer, nested defer, sync list stream, subscriptions); these remaining families need upstream's
+# subPath / record-graph dedup and the async stream item-batching.
 # Keyed (like the set above) by a unique node-id substring; only consulted on the 3.3 leg.
-# P7 residual partials: a small set of @defer/@stream cases whose DATA is byte-identical but
+# These residual partials are a small set of @defer/@stream cases whose DATA is byte-identical but
 # whose payload GROUPING / ORDERING depends on graphql-core's exact asyncio task-scheduling for
 # same-event-loop-tick item resolution (a list of awaitables / async fields that all resolve in
 # one tick must batch into ONE payload) and for defer-vs-stream completion ordering. The engine's
@@ -103,7 +103,7 @@ _GQL33_OUT_OF_SCOPE = {
 # same per-item batching for the SLOW (multi-tick) cases and ALL async-iterator cases, but does
 # not reproduce CPython's exact producer-runs-ahead interleaving for these same-tick cases, so the
 # items split across payloads (correct data, different grouping) or the defer/stream payloads swap
-# order. These remain @defer/@stream cases (NOT a separate feature) — reported as the P7 partial.
+# order. These remain @defer/@stream cases (NOT a separate feature).
 #
 # Quantified root cause (loop-turn instrumentation, BaseEventLoop._run_once counter): the engine's
 # per-streamed-item / per-promoted-defer-group completion costs ~5 event-loop turns (the nested
@@ -135,12 +135,13 @@ _GQL33_P7_PARTIAL = {
 }
 
 _GQL33_SKIP_REASON = {
-    "incremental": "incremental delivery (@defer/@stream) is a later phase (P7)",
+    "incremental": "@defer-in-mutation ordering and the sync-execution async-iterable check "
+    "are out of scope for this engine",
     "async-iterable-list": "async-iterable-as-list-value is a 3.3 feature not yet ported",
     "cancel-on-exception": "cooperative cancel-on-exception is a 3.3 feature not yet ported",
     "error-sort-order": "data identical; the engine keeps 3.2's deterministic error sort "
     "(stable .formatted across versions) while 3.3 dropped it",
-    "subscription-defer-error": "P7 partial: @defer/@stream-on-subscription field error not "
+    "subscription-defer-error": "@defer/@stream-on-subscription field error not "
     "yet injected (subscription events otherwise correct)",
 }
 
@@ -175,7 +176,7 @@ def pytest_collection_modifyitems(config, items):
                     break
             if matched:
                 continue
-            # P7 residual partials: @defer/@stream cases whose DATA is byte-identical but whose
+            # residual @defer/@stream partials whose DATA is byte-identical but whose
             # payload grouping / ordering depends on CPython's exact asyncio task-scheduling for
             # same-tick item resolution (must batch into one payload) or defer-vs-stream completion
             # order — the engine's record-graph replica does not reproduce that exact interleaving.
@@ -184,7 +185,7 @@ def pytest_collection_modifyitems(config, items):
                 if needle in nodeid:
                     item.add_marker(
                         pytest.mark.skip(
-                            reason="P7 partial: @defer/@stream same-tick payload grouping / "
+                            reason="@defer/@stream same-tick payload grouping / "
                             "defer-vs-stream order depends on exact asyncio scheduling "
                             "(data byte-identical; payload grouping differs)"
                         )

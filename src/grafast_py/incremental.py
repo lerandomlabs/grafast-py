@@ -1,6 +1,6 @@
 """The @defer / @stream incremental-delivery driver (graphql-core 3.3 only).
 
-P7's OWNED payload-assembly engine. It emits the graphql-core 3.3 incremental wire
+The OWNED payload-assembly engine. It emits the graphql-core 3.3 incremental wire
 protocol (the ``pending`` / ``incremental`` / ``completed`` shape) by constructing ONLY
 the user-facing result classes (``InitialIncrementalExecutionResult`` and friends) via
 their public ``__init__`` — it does NOT couple to 3.3's internal
@@ -20,8 +20,9 @@ machinery observably with its own record graph + publisher:
   iterator-exhausted sentinel flushing the tail then emitting the terminal ``completed`` —
   a transcription of ``incremental_graph._on_stream_items``.
 
-The driver runs each grouped-field-set through the engine's own ``execute_object_plan`` (P2.5
-detachment), so a ``loadMany`` inside a deferred fragment over N parents still fires once.
+The driver runs each grouped-field-set through the engine's own ``execute_object_plan`` (the
+detached object-plan execution), so a ``loadMany`` inside a deferred fragment over N parents
+still fires once.
 
 The whole module is import-safe on 3.2 (the result classes are imported lazily inside the
 functions), but it is only ever reached on 3.3 (the entry gates on
@@ -673,7 +674,7 @@ def complete_stream_item(context, field_plan, item_completer, item, item_path, i
     inside the item are captured as the item's ``children`` (per-item defer records). SYNC →
     a StreamItemResult; async → a coroutine resolving to one.
 
-    `item_bridge` is the per-parent P4 hoist seed (a 1-element ``value_owner``): completing this
+    `item_bridge` is the per-parent hoist seed (a 1-element ``value_owner``): completing this
     single item descends into the child layer owned by that parent bucket row, so it seeds the
     columns hoisted OUT of that layer. None (the default / hoist-off) leaves completion byte-identical.
     """
@@ -947,7 +948,7 @@ def make_defer_sink(context, sink_list):
 
 
 def capture_defer_groups(context, defer_plan, parent, path, parent_type):
-    """Mint this object level's deferred fragment records + execution groups (P7).
+    """Mint this object level's deferred fragment records + execution groups.
 
     Transcribes upstream ``add_new_deferred_fragments`` + ``collect_execution_groups``: mints a
     deferred fragment record per new defer usage at ``path`` (parent records resolved from the
@@ -1057,7 +1058,8 @@ def make_group_runner(
     """Build the 0-arg runner that executes one grouped-field-set → a :class:`GroupResult`.
 
     Runs ``field_map`` against ``parent`` at ``path`` through the engine's own
-    ``execute_object_plan`` (P2.5 detachment, so a loadMany over N parents fires once), with a
+    ``execute_object_plan`` (the detached object-plan execution, so a loadMany over N parents
+    fires once), with a
     FRESH error collector + a defer/stream sink whose minted records carry THIS group's
     registry as their enclosing scope (so a nested @defer's parent is one of this group's
     fragments). A null-bubble at the group's top boundary marks the result ``failed``.

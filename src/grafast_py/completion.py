@@ -95,7 +95,7 @@ Completer = Any
 
 
 class HoistBridge(NamedTuple):
-    """The P4 channel carrying a parent bucket's HOISTED columns down to a child bucket.
+    """The channel carrying a parent bucket's HOISTED columns down to a child bucket.
 
     When a step is hoisted to a shallower (parent) layer, its column is produced in the
     PARENT bucket but a child bucket still needs it (keyed by the hoisted step id). This
@@ -184,7 +184,7 @@ def complete_values(
     resolution needs it (and graphql-core reuses the field's single info for every
     list item, so list expansion replicates the parent info per item).
 
-    `bridge` is the P4 :class:`HoistBridge` carrying a parent bucket's hoisted columns
+    `bridge` is the :class:`HoistBridge` carrying a parent bucket's hoisted columns
     down to the object child bucket (it follows list flatten / object scatter so each
     child position seeds the right hoisted value). It is `None` by default and on every
     non-hoisting path, so completion is byte-identical when nothing was hoisted.
@@ -295,7 +295,7 @@ def complete_non_null_values(
 
     The Bubble carries the located cannot-return-null error built at *this*
     boundary's path. An inner value that is already a Bubble propagates unchanged
-    (its originating error is preserved). `bridge` (P4 hoist channel) passes through to
+    (its originating error is preserved). `bridge` (the hoist channel) passes through to
     the inner completer unchanged — a NonNull wrapper does not reshape the value batch.
     """
     inner = complete_values(
@@ -358,7 +358,7 @@ def complete_list_values(
     synchronous flatten+complete path runs; awaitable items are handled by the
     item completer's own awaiting.
 
-    `bridge` (P4 hoist channel) is threaded into the flatten so each item carries the
+    `bridge` (the hoist channel) is threaded into the flatten so each item carries the
     parent BUCKET position of its source list — a list reshapes the value batch, so the
     hoisted column must be re-projected per flattened item.
     """
@@ -424,7 +424,7 @@ def build_list_results(
     # parallel to item_values: each list item reuses its source list's field info
     # (graphql-core threads the field's single `info` through list completion)
     item_infos: List[Any] = []
-    # P4 hoist channel: parallel to item_values, the parent BUCKET position of each item's
+    # hoist channel: parallel to item_values, the parent BUCKET position of each item's
     # source list (carried from `bridge.value_owner[i]`) so the item-level bridge can project
     # the hoisted column per flattened item. Built only when a bridge is present.
     item_owner: List[int] = [] if bridge is not None else None
@@ -524,7 +524,7 @@ def collect_lists(context, completer, completed_items, spans, invalid):
 def complete_object_values(context, completer, values, paths, infos, field_nodes, bridge=None):
     """Complete a batch of object values by recursing into the child bucket.
 
-    `bridge` (P4 hoist channel) carries the parent bucket's hoisted columns + the per-value
+    `bridge` (the hoist channel) carries the parent bucket's hoisted columns + the per-value
     parent-bucket-owner map down to `run_object_children`, which seeds the child layer with the
     hoisted columns (so a hoisted step is read, not re-run, in the child bucket).
     """
@@ -620,7 +620,7 @@ def run_object_children(
 ):
     """Filter out is_type_of failures (as Bubbles), then recurse into the bucket.
 
-    `bridge` (P4 hoist channel) seeds the child layer with any columns the planner HOISTED
+    `bridge` (the hoist channel) seeds the child layer with any columns the planner HOISTED
     out of it: a hoisted step's column was produced once in a shallower (parent) bucket, so
     here we project it to each kept child position via the parent-bucket-owner map and pass it
     as `parent_store` to the child `execute_object_plan`. The child layer's `ordered_steps`
