@@ -241,7 +241,14 @@ async def test_grafast_subscribe_round_trips_events():
     )
     schema = GraphQLSchema(query=make_schema().query_type, subscription=Subscription)
 
-    stream = await grafast_subscribe(schema, "subscription { counter }")
+    # grafast_subscribe mirrors graphql-core's maybe-awaitable shape: on 3.2
+    # create_source_event_stream is a coroutine (so the call returns an awaitable), while on
+    # 3.3 a sync source-stream creation returns the mapped AsyncIterator DIRECTLY. Await only
+    # when the result is awaitable, exactly as a real caller (and graphql-core's own subscribe)
+    # would.
+    stream = grafast_subscribe(schema, "subscription { counter }")
+    if graphql.pyutils.is_awaitable(stream):
+        stream = await stream
     events = [result.formatted async for result in stream]
     assert events == [
         {"data": {"counter": "0"}},

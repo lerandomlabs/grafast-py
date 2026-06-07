@@ -896,7 +896,6 @@ def abstract_child_plan(context, completer, object_type):
     cached = completer.plan_cache.get(object_type.name)
     if cached is not None:
         return cached
-    sub_fields = context.collect_subfields(object_type, completer.field_nodes)
 
     plan = Plan()
     # mirror `plan_operation`: an abstract concrete-type subtree is its own finalize
@@ -917,8 +916,17 @@ def abstract_child_plan(context, completer, object_type):
     # it keeps parity and future-proofs nested subtrees. `is_mutation` stays False — an
     # abstract subtree is only reached from a query/event walk, never a mutation root.
     plan.hoist = config.hoist
+    # carry the incremental decision so a concrete-type subtree under an abstract field
+    # partitions @defer / reads @stream EXACTLY as the operation root does. Off (3.2, or a
+    # 3.3 op without incremental directives) => the legacy collection seam runs, byte-identical.
+    plan.incremental = getattr(context, "_grafast_incremental", False)
     root_step = RootStep()
     plan.add_step(root_step)
+    from .plan import collect_subfields_partitioned
+
+    sub_fields, sub_details, child_deferred = collect_subfields_partitioned(
+        context, plan, object_type, completer.field_nodes
+    )
     child_plan = plan_object(
         context,
         object_type,
@@ -926,6 +934,8 @@ def abstract_child_plan(context, completer, object_type):
         parent_step=root_step,
         plan=plan,
         reason=LayerReason.ROOT,
+        deferred=child_deferred,
+        details_map=sub_details,
     )
     child_plan = finalize_plan(plan, child_plan)
 

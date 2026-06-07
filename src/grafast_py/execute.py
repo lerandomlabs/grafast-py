@@ -20,10 +20,12 @@ completion is awaitable the whole object-plan execution becomes a coroutine, but
 the resulting `data`/`errors` are identical to the synchronous path.
 """
 
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, AsyncIterable, Dict, List, NamedTuple, Optional
 
-from graphql.pyutils import Path
+from graphql.error import GraphQLError, located_error
+from graphql.pyutils import Path, Undefined, is_iterable
 
+from . import _compat
 from .bubble import Bubble
 from .completion import (
     HoistBridge,
@@ -209,6 +211,13 @@ def walk_output(
     """
     state = FieldCompletion(len(parents))
 
+    # P7: mint this level's deferred fragment records BEFORE walking fields, so an INITIAL
+    # object field's deeper @defer groups (captured mid-walk) can resolve a parent record minted
+    # at THIS level (e.g. a root-fragment @defer whose only field merged into the initial data).
+    # No-op off the incremental path (no defer sink). Group CREATION still happens after the walk
+    # (it needs live parents), in `capture_deferred_jobs`.
+    premint_defer_records(context, plan, parents, parent_paths, state)
+
     pending = []
     for field_plan in plan.fields:
         maybe = complete_field(
@@ -217,14 +226,27 @@ def walk_output(
         if maybe is not None:
             pending.append(maybe)
 
+    # P7 early execution: capture this level's @defer groups right after the SYNC field pass
+    # (before awaiting async siblings), so a fast deferred resolver runs before a slow initial
+    # one — matching upstream's collect_execution_groups firing during the walk. Liveness uses
+    # the post-sync-pass state (a parent already bubbled here is dropped; a later async bubble
+    # is handled by the publisher's path filter). Only when early execution is on; otherwise the
+    # capture happens after the gather, where group runs are lazy anyway (byte-identical).
+    early = getattr(context, "_grafast_enable_early_execution", False)
+    if early and pending:
+        capture_deferred_jobs(context, plan, parents, parent_paths, state)
+
     # A synchronous non-null violation short-circuits: graphql-core raises out of
     # the field loop before awaiting any sibling. If every parent in this bucket
     # was already nulled (bubbled) by the synchronous pass, the pending async
     # fields can only write into dead parents, so abandon them and return now.
     if pending and all(b is not None for b in state.bubble):
+        if not early:
+            capture_deferred_jobs(context, plan, parents, parent_paths, state)
         return assemble(state)
 
     if not pending:
+        capture_deferred_jobs(context, plan, parents, parent_paths, state)
         return assemble(state)
 
     async def finish():
@@ -239,9 +261,53 @@ def walk_output(
             await gather(*pending)
         else:
             await gather(*(_gated(semaphore, p) for p in pending))
+        if not early:
+            capture_deferred_jobs(context, plan, parents, parent_paths, state)
         return assemble(state)
 
     return finish()
+
+
+def premint_defer_records(context, plan, parents, parent_paths, state) -> None:
+    """Mint this level's deferred fragment records (per parent path) BEFORE the field walk.
+
+    P7 seam: records must exist before descending into INITIAL object fields, so a deeper @defer
+    group captured mid-walk resolves a parent record minted at this level. Group CREATION still
+    happens after the walk (it needs live parents). No defer sink (the default / non-incremental
+    path) => no-op, byte-identical. Mints for every parent path (liveness is not yet known; a
+    dead parent's records are simply never turned into groups).
+    """
+    if not plan.deferred.new_defer_usages:
+        return
+    if getattr(context, "_grafast_defer_sink", None) is None:
+        return
+    from .incremental import add_new_deferred_fragments, get_defer_registry
+
+    registry = get_defer_registry(context)
+    for path in parent_paths:
+        add_new_deferred_fragments(registry, plan.deferred.new_defer_usages, path)
+
+
+def capture_deferred_jobs(context, plan, parents, parent_paths, state) -> None:
+    """Record this bucket's @defer'd execution groups for the incremental driver.
+
+    P7 seam: when ``plan.deferred`` carries new grouped-field-sets AND the context carries a
+    deferred-group sink (set only by the incremental entry on graphql-core 3.3), record — per
+    LIVE parent — the deferred fragment records minted from this level's new defer usages and an
+    execution group per new grouped-field-set. A parent is live when its output dict survived
+    (not nulled by a non-null violation), so a defer hanging off a bubbled parent is dropped
+    (the cancels-deferred-fields-on-null-bubbling behaviour). No sink (the default /
+    non-incremental path) => this is a no-op and byte-identical.
+    """
+    if not plan.deferred.new_defer_usages and not plan.deferred.new_groups:
+        return
+    sink = getattr(context, "_grafast_defer_sink", None)
+    if sink is None:
+        return
+    for i in range(len(parents)):
+        if not is_live(state, i):
+            continue
+        sink(plan.deferred, parents[i], parent_paths[i], plan.parent_type)
 
 
 async def _gated(semaphore, awaitable):
@@ -412,6 +478,15 @@ def complete_field(
 
             return finish_serial()
 
+    # P7 @stream: a @stream'd list field completes items[:initialCount] inline (into the
+    # initial data) and hands items[initialCount:] to a stream producer the driver drains
+    # item-by-item. Only when a stream sink is present (the incremental entry on 3.3); else
+    # the field completes whole, byte-identical.
+    if field_plan.stream is not None and getattr(context, "_grafast_stream_sink", None):
+        return complete_stream_field(
+            context, field_plan, outcome, live_idx, state, bridge
+        )
+
     completed = complete_values(
         context,
         field_plan.completer,
@@ -428,9 +503,286 @@ def complete_field(
         return None
 
     async def finish():
-        scatter(context, field_plan, await completed, live_idx, outcome.paths, state)
+        resolved = await completed
+        scatter(context, field_plan, resolved, live_idx, outcome.paths, state)
 
     return finish()
+
+
+def complete_stream_field(context, field_plan, outcome, live_idx, state, bridge):
+    """Complete a @stream'd list field: head inline, tail to a per-item stream producer.
+
+    The @stream path (only when a stream sink is present, 3.3): each list value's
+    ``items[:initialCount]`` complete inline into the initial data, and ``items[initialCount:]``
+    (RAW, uncompleted) are handed to a stream producer the driver drains item-by-item with
+    upstream's batching (sync list, list of awaitables, and async iterator all uniform). A
+    @stream arg coercion error or a negative initialCount surfaces as a located field error
+    (the value bubbles). Returns None (sync) or a coroutine, like ``complete_field``.
+    """
+    from .incremental import build_stream_record
+
+    list_completer = find_list_completer(field_plan.completer)
+    sink = context._grafast_stream_sink
+    pending = []
+    for k, value in enumerate(outcome.values):
+        i = live_idx[k]
+        # P4 hoist channel for the streamed items: every one of THIS parent's list items
+        # (head completed inline + tail drained by the producer) descends into the child layer
+        # owned by parent bucket row `bridge.value_owner[k]`, so each must seed the columns
+        # hoisted OUT of that layer. Carry a per-parent seed — a 1-element `value_owner` the head
+        # expands ×len and each tail item uses as-is. None when nothing was hoisted (byte-identical).
+        item_bridge = (
+            bridge._replace(value_owner=[bridge.value_owner[k]]) if bridge is not None else None
+        )
+        result = complete_one_stream_value(
+            context, field_plan, list_completer, value, outcome.paths[k],
+            outcome.infos[k], sink, build_stream_record, i, state, item_bridge,
+        )
+        if context.is_awaitable(result):
+            pending.append(result)
+    if not pending:
+        return None
+
+    async def finish():
+        from asyncio import gather
+
+        await gather(*pending)
+
+    return finish()
+
+
+def complete_one_stream_value(
+    context, field_plan, list_completer, value, path, info, sink,
+    build_stream_record, parent_index, state, item_bridge=None,
+):
+    """Complete ONE parent's @stream'd list value (sync → None / async → coroutine).
+
+    `item_bridge` is the per-parent P4 hoist seed (a 1-element ``value_owner``) threaded down to
+    the head + tail item completion so streamed child objects seed their hoisted-out columns.
+    """
+    stream = field_plan.stream
+    if isinstance(stream, _compat.StreamError):
+        error = located_error(stream.error, field_plan.field_nodes, path.as_list())
+        write_value(context, field_plan, state, parent_index, Bubble(error), path)
+        return None
+    initial_count, label = stream
+
+    def emit(head_completed):
+        write_value(context, field_plan, state, parent_index, head_completed, path)
+
+    if context.is_awaitable(value):
+
+        async def after_await():
+            try:
+                resolved = await value
+            except (GraphQLError, TypeError, ValueError, RuntimeError) as exc:
+                emit(Bubble(located_error(exc, field_plan.field_nodes, path.as_list())))
+                return
+            inner = drive_stream_value(
+                context, field_plan, list_completer, resolved, path, info,
+                initial_count, label, sink, build_stream_record, parent_index, state, item_bridge,
+            )
+            if context.is_awaitable(inner):
+                await inner
+
+        return after_await()
+
+    return drive_stream_value(
+        context, field_plan, list_completer, value, path, info,
+        initial_count, label, sink, build_stream_record, parent_index, state, item_bridge,
+    )
+
+
+def drive_stream_value(
+    context, field_plan, list_completer, value, path, info, initial_count, label,
+    sink, build_stream_record, parent_index, state, item_bridge=None,
+):
+    """Complete the head + register the stream producer for one resolved list value.
+
+    `item_bridge` (per-parent P4 hoist seed) threads into BOTH the inline head completion and the
+    producer that drains the tail, so streamed child objects seed their hoisted-out columns.
+    """
+    from .incremental import AsyncStreamProducer, SyncStreamProducer
+
+    if initial_count < 0:
+        error = located_error(
+            GraphQLError("initialCount must be a positive integer"),
+            field_plan.field_nodes,
+            path.as_list(),
+        )
+        write_value(context, field_plan, state, parent_index, Bubble(error), path)
+        return None
+
+    item_completer = list_completer.item_completer
+
+    if value is None:
+        write_value(context, field_plan, state, parent_index, None, path)
+        return None
+
+    if not is_iterable(value) and isinstance(value, AsyncIterable):
+        iterator = value.__aiter__()
+        early_return = getattr(iterator, "aclose", None)
+        producer = AsyncStreamProducer(
+            context, field_plan, item_completer, path, info, iterator, initial_count, item_bridge
+        )
+        # pull + complete the head (items[:initial_count]) inline into the initial data.
+        return drain_async_head(
+            context, field_plan, producer, path, sink, build_stream_record,
+            label, early_return, parent_index, state, item_bridge,
+        )
+
+    if not is_iterable(value):
+        err = GraphQLError(
+            "Expected Iterable, but did not find one for field"
+            f" '{field_plan.field_label}'."
+        )
+        write_value(
+            context, field_plan, state, parent_index,
+            Bubble(located_error(err, field_plan.field_nodes, path.as_list())), path,
+        )
+        return None
+
+    items = list(value)
+    head_raw = items[:initial_count]
+    tail_raw = items[initial_count:]
+    producer = SyncStreamProducer(
+        context, field_plan, item_completer, path, info, tail_raw, initial_count, item_bridge
+    )
+    stream_rec = build_stream_record(path, label, producer, None)
+    completed_head = complete_stream_head(
+        context, field_plan, item_completer, head_raw, path, info, item_bridge
+    )
+    if context.is_awaitable(completed_head):
+
+        async def finish():
+            head = await completed_head
+            head = scatter_stream_head(context, field_plan, item_completer, head)
+            if isinstance(head, Bubble):
+                write_value(context, field_plan, state, parent_index, head, path)
+                return
+            write_value(context, field_plan, state, parent_index, head, path)
+            sink(stream_rec)
+
+        return finish()
+    head = scatter_stream_head(context, field_plan, item_completer, completed_head)
+    if isinstance(head, Bubble):
+        write_value(context, field_plan, state, parent_index, head, path)
+        return None
+    write_value(context, field_plan, state, parent_index, head, path)
+    sink(stream_rec)
+    return None
+
+
+def drain_async_head(
+    context, field_plan, producer, path, sink, build_stream_record, label,
+    early_return, parent_index, state, item_bridge=None,
+):
+    """Pull + complete the async iterator's head (items[:initialCount]) inline.
+
+    Returns a coroutine (an async iterator always awaits ``anext``). The head items become the
+    field's initial list value; the live iterator is then handed to the driver as a stream
+    record. An error WHILE pulling the head surfaces as a field error (the field bubbles)."""
+
+    from graphql.pyutils import Undefined as _Undefined
+
+    async def run():
+        # pull the raw head items (items[:initialCount]) from the iterator; a pull error before
+        # initialCount surfaces as a FIELD error (the field bubbles, no stream). Exhaustion just
+        # ends the head early. Each item is completed through the list item completer with the
+        # MAIN context so a nullable head item error lands in the initial result's errors.
+        raw_head = []
+        bubbled = None
+        for _ in range(producer.initial_count):
+            try:
+                item = await producer._iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            except (GraphQLError, TypeError, ValueError, RuntimeError) as exc:
+                bubbled = located_error(exc, field_plan.field_nodes, path.as_list())
+                break
+            raw_head.append(item)
+            producer._index += 1
+        if bubbled is None:
+            completed_head = complete_stream_head(
+                context, field_plan, producer._item_completer, raw_head, path,
+                info_of(producer), item_bridge,
+            )
+            if context.is_awaitable(completed_head):
+                completed_head = await completed_head
+            head = scatter_stream_head(
+                context, field_plan, producer._item_completer, completed_head
+            )
+            if isinstance(head, Bubble):
+                bubbled = head.error
+        if bubbled is not None:
+            write_value(context, field_plan, state, parent_index, Bubble(bubbled), path)
+            if early_return is not None:
+                from contextlib import suppress
+
+                with suppress(Exception):
+                    await early_return()
+            return
+        write_value(context, field_plan, state, parent_index, head, path)
+        producer.start()
+        stream_rec = build_stream_record(path, label, producer, early_return)
+        sink(stream_rec)
+
+    return run()
+
+
+def info_of(producer):
+    return producer._info
+
+
+def complete_stream_head(context, field_plan, item_completer, head_raw, path, info, item_bridge=None):
+    """Complete the head items (items[:initialCount]) through the list item completer.
+
+    `item_bridge` is the per-parent P4 hoist seed (a 1-element ``value_owner``); since every head
+    item shares the same parent-bucket owner, expand it to one entry per head item so the child
+    object completer projects the hoisted column for each.
+    """
+    if not head_raw:
+        return []
+    item_paths = [path.add_key(idx, None) for idx in range(len(head_raw))]
+    item_infos = [info] * len(head_raw)
+    head_bridge = (
+        item_bridge._replace(value_owner=item_bridge.value_owner * len(head_raw))
+        if item_bridge is not None
+        else None
+    )
+    return complete_values(
+        context, item_completer, list(head_raw), item_paths, item_infos,
+        field_plan.field_nodes, field_plan.field_label, head_bridge,
+    )
+
+
+def scatter_stream_head(context, field_plan, item_completer, completed_items):
+    """Re-collect completed head items into the list value, handling item bubbles.
+
+    Mirrors ``collect_lists`` for the head: a non-null item bubble nulls the whole list
+    (returned as a Bubble); a nullable item bubble appends its error + None."""
+    item_is_non_null = isinstance(item_completer, NonNullCompleter)
+    out = []
+    for item in completed_items:
+        if isinstance(item, Bubble):
+            if item_is_non_null:
+                return item
+            context.errors.append(item.error)
+            out.append(None)
+            continue
+        out.append(item)
+    return out
+
+
+def find_list_completer(completer):
+    """Return the ListCompleter at the head of a (possibly NonNull-wrapped) @stream'd field."""
+    from .completion import ListCompleter
+
+    if isinstance(completer, ListCompleter):
+        return completer
+    if isinstance(completer, NonNullCompleter):
+        return find_list_completer(completer.inner)
+    return None
 
 
 def hoist_bridge_for_field(field_plan, step_columns, live_idx):
