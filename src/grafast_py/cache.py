@@ -70,7 +70,7 @@ EVICTION. A bounded LRU (``max_entries``, default 1000) evicts the least-recentl
 entry so an adversarial stream of unique documents cannot grow the cache without bound.
 
 OPT-IN. The cache is consulted ONLY when ``GrafastConfig.cache_plans`` is on; the default
-(off) never touches it, so the engine plans per-request exactly as before — byte-identical.
+(off) never touches it, so the engine plans per-request and produces byte-identical output.
 """
 
 from collections import OrderedDict

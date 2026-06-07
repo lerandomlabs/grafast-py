@@ -98,8 +98,8 @@ def apply_laterals(stmt: Any, parent_table: Any, inline_specs: Sequence[InlineSp
     in the FROM and is correlated OUT inside each LATERAL, so the folds compose left-to-right
     into ONE statement.
     """
-    # no specs -> return the statement UNTOUCHED (no add_columns/select_from), so the
-    # default-built parent emits byte-identical SQL to the pre-Wave-3b batched path.
+    # no specs -> return the statement UNTOUCHED (no add_columns/select_from), so a parent
+    # with no folds emits byte-identical SQL to the plain batched path (the default).
     if not inline_specs:
         return stmt
     from_obj = parent_table
@@ -235,11 +235,11 @@ class PgSelectStep(PgCustomizable):
         # math resolves the runtime value per request via ``resolve_placeholder``.
         self.first = first
         self.offset = offset
-        # the inlined child relations this parent absorbed into its own statement (Wave
-        # 3b): empty until the optimize pass attaches a fold, so the default-built step is
-        # byte-identical to the batched path. When present, build_query LEFT JOINs one
-        # LATERAL per spec (see apply_laterals); they fold into the dedup key (two parents
-        # inlining different children must never merge).
+        # the inlined child relations this parent absorbed into its own statement: empty
+        # until the optimize pass attaches a fold, so a step with no folds is byte-identical
+        # to the batched path. When present, build_query LEFT JOINs one LATERAL per spec
+        # (see apply_laterals); they fold into the dedup key (two parents inlining different
+        # children must never merge).
         self.inline_specs: Tuple[InlineSpec, ...] = tuple(inline_specs)
         # dep 0 is the key step; values[0] is the key column at execute time.
         self.add_dependency(key_step)
@@ -522,9 +522,9 @@ class PgSelectStep(PgCustomizable):
         each child relation step that passes EVERY safety condition (FK-correlatable,
         unpaginated, faithfully ordered, unfiltered, json-stable codecs, not a mutation /
         connection), reading ``plan.inline_relations`` and returning ``[]`` when inlining is
-        off. The parent's ``optimize`` (a later Wave 3b step) consumes this to build the
-        replacement parent + rewrite each folded child into a ``NestedExtractStep``; this
-        method only DECIDES, conservatively. A window-sliced (limited) parent cannot host a
+        off. The parent's ``optimize`` consumes this to build the replacement parent +
+        rewrite each folded child into a ``NestedExtractStep``; this method only DECIDES,
+        conservatively. A window-sliced (limited) parent cannot host a
         LATERAL, so it never absorbs a child — return no candidates rather than emit a fold
         that ``build_query`` would assert against.
         """
@@ -566,7 +566,7 @@ class PgSelectStep(PgCustomizable):
         Direction is DOWNWARD: the parent (which owns the SQL that must grow a LATERAL)
         pulls its children in. The safety predicate (:meth:`inline_candidates`) returns the
         children PROVABLY equivalent to fold; with none (inlining off, or every child
-        skipped) this returns ``self`` — the Wave 3a no-op invariant, byte-identical to the
+        skipped) this returns ``self`` unchanged — the no-op invariant, byte-identical to the
         batched path. Otherwise it builds the replacement parent + rewrites each folded
         child into a :class:`NestedExtractStep` (see :func:`fold_inline_candidates`) and
         returns the replacement, which the optimize pass wires in.
@@ -631,9 +631,9 @@ class PgSelectAllStep(PgCustomizable):
         # PARAM so the SQL stays value-agnostic, source-keyed in the dedup key).
         self.first = first
         self.offset = offset
-        # the inlined child relations this root collection absorbed (Wave 3b): empty until
-        # the optimize pass folds one. A root list has ONE bucket entry, so a LATERAL per
-        # spec folds the child rows into the same single statement (see build_query).
+        # the inlined child relations this root collection absorbed: empty until the
+        # optimize pass folds one. A root list has ONE bucket entry, so a LATERAL per spec
+        # folds the child rows into the same single statement (see build_query).
         self.inline_specs: Tuple[InlineSpec, ...] = tuple(inline_specs)
         self.seed_resource_customization(resource)
 
@@ -679,8 +679,8 @@ class PgSelectAllStep(PgCustomizable):
             stmt = stmt.where(predicate)
         if self.order_by:
             stmt = stmt.order_by(*order_clauses(self.order_by))
-        # LIMIT/OFFSET: a plan-time literal int inlines (``.offset(2)`` -> ``OFFSET 2``,
-        # byte-identical to before); a ``Placeholder`` emits a value-LESS bound param
+        # LIMIT/OFFSET: a plan-time literal int inlines the value into the SQL (``.offset(2)``
+        # -> ``OFFSET 2``); a ``Placeholder`` emits a value-LESS bound param
         # (``OFFSET :root_offset``) so the cached SQL is value-agnostic and the runtime value
         # is supplied per request in ``run_params`` — never inlined into a cacheable plan.
         if isinstance(self.offset, Placeholder):

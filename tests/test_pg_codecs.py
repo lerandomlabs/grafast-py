@@ -16,7 +16,7 @@ cover three concerns:
 - DEDUP NEUTRALITY (no DB): a codec rides the POST-grouping decode and an ``sql_type`` is
   resource-static (keyed by ``qualified_table``), so a codec NEVER changes a step's
   ``peer_key`` / ``dedup_params`` — a resource WITH a codec and an identical one WITHOUT
-  produce byte-identical dedup keys (decode is dedup-neutral, per the architecture).
+  produce byte-identical dedup keys (decode is dedup-neutral).
 - DECODE THROUGH EVERY PATH (DB, marked ``pg``): the array/range/enum/composite codecs
   decode correctly through a plain ``= ANY`` select, a window slice, and a Relay connection
   node over the dedicated ``codec_rows`` fixture.
@@ -337,10 +337,10 @@ def test_codec_column_type_drives_keyset_cast():
 # A codec rides the POST-grouping decode and its sql_type is resource-static (keyed by
 # qualified_table), so it NEVER enters a step's dedup key — a resource WITH a codec and an
 # identical one WITHOUT must produce byte-identical dedup keys. This is the codec half of the
-# wave's dedup-correctness invariant: decode is dedup-neutral (it changes no emitted SQL
-# skeleton), so folding a codec into the key would only over-discriminate. The DB-side keyset
-# CAST is resource-static (the same qualified_table => the same column_types => the same SQL),
-# so it is already covered by qualified_table and needs no extra discriminator.
+# dedup-correctness invariant: decode is dedup-neutral (it changes no emitted SQL skeleton), so
+# folding a codec into the key would only over-discriminate. The DB-side keyset CAST is
+# resource-static (the same qualified_table => the same column_types => the same SQL), so it is
+# already covered by qualified_table and needs no extra discriminator.
 
 
 def plain_and_coded_resources():

@@ -180,15 +180,14 @@ def plan_object(
                 parent_type,
                 Path(None, response_name, parent_type.name),
             )
-            # per-argument variable provenance (Wave 4 placeholders): walk this field's
+            # per-argument variable provenance (placeholders): walk this field's
             # argument AST so a plan resolver can tell a `$variable`-derived value from a
             # plan-time literal. Computed when `placeholders` is on OR when `cache_plans` is on
             # — caching NEEDS the provenance so an INLINED variable (read raw, not
             # placeholdered) is detected below and the plan marked non-cacheable; without it a
             # `cache_plans=True` / `placeholders=False` host would bleed the first request's
             # value across requests. Both off (the default) => empty provenance =>
-            # `FieldArgs.is_variable` is always False => every host inlines literals exactly as
-            # before (byte-identical).
+            # `FieldArgs.is_variable` is always False => every host inlines literals by value.
             variable_args, variable_sources = (
                 variable_provenance(field_nodes[0])
                 if (plan.placeholders or plan.cache_plans)
@@ -285,8 +284,8 @@ def variable_provenance(
     Returns the SET of variable-derived argument names plus a mapping arg-name ->
     GraphQL-variable-name, which :class:`FieldArgs` turns into the stable ``"var:<name>"``
     source tag a placeholder dedups by. Arguments given as literals (or as a list/object
-    literal) are not included, so a host inlines them by value exactly as before. This is
-    pure ``graphql.language`` — no execute-internals dependency.
+    literal) are not included, so a host inlines them by value. This is pure
+    ``graphql.language`` — no execute-internals dependency.
     """
     variable_args: Set[str] = set()
     variable_sources: Dict[str, str] = {}
@@ -321,11 +320,11 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     (recursively). After the tree is planned the DAG is deduplicated and the
     surviving `Plan` plus the `RootStep` are stashed on the context for the executor
     (`context._grafast_plan` / `context._grafast_root_step`). Fields without a plan
-    resolver contribute no steps, so for the conformance suite the DAG is empty and
-    the legacy path is entirely unaffected.
+    resolver contribute no steps, so a pure plain-resolver schema yields an empty DAG
+    and the legacy resolver path is entirely unaffected.
 
-    Cross-request plan cache (Wave 4, opt-in)
-    -----------------------------------------
+    Cross-request plan cache (opt-in)
+    ---------------------------------
     When `GrafastConfig.cache_plans` is on, a finalized VALUE-INDEPENDENT plan is cached by
     `(schema identity, document text, operation name, variable fingerprint)` and reused
     across requests of the same document — a HIT skips the whole plan build, stashes the
@@ -364,7 +363,8 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     # plan-level placeholder/caching decisions, threaded off the SAME config the same
     # way: `placeholders` gates whether `plan_object` computes per-argument variable
     # provenance (and threads it into `FieldArgs`); `cache_plans` gates the cross-request
-    # plan cache. Both default-OFF => no provenance computed, nothing cached, byte-identical.
+    # plan cache. Both default-OFF => no provenance computed, nothing cached, literals
+    # inlined by value.
     plan.placeholders = config.placeholders
     plan.cache_plans = config.cache_plans
     root_step = RootStep()
@@ -518,9 +518,10 @@ def finalize_plan(plan: Plan, object_plan: ObjectPlan) -> ObjectPlan:
     tree (post-survivor) so tree-shake measures reachability against the steps the
     executor will actually consume.
 
-    With the shipped default identity `Step.optimize`, `optimize` returns an empty remap,
-    `deduplicate` behaves exactly as before, every step stays reachable from a
-    `FieldPlan.step`, and tree-shake keeps everything — a byte-identical no-op.
+    With the default identity `Step.optimize` (a step that does not optimize returns itself
+    unchanged), `optimize` returns an empty remap, `deduplicate` sees the original DAG, every
+    step stays reachable from a `FieldPlan.step`, and tree-shake keeps everything — so the
+    finalized plan equals the planned one.
     """
     opt_remap = plan.optimize()
     dedup_remap = plan.deduplicate()
@@ -608,7 +609,7 @@ def attach_effect_steps(
     effect alongside the bucket's consumed fields.
 
     With the default identity optimize nothing is ever orphaned, so `orphaned_effects`
-    is empty and this function is never called — a no-op for the conformance path.
+    is empty and this function is never called.
     """
     owner_id_for: Dict[int, int] = {}
     for effect in orphaned_effects:

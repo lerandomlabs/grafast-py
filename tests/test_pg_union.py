@@ -1,7 +1,7 @@
 """pgUnionAll end-to-end over Postgres: the cross-table polymorphism DB suite.
 
-The cross-table shape (the ``pgUnionAll`` DB tests of the polymorphism wave): a GraphQL
-union (``SearchResult = Article | Snippet``) whose concrete types live in SEPARATE tables.
+The cross-table shape (the ``pgUnionAll`` DB tests): a GraphQL union
+(``SearchResult = Article | Snippet``) whose concrete types live in SEPARATE tables.
 :class:`grafast_py.pg.union.PgUnionAllStep` fetches every member in ONE ``UNION ALL``
 statement whose branches project a SHARED, NULL-padded column shape plus a ``__typename``
 literal tag, keyset-slices the merged result over the shared order columns, and (per-parent
