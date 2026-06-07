@@ -327,11 +327,12 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     ---------------------------------
     When `GrafastConfig.cache_plans` is on, a finalized VALUE-INDEPENDENT plan is cached by
     `(schema identity, document text, operation name, variable fingerprint)` and reused
-    across requests of the same document — a HIT skips the whole plan build, RE-BINDS each
-    placeholder to THIS request's variables (`rebind_cached_plan`), and stashes the cached
-    triple. A MISS plans normally and, if the result is cacheable (no variable value was
-    inlined as a literal), stores it. With `cache_plans` off (the default) the cache is never
-    touched, so the path below the cache block plans exactly as it would with no cache present.
+    across requests of the same document — a HIT skips the whole plan build, stashes the
+    SHARED cached triple (no copy) plus this request's SOURCE MAP, and the executor resolves
+    each placeholder from that map into the compiled `params` at render. A MISS plans normally
+    and, if the result is cacheable (no variable value was inlined as a literal), stores it.
+    With `cache_plans` off (the default) the cache is never touched, so the path below the
+    cache block is byte-identical to pre-Wave-4.
     """
     from .core_steps import RootStep
 
@@ -340,6 +341,19 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
         cached = lookup_cached_plan(context, operation, config)
         if cached is not None:
             return cached
+
+    # the per-request SOURCE MAP (source-tag -> variable value) the executor threads via
+    # BucketExtra.source_values so a pg step resolves its placeholders into params at render.
+    # Computed on the MISS path too (uniform with the HIT path), so a placeholder-bearing plan
+    # renders byte-identically whether it was freshly built or served from cache. When neither
+    # placeholders NOR caching is on (the default) no step reads it, so leave it empty/unset —
+    # the `getattr(context, "_grafast_source_values", {})` fallback keeps the path byte-identical.
+    if config.placeholders or config.cache_plans:
+        from .cache import values_by_source
+
+        context._grafast_source_values = values_by_source(
+            context.variable_values, operation
+        )
 
     plan = Plan()
     # thread the plan-level inlining decision off the context's config so each pg
@@ -423,18 +437,18 @@ def owns_abstract_field(object_plan: ObjectPlan) -> bool:
 
 
 def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
-    """Return the cached ObjectPlan for this request (re-bound to its variables), or None.
+    """Return the SHARED cached ObjectPlan for this request (deepcopy-free), or None.
 
-    A cache HIT ISOLATES the shared cached entry into a per-request deep copy
-    (`isolate_cached_plan`) and re-points every placeholder on that COPY to THIS request's
-    variable values (the cached SQL is value-agnostic, so only the bound values move), then
-    re-stashes the COPY's triple on the context for the executor. Isolating per request keeps
-    the shared cache entry IMMUTABLE, so two concurrent requests of the same document with
-    different variables each rebind+execute their own copy and never bleed values into each
-    other — no request-level serialization needed. A MISS returns None so `plan_operation`
-    plans normally. Only called when `cache_plans` is on.
+    A cache HIT stashes the SHARED cached triple DIRECTLY on the context — `context._grafast_plan
+    IS cached.plan`, no copy — plus this request's SOURCE MAP (`_grafast_source_values`: the
+    source-tag -> variable-value map the executor threads via `BucketExtra.source_values`). The
+    cached steps carry NO per-request value (a value-LESS `pg_placeholder` bind, a value-LESS
+    pagination `Placeholder`, a per-request-decoded cursor), so sharing them is concurrency-safe:
+    two concurrent hits of the same document with different variables reuse the identical objects
+    but each renders its OWN source map into its OWN `params`, never bleeding. A MISS returns None
+    so `plan_operation` plans normally. Only called when `cache_plans` is on.
     """
-    from .cache import compute_cache_key, isolate_cached_plan, rebind_cached_plan
+    from .cache import compute_cache_key, values_by_source
 
     cache = config.plan_cache if config.plan_cache is not None else _process_cache()
     key = compute_cache_key(context.schema, operation, context.fragments, config)
@@ -445,13 +459,12 @@ def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
         # a stale `id(schema)` collision (a freed schema's id reused by this one) — treat as a
         # miss so we never serve a plan built against a different schema.
         return None
-    # deep-copy into a per-request plan BEFORE rebinding, so the rebind mutates this request's
-    # own copy and never the shared cache entry (the concurrency-safety guarantee).
-    request_plan = isolate_cached_plan(cached)
-    rebind_cached_plan(request_plan, context.variable_values, operation)
-    context._grafast_plan = request_plan.plan
-    context._grafast_root_step = request_plan.root_step
-    return request_plan.object_plan
+    # the SHARED triple is read-only at execute (no per-request value lives on it); each request
+    # carries its OWN source map, so no copy is needed (the deepcopy-free hit path).
+    context._grafast_source_values = values_by_source(context.variable_values, operation)
+    context._grafast_plan = cached.plan
+    context._grafast_root_step = cached.root_step
+    return cached.object_plan
 
 
 def store_cached_plan(

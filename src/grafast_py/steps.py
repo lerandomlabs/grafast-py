@@ -30,7 +30,7 @@ chain per parent because the graphql-core conformance oracle asserts the complet
 path.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from graphql.pyutils import Path
@@ -44,14 +44,24 @@ class BucketExtra:
     """The per-bucket-invocation extra threaded into a `wants_extra` step's `execute`.
 
     Holds the request `context` (for field_resolver / middleware / build_resolve_info /
-    is_awaitable) and the per-parent `parent_paths` (one Path per bucket position, used to
-    build each resolver `info.path`). It is a FRESH argument per `run_steps` call — never
-    stored on the shared step — so it is concurrency-safe under the async await loop and
-    survives the plan cache deepcopy untouched (it is never part of the cached plan).
+    is_awaitable), the per-parent `parent_paths` (one Path per bucket position, used to
+    build each resolver `info.path`), and the per-request `source_values` (the source-tag ->
+    runtime value map a pg value-step resolves its WHERE / pagination / cursor placeholders
+    from at SQL-render time). It is a FRESH argument per `run_steps` call — never stored on
+    the shared step — so it is concurrency-safe under the async await loop and under the
+    plan cache (two concurrent cache HITs share the cached step objects but each carries its
+    OWN `source_values`, so a placeholder value can never bleed between requests).
+
+    `source_values` is a plain `dict` (core stays sqlalchemy-free): the engine computes it
+    once per request from `context.variable_values` (keyed by the placeholder source tag,
+    `"var:<name>"`) and the pg step injects each value into the compiled statement's params,
+    never onto a shared bind. It is `{}` when the request has no placeholders (the default
+    cache-off path), so a step that reads it gets a byte-identical no-value result.
     """
 
     context: Any
     parent_paths: List[Any]
+    source_values: Dict[str, Any] = field(default_factory=dict)
 
 
 class ResolveStep(Step):

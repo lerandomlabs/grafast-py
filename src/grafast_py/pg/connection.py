@@ -53,11 +53,14 @@ from .ordering import OrderTerm, normalize_order, order_clauses
 from .placeholders import (
     Placeholder,
     placeholder_source_tag,
-    rebind_pagination_value,
-    unwrap_placeholder,
+    resolve_placeholder,
 )
 from .resource import PgResource
 from .steps import as_match_columns, grouping_key, normalize_lookup_key
+
+# sentinel distinguishing "caller omitted the resolved cursor values" (default to the step's
+# plan-time literal decode) from "caller passed None" (genuinely no cursor on that side).
+_UNSET: Any = object()
 
 
 def connection_needs_total(info: Any) -> bool:
@@ -197,6 +200,10 @@ class PgConnectionStep(PgCustomizable):
     """
 
     is_sync_and_safe = False
+    # needs the per-request source-tag -> value map (BucketExtra.source_values) to resolve its
+    # WHERE / page-size / cursor placeholders into the compiled statement's params at render
+    # time (and to digest-validate a variable cursor per request).
+    wants_extra = True
 
     def __init__(
         self,
@@ -257,14 +264,16 @@ class PgConnectionStep(PgCustomizable):
         # reverse paging when last/before is in play; otherwise forward. The guard above
         # ensures the two are mutually exclusive here.
         self.reverse = reverse_arg
-        # keep the raw after/before (a literal cursor str or a ``Placeholder``) so the decode
-        # can be RE-RUN whenever the order mutates (add_order_term) OR a variable-derived cursor
-        # is re-bound for the next cached request (rebind_placeholders) — decoding only at
-        # construction would seek with stale values against a changed order or value. A literal
-        # cursor's rebind is a no-op; ``None`` when the arg was absent.
+        # keep the raw after/before (a literal cursor str or a ``Placeholder``) so a LITERAL
+        # cursor can be RE-DECODED whenever the order mutates (add_order_term), and a VARIABLE
+        # cursor can be resolved + decoded per request at RENDER time. ``None`` when absent.
         self.after = after
         self.before = before
-        self._decode_cursors()
+        # decode LITERAL cursors at plan time (request-stable, and the dedup key reads their
+        # decoded VALUES); a VARIABLE (``Placeholder``) cursor stores no decoded values on the
+        # shared step — it is resolved against this request's source map and decoded at render
+        # (see :meth:`resolve_cursor_values`), so the cached step carries no per-request value.
+        self.after_values, self.before_values = self.decode_literal_cursors()
         # dep 0 is the key step; values[0] is the key column at execute time.
         self.add_dependency(key_step)
         self.seed_resource_customization(resource)
@@ -301,27 +310,60 @@ class PgConnectionStep(PgCustomizable):
             bindparam("keys", value=unique_keys or [], expanding=True)
         )
 
-    def _decode_cursors(self) -> None:
-        """Decode the after/before cursors LOUDLY against the CURRENT order and bound values.
+    def decode_literal_cursors(self) -> Tuple[Optional[List[Any]], Optional[List[Any]]]:
+        """Decode the LITERAL after/before cursors against the current order (plan time).
 
-        Run at construction, whenever the order is mutated (add_order_term), AND whenever a
-        variable-derived cursor is re-bound for a cached request (rebind_placeholders), so the
-        seek values are always validated against the order actually emitted and the value
-        actually bound. A ``Placeholder`` cursor is unwrapped to its current value first. The
-        decode is digest-validated: a cursor minted under a different ordering — or a garbage
-        cursor — raises a clear "minted for a different ordering" ``ValueError`` at plan time
-        rather than seeking with stale values (an IndexError, or worse a SILENT mis-seek for a
-        same-length order change). The decoded VALUES discriminate the dedup key ONLY for a
-        LITERAL cursor; a variable-derived cursor keys off its source tag instead.
+        A LITERAL cursor (a bare str) is request-stable and its decoded VALUES discriminate
+        the dedup key, so it is decoded here at construction (and re-decoded on an order
+        mutation). A VARIABLE (``Placeholder``) cursor is NOT decoded here — its value is not
+        the cached step's to hold; it is resolved + decoded per request at RENDER time (see
+        :meth:`resolve_cursor_values`), keying value-agnostically off its source tag. The
+        decode is digest-validated: a literal cursor minted under a different ordering — or
+        garbage — raises a clear "minted for a different ordering" ``ValueError`` rather than
+        seeking with stale values.
         """
-        after_cursor = unwrap_placeholder(self.after)
-        before_cursor = unwrap_placeholder(self.before)
-        self.after_values: Optional[List[Any]] = (
-            decode_keyset_cursor(after_cursor, self.order_by) if after_cursor else None
+        after_values = (
+            decode_keyset_cursor(self.after, self.order_by)
+            if isinstance(self.after, str) and self.after
+            else None
         )
-        self.before_values: Optional[List[Any]] = (
-            decode_keyset_cursor(before_cursor, self.order_by) if before_cursor else None
+        before_values = (
+            decode_keyset_cursor(self.before, self.order_by)
+            if isinstance(self.before, str) and self.before
+            else None
         )
+        return after_values, before_values
+
+    def resolve_cursor_values(
+        self, source_values: Mapping[str, Any]
+    ) -> Tuple[Optional[List[Any]], Optional[List[Any]]]:
+        """The decoded after/before seek values for THIS request (digest-validated at render).
+
+        A LITERAL cursor's values were decoded at plan time (``after_values`` / ``before_values``
+        on the step), so they pass straight through. A VARIABLE (``Placeholder``) cursor is
+        resolved to THIS request's cursor string from ``source_values`` and decoded HERE — never
+        stored on the shared step, so two concurrent cache HITs decode their OWN cursor with no
+        bleed. The decode is digest-validated per request: a variable cursor minted under a
+        different ordering still raises the same loud ``ValueError`` as a literal one, just at
+        render time.
+        """
+        after_values = self.after_values
+        before_values = self.before_values
+        if isinstance(self.after, Placeholder):
+            after_cursor = resolve_placeholder(self.after, source_values)
+            after_values = (
+                decode_keyset_cursor(after_cursor, self.order_by)
+                if after_cursor
+                else None
+            )
+        if isinstance(self.before, Placeholder):
+            before_cursor = resolve_placeholder(self.before, source_values)
+            before_values = (
+                decode_keyset_cursor(before_cursor, self.order_by)
+                if before_cursor
+                else None
+            )
+        return after_values, before_values
 
     def add_order_term(self, term: Union[str, OrderTerm]) -> None:
         """Append a UNIFORM ordering term (re-normalised with the PK tie-break)."""
@@ -333,38 +375,15 @@ class PgConnectionStep(PgCustomizable):
             order_is_unique=self.order_is_unique,
         )
         self.resource.assert_order_terms_stored(self.order_by)
-        # the order just changed, so any after/before cursor decoded under the OLD order is
-        # now invalid; re-decode against the new order. A now-incompatible cursor (different
-        # digest) is rejected LOUDLY here instead of silently seeking the wrong page.
-        self._decode_cursors()
+        # the order just changed, so any LITERAL after/before cursor decoded under the OLD
+        # order is now invalid; re-decode it against the new order (a now-incompatible cursor
+        # is rejected LOUDLY here). A VARIABLE cursor holds no decoded values here — it decodes
+        # per request at render against this same (mutated) order, so nothing to re-do.
+        self.after_values, self.before_values = self.decode_literal_cursors()
 
     def set_first(self, first: Optional[Union[int, Placeholder]]) -> None:
         """Set the structured per-parent forward page size (literal int or ``Placeholder``)."""
         self.first = first
-
-    def rebind_placeholders(self, values_by_source: Mapping[str, Any]) -> None:
-        """Re-point this connection's WHERE, page-size and CURSOR placeholders to a cached request.
-
-        Extends the base WHERE rebind (``super``) with the Relay pagination placeholders:
-
-        * ``first`` / ``last`` page sizes — a variable-derived size is a :class:`Placeholder`
-          re-pointed by source (a literal int is a no-op);
-        * ``after`` / ``before`` cursors — a variable-derived cursor is a :class:`Placeholder`
-          carrying the FIRST request's cursor string; the cached step decoded it into
-          ``after_values`` / ``before_values`` at build, so on a HIT we re-point the sentinel
-          AND RE-DECODE the new cursor against the current order (digest-validated, so a cursor
-          from a different ordering still fails loud). A literal cursor is left verbatim and its
-          decoded values stand — a no-op.
-        """
-        super().rebind_placeholders(values_by_source)
-        self.first = rebind_pagination_value(self.first, values_by_source)
-        self.last = rebind_pagination_value(self.last, values_by_source)
-        self.after = rebind_pagination_value(self.after, values_by_source)
-        self.before = rebind_pagination_value(self.before, values_by_source)
-        # re-decode the (possibly re-pointed) cursors against the current order — the shared
-        # helper unwraps the new placeholder value and digest-validates, so a cursor from a
-        # different ordering still fails loud.
-        self._decode_cursors()
 
     # ------------------------------------------------------------------ SQL build
 
@@ -383,55 +402,66 @@ class PgConnectionStep(PgCustomizable):
             for t in self.order_by
         )
 
-    def page_size(self) -> Optional[int]:
-        """The active page size as a runtime int, unwrapping a variable-derived ``Placeholder``.
+    def page_size(self, source_values: Mapping[str, Any] = {}) -> Optional[int]:
+        """The active page size as a runtime int, resolving a variable-derived ``Placeholder``.
 
         ``last`` for reverse paging, ``first`` for forward; a ``Placeholder`` yields its
-        request value. The page arithmetic (``page_limit`` / the one-extra-row probe in
-        ``build_connection``) reads THIS, so a placeholder page size pages exactly like a
-        literal — only the dedup key (which keeps the sentinel) differs.
+        request value from ``source_values``. The page arithmetic (``page_limit`` / the
+        one-extra-row probe in ``build_connection``) reads THIS, so a placeholder page size
+        pages exactly like a literal — only the dedup key (which keeps the sentinel) differs.
         """
-        return unwrap_placeholder(self.last if self.reverse else self.first)
+        return resolve_placeholder(self.last if self.reverse else self.first, source_values)
 
-    def page_limit(self) -> Optional[int]:
+    def page_limit(self, source_values: Mapping[str, Any] = {}) -> Optional[int]:
         """The per-partition row cap: the page size PLUS ONE extra (for hasNextPage)."""
-        size = self.page_size()
+        size = self.page_size(source_values)
         return None if size is None else size + 1
 
-    def cursor_predicate(self):
+    def cursor_predicate(
+        self, after_values: Optional[List[Any]], before_values: Optional[List[Any]]
+    ):
         """The keyset WHERE predicate for the active cursor, or ``None`` when unpaged.
 
         Forward: rows strictly AFTER the ``after`` cursor. Reverse: rows strictly BEFORE
         the ``before`` cursor (built against the request order; the comparator flips
-        internally). The values are plan-time-known (decoded in ``__init__``).
+        internally). The seek values are passed in (resolved per request via
+        :meth:`resolve_cursor_values`), never read off the shared step.
         """
         if self.reverse:
-            if self.before_values is None:
+            if before_values is None:
                 return None
             return keyset_where(
                 self.order_by,
-                self.before_values,
+                before_values,
                 after=False,
                 column_types=self.resource.column_types,
             )
-        if self.after_values is None:
+        if after_values is None:
             return None
         return keyset_where(
             self.order_by,
-            self.after_values,
+            after_values,
             after=True,
             column_types=self.resource.column_types,
         )
 
-    def inner_predicates(self) -> List[Any]:
+    def inner_predicates(
+        self, after_values: Optional[List[Any]], before_values: Optional[List[Any]]
+    ) -> List[Any]:
         """Host customization predicates AND the keyset predicate for the INNER WHERE."""
         predicates = list(self.where_predicates)
-        cursor = self.cursor_predicate()
+        cursor = self.cursor_predicate(after_values, before_values)
         if cursor is not None:
             predicates.append(cursor)
         return predicates
 
-    def build_page_query(self, unique_keys: Optional[List[Any]] = None):
+    def build_page_query(
+        self,
+        unique_keys: Optional[List[Any]] = None,
+        source_values: Mapping[str, Any] = {},
+        after_values: Any = _UNSET,
+        before_values: Any = _UNSET,
+    ):
         """Build the batched window-sliced PAGE SELECT (ONE statement across parents).
 
         The inner query filters the key match (``= ANY(:keys)`` single / tuple-IN
@@ -443,10 +473,18 @@ class PgConnectionStep(PgCustomizable):
         return — the slice is IN SQL. ``unique_keys`` supplies the composite IN list at
         build time (ignored by the single fast path).
 
+        ``after_values`` / ``before_values`` are this request's decoded seek values (from
+        :meth:`resolve_cursor_values`); when omitted (a direct build call) they default to the
+        step's plan-time-decoded LITERAL values, so a literal cursor still seeks.
+
         Computed attributes (``expression.label(name)`` over the table columns) are
         projected in the INNER (table-scope) select and re-selected by label in the outer,
         so each node row carries the computed value with no extra statement.
         """
+        if after_values is _UNSET:
+            after_values = self.after_values
+        if before_values is _UNSET:
+            before_values = self.before_values
         match_cols = [column(c) for c in self.match_columns]
         cols = [column(c) for c in self.resource.columns]
         computed = self.resource.computed_projections()
@@ -469,7 +507,7 @@ class PgConnectionStep(PgCustomizable):
             .select_from(tbl)
             .where(self.match_predicate(unique_keys))
         )
-        for predicate in self.inner_predicates():
+        for predicate in self.inner_predicates(after_values, before_values):
             inner = inner.where(predicate)
         inner = inner.subquery()
 
@@ -481,7 +519,7 @@ class PgConnectionStep(PgCustomizable):
         stmt = select(*outer_cols).order_by(
             *[inner.c[c] for c in self.match_columns], inner.c["__rn"]
         )
-        if self.page_limit() is not None:
+        if self.page_limit(source_values) is not None:
             # per-partition upper bound: __rn <= page_limit (bound param; page + 1 extra).
             stmt = stmt.where(inner.c["__rn"] <= bindparam("page_limit"))
         return stmt
@@ -585,7 +623,7 @@ class PgConnectionStep(PgCustomizable):
         }
 
     async def run_queries(
-        self, unique_keys: List[Any]
+        self, unique_keys: List[Any], source_values: Mapping[str, Any] = {}
     ) -> Tuple[List[Dict[str, Any]], Dict[Any, int], Dict[Any, List[Dict[str, Any]]]]:
         """Run the page query (always), the count (iff ``needs_total``), the aggregate (iff selected).
 
@@ -596,20 +634,32 @@ class PgConnectionStep(PgCustomizable):
         single-column path binds ``keys`` at execute time; the composite path bakes the IN
         list at build time, so it passes no ``keys`` param. The aggregate is a THIRD statement
         at most — issued only when the selection set asks for one.
+
+        ``source_values`` resolves THIS request's variable-derived cursors (decoded here per
+        request, never on the shared step), page size, and WHERE placeholder values, all
+        injected into the params so a value-LESS placeholder bind executes with this request's
+        value. The count/aggregate share the SAME WHERE placeholder values (they AND the same
+        ``where_predicates``), so they carry ``where_params`` too.
         """
         request = current_pg_request()
-        params: Dict[str, Any] = {}
+        after_values, before_values = self.resolve_cursor_values(source_values)
+        where_params = self.where_params(source_values)
+        params: Dict[str, Any] = dict(where_params)
         if not self.is_composite:
             params["keys"] = unique_keys
-        if self.page_limit() is not None:
-            params["page_limit"] = self.page_limit()
+        if self.page_limit(source_values) is not None:
+            params["page_limit"] = self.page_limit(source_values)
         rows = await request.executor.run(
-            self.build_page_query(unique_keys), params, settings=request.settings
+            self.build_page_query(
+                unique_keys, source_values, after_values, before_values
+            ),
+            params,
+            settings=request.settings,
         )
 
         totals: Dict[Any, int] = {}
         if self.needs_total:
-            count_params: Dict[str, Any] = {}
+            count_params: Dict[str, Any] = dict(where_params)
             if not self.is_composite:
                 count_params["keys"] = unique_keys
             count_rows = await request.executor.run(
@@ -621,7 +671,7 @@ class PgConnectionStep(PgCustomizable):
 
         aggregates: Dict[Any, List[Dict[str, Any]]] = {}
         if self.has_aggregates:
-            agg_params: Dict[str, Any] = {}
+            agg_params: Dict[str, Any] = dict(where_params)
             if not self.is_composite:
                 agg_params["keys"] = unique_keys
             agg_rows = await request.executor.run(
@@ -641,6 +691,9 @@ class PgConnectionStep(PgCustomizable):
         rows: List[Dict[str, Any]],
         total: int,
         aggregate_rows: Sequence[Dict[str, Any]] = (),
+        source_values: Mapping[str, Any] = {},
+        after_values: Optional[List[Any]] = None,
+        before_values: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Assemble one parent's page rows + total + aggregates into a Relay connection dict.
 
@@ -656,11 +709,16 @@ class PgConnectionStep(PgCustomizable):
         row's aggregate values are surfaced flat under ``aggregates``; with an extra GROUP BY
         each bucket's group_by key columns AND aggregate values are surfaced under
         ``aggregateGroups``. Both are absent (``None``) when no aggregate is selected, so an
-        unaggregated connection's shape is byte-identical to one built with aggregates off.
+        unaggregated connection is byte-identical to before.
+
+        ``source_values`` resolves the variable-derived page size for the one-extra-row probe;
+        ``after_values`` / ``before_values`` (this request's decoded seek values) drive the
+        ``hasNextPage``/``hasPreviousPage`` presence flags — both per request, never off the
+        shared step.
         """
-        # the active page size as a runtime int (unwrapping a variable-derived Placeholder),
+        # the active page size as a runtime int (resolving a variable-derived Placeholder),
         # so the one-extra-row probe is computed against the real size.
-        size = self.page_size()
+        size = self.page_size(source_values)
         has_extra = size is not None and len(rows) > size
         page = rows[:size] if has_extra else rows
         # reverse paging numbered from the tail; restore the requested (forward) order.
@@ -683,12 +741,12 @@ class PgConnectionStep(PgCustomizable):
             # reverse: the extra row probes for an EARLIER page (hasPreviousPage); a
             # `before` cursor means later rows exist (hasNextPage).
             has_previous = has_extra
-            has_next = self.before_values is not None
+            has_next = before_values is not None
         else:
             # forward: the extra row probes for a LATER page (hasNextPage); an `after`
             # cursor means earlier rows exist (hasPreviousPage).
             has_next = has_extra
-            has_previous = self.after_values is not None
+            has_previous = after_values is not None
 
         page_info = {
             "hasNextPage": has_next,
@@ -745,16 +803,26 @@ class PgConnectionStep(PgCustomizable):
             for a in self.aggregates
         }
 
-    def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
+    def execute(self, count: int, values: List[List[Any]], extra=None) -> List[Any]:
+        # `extra` is always supplied in production; the default covers a direct execute() call
+        # in a unit test with no placeholders.
+        source_values = extra.source_values if extra is not None else {}
         composite = self.is_composite
         keys = [normalize_lookup_key(k, composite) for k in values[0]]
         unique_keys = [k for k in dict.fromkeys(keys) if k is not None]
         if not unique_keys:
-            empty = self.build_connection([], 0)
+            # an empty bucket still resolves cursor presence for the empty connection's
+            # pageInfo (per request, digest-validated), but issues no query.
+            after_values, before_values = self.resolve_cursor_values(source_values)
+            empty = self.build_connection(
+                [], 0, source_values=source_values,
+                after_values=after_values, before_values=before_values,
+            )
             return [dict(empty) for _ in range(count)]
 
         async def run():
-            rows, totals, aggregates = await self.run_queries(unique_keys)
+            rows, totals, aggregates = await self.run_queries(unique_keys, source_values)
+            after_values, before_values = self.resolve_cursor_values(source_values)
             by_key: Dict[Any, List[Dict[str, Any]]] = {}
             for row in rows:
                 by_key.setdefault(grouping_key(row, self.match_columns), []).append(row)
@@ -763,6 +831,9 @@ class PgConnectionStep(PgCustomizable):
                     by_key.get(keys[i], []),
                     totals.get(keys[i], 0),
                     aggregates.get(keys[i], []),
+                    source_values=source_values,
+                    after_values=after_values,
+                    before_values=before_values,
                 )
                 for i in range(count)
             ]

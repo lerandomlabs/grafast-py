@@ -119,24 +119,6 @@ class Step:
     def finalize(self) -> None:
         """Last-chance precompute before execution (default: no-op)."""
 
-    def rebind_placeholders(self, values_by_source: Dict[str, Any]) -> None:
-        """Re-point this step's variable-derived placeholder VALUES (default: no-op).
-
-        The plan-cache rebind hook: a CACHED plan's steps were built carrying the
-        FIRST request's placeholder values (a ``pg_placeholder`` bindparam's ``value=``, a
-        pagination ``Placeholder``'s ``value``). On a cache HIT for a DIFFERENT request, the
-        cache re-points each placeholder to THIS request's value before execution, keyed by
-        the placeholder's stable SOURCE tag (``"var:<name>"`` -> the request's variable
-        value). The dedup KEY is value-agnostic and source-keyed, so the SQL shape is shared
-        across requests; only the bound VALUES differ, and this hook updates them in place.
-
-        The default is a no-op: a step with no placeholders (every core step, and a pg step
-        whose values are all plan-time literals) has nothing to re-point, so a plan that was
-        cached without any placeholders rebinds to a no-op. Pg steps that carry a placeholder
-        (a WHERE ``pg_placeholder`` or a pagination ``Placeholder``) override this to update
-        their bound values from ``values_by_source``.
-        """
-
 
 def run_steps(
     count: int,
