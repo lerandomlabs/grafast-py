@@ -17,42 +17,50 @@ experimental Python re-implementation of the core ideas of Graphile's Grafast.
 
 ## The core design choice (and its trade-off)
 
-grafast-py is a **drop-in `graphql-core` `ExecutionContext`** — a batching layer that
-slots *on top of* graphql-core, **not** a replacement engine. (Upstream Grafast, by
-contrast, owns the entire execution pipeline and uses graphql-js only for the type
-system.) That single decision defines what this library is and isn't — read it before
-adopting:
+grafast-py reuses graphql-core's **type system, parser, validation and leaf helpers**
+(argument/variable coercion, scalar serialize, `GraphQLError`, `located_error`) but
+**owns execution**: it is a genuine plan-then-execute engine, not a field-by-field walk
+on top of graphql-core's `complete_value`. You adopt it either as a drop-in
+`ExecutionContext` (`execution_context_class=GrafastExecutionContext`) or through the
+function seam (`grafast_execute` / `grafast_subscribe`); both run the *same* pipeline.
+That single decision defines what this library is and isn't — read it before adopting:
 
 **What it buys you**
 
-- **Adoption is a one-liner** (`execution_context_class=GrafastExecutionContext`): no new
-  server, no rewrite, and planned fields coexist with ordinary graphql-core resolvers in
-  the *same* schema.
-- **A small, legible core** (~1.5k lines vs upstream's ~26k): one tree-shaped plan, not a
-  separate layer-plan / output-plan machinery.
-- **Correctness largely for free**: graphql-core's own execution conformance suite is the
-  oracle, so a plain-resolver schema behaves byte-identically to stock graphql-core.
+- **Adoption is a one-liner** (`execution_context_class=GrafastExecutionContext`, or call
+  `grafast_execute`): no new server, no rewrite, and planned fields coexist with ordinary
+  graphql-core resolvers in the *same* schema.
+- **A small, legible core** (a fraction of upstream's ~26k lines): an explicit **two-tree
+  model** — a `LayerPlan` (batched execution) de-fused from an `OutputPlan` (serialization),
+  mirroring upstream Grafast's substrate at a fraction of its size — rather than a
+  field-by-field walk fused to graphql-core's completion.
+- **One execution path**: every field is a *step* — a plan step, or a resolver-adapter
+  (`ResolveStep`) wrapping a plain resolver — so a plain-resolver schema and the full
+  graphql-core conformance suite run through the same machinery, byte-identically to stock
+  graphql-core. graphql-core's own execution conformance suite is the oracle.
 - **The asymptotic win equals upstream**: O(depth) batched SQL, not O(rows) — the N+1 fix
   is fully here.
+- **Incremental delivery + subscriptions** ship on the graphql-core 3.3 line: `@defer`,
+  `@stream` and subscriptions run through the owned `OutputPlan` / incremental driver (see
+  the 3.3 tier below).
 
 **What it costs**
 
-- Execution is **fused with graphql-core's field-by-field, tree-shaped completion.**
-  Optimizations upstream gets from its separate `LayerPlan` / `OutputPlan` substrate are
-  therefore harder here, and are deliberately **scoped or opt-in**: query inlining
-  (`LATERAL`) covers the common relation shapes and *falls back* to the batched path
-  otherwise; cross-request plan caching is opt-in and conservative; step **hoisting** and
-  **`@defer`/`@stream`** are not implemented (incremental delivery is the one feature this
-  model genuinely fights — it would require owning output planning).
-- So the gap vs upstream is **constant-factor** (round-trips, a few redundant step runs),
-  **not asymptotic** — and our optimizers intentionally cover fewer cases.
-- We are **coupled to graphql-core's execution semantics and release cadence** (e.g.
-  incremental delivery would track graphql-core 3.3).
+- The gap vs upstream Grafast is **constant-factor** (round-trips, a few redundant step
+  runs), **not asymptotic** — and the optimizers (LATERAL inlining, cross-parent hoisting,
+  plan caching) intentionally cover fewer cases and **fall back** to the batched path on any
+  uncertain shape. Inlining and hoisting **ship dark** (opt-in `GrafastConfig` flags) this
+  wave.
+- We remain **coupled to graphql-core's type system, validation and execution semantics**
+  (the deliberate reuse), and to its release lines: incremental delivery / subscriptions
+  ride the **graphql-core 3.3 alpha** line (the 3.2 line has no incremental delivery).
+- The 3.3 `@defer`/`@stream` tier carries **7 documented payload-grouping cases**: the
+  response *data* is byte-identical to upstream, but the *chunk grouping/ordering* of the
+  incremental payloads can differ (identical after client reassembly — see the tier below).
 
-**In one line:** if you want pragmatic Grafast-style batching for an *existing* graphql-core
-/ Ariadne app, this is the right tool and the trade-off is the whole point. If you need
-upstream-class *optimization power*, that is a different design — one that owns execution
-on top of graphql-core's type-system / parser / validation (≈ upstream's size) — which this
+**In one line:** if you want Grafast-style batching for an *existing* graphql-core / Ariadne
+app — on either the 3.2 or the 3.3 line — this is the right tool. If you need upstream-class
+*optimization power* across every shape, that is upstream Grafast (≈ its size), which this
 library deliberately is **not**.
 
 ## Install
@@ -98,9 +106,51 @@ schema = make_executable_schema(type_defs, GrafastSchemaBindable(plans))
 # then call ariadne's graphql(..., execution_context_class=GrafastExecutionContext)
 ```
 
-Fields **without** a plan resolver keep the ordinary per-parent resolver path, so an
-existing plain-resolver schema runs unchanged (this is exactly why the full
-graphql-core 3.2.8 execution conformance suite passes against this engine).
+Fields **without** a plan resolver are adapted into a resolver step (`ResolveStep`) on the
+**same** unified execution path — there is no separate per-parent resolver path. Every
+field is a step (a plan step or a `ResolveStep`), so an existing plain-resolver schema runs
+byte-identically to stock graphql-core (this is exactly why the full graphql-core execution
+conformance suite passes against this engine).
+
+### The function seam (no `ExecutionContext` subclass)
+
+`GrafastExecutionContext` is a thin **drop-in shim**: its `execute_operation` delegates
+straight into the same core (`run_planned_operation`) that the function-level entry points
+run, so the two share one pipeline. When you can't thread an execution-context class
+through your host, call the engine directly — it returns a plain `graphql.ExecutionResult`
+on every version:
+
+```python
+from graphql import parse
+from grafast_py import grafast_execute, grafast_subscribe
+
+result = grafast_execute(schema, parse(query), variable_values=vars)
+
+# subscriptions (graphql-core 3.3): grafast_subscribe mirrors graphql-core's maybe-awaitable
+# shape — it returns the mapped AsyncIterator directly when source-stream creation is sync,
+# or a coroutine of it when async; await only if awaitable.
+stream = grafast_subscribe(schema, parse(subscription))
+```
+
+`grafast_execute` accepts the same arguments as graphql-core's `execute` (document/string,
+`root_value`, `context_value`, `variable_values`, `operation_name`, resolvers, `config`).
+
+### graphql-core 3.2 and 3.3 (dual-version)
+
+The engine runs on **both** the graphql-core 3.2 line and the 3.3-alpha line. Version-specific
+differences (`get_field_def`, `collect_fields`, error-sort, the incremental classes) are isolated
+behind a feature-probed seam in `grafast_py._compat`, so one engine core serves both. The pin is
+`graphql-core>=3.2.8` (no upper cap), which admits either line. CI runs a two-leg matrix proving
+the seam on both.
+
+To run the 3.3 leg locally, build the sibling env and use it directly (the default `.venv`
+keeps graphql-core 3.2):
+
+```bash
+bash scripts/venv33.sh                                   # builds .venv33 with graphql-core 3.3 alpha
+.venv33/bin/python scripts/fetch_conformance.py 3.3.0a12 # fetch the matching conformance suite
+.venv33/bin/python -m pytest conformance/_suite/execution -p anyio -q
+```
 
 ## Plan-resolver example (in-memory, no DB)
 
@@ -487,7 +537,9 @@ Two opt-in flags (both default **OFF**, both ship dark) let a host reuse a plan 
   value-independent plan is cached** — every SQL-affecting variable value must be either a
   same-every-request literal or a value-agnostic placeholder; a plan that inlined a `$variable` as a
   literal is value-specific and is *never* cached for reuse. On a cache **hit** the stored plan is
-  re-used and each placeholder is **re-bound** to this request's variable values (the cached SQL is
+  re-used **without deepcopy** — per-request variable values are **render-injected** at execute
+  time, never mutated into the shared plan, so the cached plan is safe to share across concurrent
+  requests; each placeholder is **re-bound** to this request's variable values (the cached SQL is
   value-agnostic, so only the bound values move). It is a pure optimization: a hit changes only
   *whether* planning re-runs — never the SQL text or the result data.
 
@@ -513,19 +565,80 @@ caching — every existing exact-data **and** statement-count assertion still ho
 hit changes only whether planning re-runs and a placeholder changes only how a value-agnostic value
 is dedup-keyed, never the SQL or the data.
 
+## Cross-parent step hoisting (experimental, opt-in, ships dark)
+
+`hoist` (a `GrafastConfig` field, default **OFF**) is a pure optimization that **lifts** a step
+whose inputs are constant across a child bucket up into a shallower layer, so it runs
+once-per-request (or once-per-few-parents) instead of once-per-child-bucket. It changes *where* a
+step runs, never *whether* it runs — no step is replaced, no `FieldPlan.step` reference moves, only
+the column's production layer shifts — so the data is **byte-identical** to the naive plan; the
+hoisted column is produced in the parent bucket and threaded down to the child bucket as an extra
+`parent_store` seed (the child reads it, never re-runs it). It is **disabled entirely under
+mutations** (a serial mutation root must not be reordered). With the flag off (the default) the
+finalize pass is a no-op.
+
+```python
+from grafast_py import GrafastConfig, GrafastExecutionContext
+
+class HoistContext(GrafastExecutionContext):
+    grafast_config = GrafastConfig(hoist=True)   # default False (ships dark)
+```
+
+Like inlining/caching, you can flip it on suite-wide as a byte-identical oracle:
+`GRAFAST_HOIST=1 uv run pytest tests` re-runs everything with hoisting forced on (the existing
+corpus has no hoistable shape, so it is byte-identical including fetchCounts; `tests/test_hoist.py`
+constructs a hoistable shape and proves relocation + fire-once + the mutation guard).
+
+## Incremental delivery: `@defer` / `@stream` / subscriptions (graphql-core 3.3 only)
+
+On the graphql-core **3.3** line the engine implements incremental delivery and subscriptions
+through the owned `OutputPlan` + an incremental driver (a driver-owned record graph + a publisher
+emitting the 3.3 `pending` / `incremental` / `completed` wire protocol). Drive it via
+`grafast_py.entry.experimental_execute_incrementally` (or, when `install()` is active, graphql-core's
+own `experimental_execute_incrementally`); subscriptions ride the same path via `grafast_subscribe`.
+It is a **3.3-only tier** — gated on `_compat.supports_incremental()`, absent on the 3.2 line, which
+has no incremental delivery.
+
+It covers single-fragment `@defer`, nested `@defer`, sync-list `@stream`, **all** async-iterator
+`@stream` cases, and subscriptions **byte-identically** to upstream graphql-core (the 49
+slow-stream / async-iterator cases pass).
+
+**Honest limitation — 7 documented payload-grouping cases.** For 7 specific `@defer`/`@stream`
+cases the response **data is byte-identical** to upstream, but the **payload chunk-grouping /
+ordering differs**: items that upstream batches into one incremental payload may arrive as separate
+payloads, or a defer-vs-stream payload pair may swap order. **After client reassembly the result is
+identical.** The cases are: 4 same-tick stream-item-batching cases (a list of awaitables /
+async-resolved items that all resolve in one event-loop tick must batch into one payload, plus 3
+error-after-initial-count variants), 2 defer-vs-stream completion-order cases, and 1 nested-deferred
+group resolver-start-timing case (see `conformance/conftest.py`, the `_GQL33_P7_PARTIAL` set).
+
+**Root cause** (quantified by event-loop-turn instrumentation): the step engine's per-streamed-item /
+per-promoted-defer-group completion costs ~5 event-loop turns vs graphql-core's ~1. Upstream's
+single-payload batching is *emergent* from that cheap per-item cost — its producer runs ahead of its
+consumer, so same-tick items drain into one payload. The only fix that reproduces it exactly is
+reducing the engine's per-item/per-group await count to ~1 turn (in `execute.py` / `completion.py`),
+which is high blast radius on the green 3.2 baseline and the 49 passing slow-stream cases; it is
+deliberately out of scope this wave. Whether to advertise this 3.3-alpha tier as production-shippable
+now, or gate it until graphql-core 3.3 stabilises, is a deployment decision (the engine's 3.2 path is
+unaffected).
+
 ## Status / caveats
 
-This engine **passes a rigorous internal gate set**: the full graphql-core 3.2.8
-execution conformance suite (302 on the stock executor / 300 + 2 skipped through this
+This engine **passes a rigorous internal gate set**: on the graphql-core **3.2** line the
+full execution conformance suite (302 on the stock executor / 300 + 2 skipped through this
 engine), differential parity vs the reference Node Grafast (`tests/differential/`), an
-O(depth) N+1 benchmark, and a concurrent soak. **"Passes our gates" is not the same as
+O(depth) N+1 benchmark, and a concurrent soak; on the graphql-core **3.3** line the full
+execution conformance suite runs through the engine (396 passed, including `@defer`/`@stream`
+modulo the 7 documented payload-grouping cases above). **"Passes our gates" is not the same as
 "validated against your production workload."** Before running with real money: pin
 the version, run the differential harness against **your** schema and fixtures,
 load-test with **your** pool size and concurrency, and commission a security review.
 
-Not yet covered: `@defer`/`@stream` incremental delivery (graphql-core 3.3); multiple
-databases in one process (one engine per URL — dispose+reconfigure to switch); and the
-execution timeout bounds the caller but does not itself cancel in-flight SQL (pair it
+Remaining caveats: the `@defer`/`@stream` tier is **3.3-only** and carries the **7 documented
+payload-grouping cases** (data byte-identical, chunk-grouping differs; identical after client
+reassembly — see above) plus a dependency on the **graphql-core 3.3 alpha**; multiple
+databases in one process are not supported (one engine per URL — dispose+reconfigure to switch);
+and the execution timeout bounds the caller but does not itself cancel in-flight SQL (pair it
 with a server-side `statement_timeout`). Query cost/depth limiting is by design **not**
 in this engine — do it in your validation layer (see above).
 
@@ -533,27 +646,34 @@ in this engine — do it in your validation layer (see above).
 
 **Experimental / opt-in this wave**: opportunistic `LATERAL` relation inlining
 (`inline_relations`, default **OFF**), cross-request **plan caching** (`cache_plans`, default
-**OFF**), and runtime **placeholders** (`placeholders`, default **OFF**). When all three are off
-— the default — each resource layer is its own batched `= ANY($1)` round-trip and every operation
-plans per-request, inlining each `$variable` value as a SQL literal. Turning inlining on folds a
-*safe-to-prove* hasOne / unpaginated-hasMany child into the parent's statement to cut SQL
-round-trips; turning placeholders on lets a host express a variable-derived filter / pagination
-value as a *value-agnostic* bindparam tagged by its source variable, so the resulting plan is
-value-independent; turning caching on reuses that value-independent plan across requests of the
-same document (re-binding only the values). All three ship **dark** and are gated so the default
-build is byte-identical (see
-[LATERAL relation inlining](#lateral-relation-inlining-experimental-opt-in) and
-[Plan caching + runtime placeholders](#plan-caching--runtime-placeholders-experimental-opt-in)
-below).
+**OFF**), runtime **placeholders** (`placeholders`, default **OFF**), and cross-parent step
+**hoisting** (`hoist`, default **OFF**). With all of them off — the default — each resource layer
+is its own batched `= ANY($1)` round-trip and every operation plans per-request, inlining each
+`$variable` value as a SQL literal. Turning inlining on folds a *safe-to-prove* hasOne /
+unpaginated-hasMany child into the parent's statement to cut SQL round-trips; turning placeholders
+on lets a host express a variable-derived filter / pagination value as a *value-agnostic* bindparam
+tagged by its source variable, so the resulting plan is value-independent; turning caching on
+reuses that value-independent plan across requests of the same document (re-binding only the values,
+no deepcopy); turning hoisting on lifts a child-bucket-constant step to a shallower layer so it runs
+once instead of once-per-child-bucket. All four ship **dark** and are gated so the default build is
+byte-identical (see
+[LATERAL relation inlining](#lateral-relation-inlining-experimental-opt-in),
+[Plan caching + runtime placeholders](#plan-caching--runtime-placeholders-experimental-opt-in), and
+[Cross-parent step hoisting](#cross-parent-step-hoisting-experimental-opt-in-ships-dark) above).
 
-Previously deferred, now built: multi-column (composite) relation keys, the
-single-shared-request-transaction mode, connection `GROUP BY` / aggregates, a codec
-type library (recursive arrays / ranges / enums / composites), and GraphQL **interfaces /
-unions** backed by Postgres — column-discriminator single-table inheritance (a `resolve_type`
-bridge on the discriminator column) and cross-table `UNION ALL` (`pgUnionAll`: a keyset-paged
-Relay connection over N member tables, each tagged with its concrete type). Both compose with
-the engine's completion-time abstract dispatch, so a concrete type's nested relations batch
-per concrete-type group with no plan-time polymorphism.
+Previously deferred, now built (this engine-port wave): the explicit two-tree
+`LayerPlan`/`OutputPlan` model (execution de-fused from serialization); resolver-unification
+(every field is a step, one execution path); the function-level `grafast_execute()` /
+`grafast_subscribe()` seam + the `GrafastExecutionContext` drop-in shim; dual graphql-core 3.2
+**and** 3.3 support; `@defer`/`@stream`/subscriptions as the 3.3-only tier (with the 7-case caveat
+above); cross-parent hoisting (`hoist`, ships dark); and the deepcopy-free plan cache. Earlier waves
+also built: multi-column (composite) relation keys, the single-shared-request-transaction mode,
+connection `GROUP BY` / aggregates, a codec type library (recursive arrays / ranges / enums /
+composites), and GraphQL **interfaces / unions** backed by Postgres — column-discriminator
+single-table inheritance (a `resolve_type` bridge on the discriminator column) and cross-table
+`UNION ALL` (`pgUnionAll`: a keyset-paged Relay connection over N member tables, each tagged with its
+concrete type). Both compose with the engine's completion-time abstract dispatch, so a concrete
+type's nested relations batch per concrete-type group with no plan-time polymorphism.
 
 ## More
 
