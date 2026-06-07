@@ -18,9 +18,9 @@ graphql-core conformance suite, run unchanged through the one unified path.
 
 Production hardening (execution timeout, bounded concurrency, structured logging,
 tracing hooks, configurable pg pool) is OPT-IN via a :class:`GrafastConfig` attached
-to the context class; the defaults reproduce the engine's pre-hardening behaviour
-exactly. See :mod:`grafast_py.config`. (Query cost/depth limiting is a validation-layer
-concern — use your server's validation rules, not this executor.)
+to the context class; with the defaults (every hardening knob off) the engine behaves
+as a plain unhardened executor. See :mod:`grafast_py.config`. (Query cost/depth limiting
+is a validation-layer concern — use your server's validation rules, not this executor.)
 """
 
 import asyncio
@@ -41,7 +41,7 @@ from .plan import plan_operation
 class GrafastExecutionContext(ExecutionContext):
     """Plan-then-execute GraphQL execution context (unconditional drop-in)."""
 
-    # opt-in hardening config; the default reproduces pre-hardening behaviour. A
+    # opt-in hardening config; the default leaves every hardening knob off. A
     # host overrides it by subclassing or assigning
     # ``GrafastExecutionContext.grafast_config = GrafastConfig(...)``. Read per
     # operation via ``type(self).grafast_config``.

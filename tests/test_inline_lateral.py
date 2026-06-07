@@ -1,10 +1,9 @@
-"""The correlated LATERAL build (Wave 3b, step 4): build_lateral + apply_laterals.
+"""The correlated LATERAL build: build_lateral + apply_laterals.
 
-Step 3 added the fold DATA structures (:class:`InlineSpec` / :class:`NestedExtractStep`);
-this step adds the SQL: a parent pg select's ``build_query`` LEFT JOINs one
-``json_agg`` / ``to_jsonb`` LATERAL per carried :class:`InlineSpec`. There is no optimize
-wiring yet (a default-built step carries no specs), so this is gated behind the presence of
-specs — a parent with no specs emits BYTE-IDENTICAL SQL to the batched ``= ANY($1)`` path.
+A parent pg select's ``build_query`` LEFT JOINs one ``json_agg`` / ``to_jsonb`` LATERAL per
+carried :class:`InlineSpec` (the fold DATA structures :class:`InlineSpec` /
+:class:`NestedExtractStep`). The LATERAL is gated behind the presence of specs — a parent
+with no specs emits BYTE-IDENTICAL SQL to the batched ``= ANY($1)`` path.
 
 These tests pin three layers:
 
@@ -12,7 +11,7 @@ These tests pin three layers:
   subquery string), and that ``build_query`` wraps it in ``LEFT OUTER JOIN LATERAL ... ON
   true`` so a child-less parent survives;
 - the NO-OP invariant: an empty ``inline_specs`` leaves the statement (and the dedup key)
-  exactly as the pre-Wave-3b batched build, while a present spec DISCRIMINATES the dedup key
+  exactly as the plain batched build, while a present spec DISCRIMINATES the dedup key
   (two parents inlining different children never merge);
 - DB-BACKED EQUIVALENCE (marked ``pg``): a manually-inlined parent + :class:`NestedExtractStep`
   scatters BYTE-IDENTICAL child rows to the standalone batched child step, in ONE FEWER
@@ -258,7 +257,7 @@ def test_build_lateral_composite_correlation_ands_each_pair():
 
 
 def test_empty_specs_is_byte_identical_to_batched_build():
-    """A default-built parent (no specs) emits the EXACT pre-Wave-3b SQL — no LATERAL."""
+    """A default-built parent (no specs) emits the EXACT plain batched SQL — no LATERAL."""
     registry, authors, posts = make_blog_registry()
     plain = render(PgSelectAllStep(authors, order_by=["id"]).build_query())
     assert "LATERAL" not in plain
@@ -310,8 +309,8 @@ def test_specs_discriminate_the_dedup_key():
 def test_no_specs_dedup_key_unchanged_from_baseline():
     """The empty-spec dedup key is byte-identical to a baseline build (no over-discrimination).
 
-    inline_signature() of () is an empty tuple, so a default-built step's key is the same it
-    was pre-Wave-3b — the no-op invariant extends to dedup.
+    inline_signature() of () is an empty tuple, so a default-built step's key is the same as
+    a plain batched build — the no-op invariant extends to dedup.
     """
     registry, authors, posts = make_blog_registry()
     a = PgSelectAllStep(authors, order_by=["id"])
