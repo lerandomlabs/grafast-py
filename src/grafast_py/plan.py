@@ -19,6 +19,7 @@ there is no `step is None` path and no separate per-parent resolver machine.
 from enum import Enum
 from typing import Any, Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
+from graphql.error import GraphQLError
 from graphql.execution.values import get_argument_values
 from graphql.language import (
     FieldNode,
@@ -66,6 +67,10 @@ class FieldPlan(NamedTuple):
     # step now; `step is None` only in the (unreachable) no-plan-no-parent guard case.
     plan_fn: Optional[Callable] = None
     step: Optional[Step] = None
+    # P7 stream marker: ``(initial_count, label)`` when this list field carries `@stream`,
+    # else None. Default None for every non-streamed field → byte-identical NamedTuple on 3.2
+    # and on any 3.3 field without the directive.
+    stream: Optional[Tuple[int, Optional[str]]] = None
 
 
 class LayerReason(Enum):
@@ -83,6 +88,12 @@ class LayerReason(Enum):
 
     ROOT = "root"
     NESTED = "nested"
+    # P7: a @defer'd fragment-spread / inline-fragment and a @stream'd list field each become
+    # a detachable subtree planned as its own self-contained layer (own RootStep, own DAG),
+    # run later from the host's (parent value column, index_map). Distinct reasons so a future
+    # consumer can branch, though nothing branches on them today.
+    DEFER = "defer"
+    STREAM = "stream"
 
 
 class LayerPlan(NamedTuple):
@@ -140,16 +151,39 @@ class LayerPlan(NamedTuple):
     hoisted_out_ids: FrozenSet[int] = frozenset()
 
 
+class DeferPlan(NamedTuple):
+    """The @defer execution plan hanging off an object level (P7) — upstream parity.
+
+    A transcription of upstream's per-level ``build_execution_plan`` output + the new defer
+    usages minted at this level. ``new_groups`` is a list of ``(defer_usage_set, field_map)``
+    where ``defer_usage_set`` is a tuple of the actual DeferUsage objects (identity-meaningful)
+    and ``field_map`` is ``{response_name: [FieldDetails]}`` — each entry is a grouped-field-set
+    executed at THIS object level's path, keyed by its defer-usage-set (two overlapping
+    fragments selecting the same field share ONE group, so the field delivers once).
+    ``new_defer_usages`` are the DeferUsage objects NEW at this level, used to mint the deferred
+    fragment records. Empty on 3.2 / any selection without @defer (the capture is then a no-op).
+    """
+
+    new_groups: List[Any] = []
+    new_defer_usages: List[Any] = []
+
+
 class ObjectPlan(NamedTuple):
     """An output plan for one object selection set, paired with its batch boundary.
 
     `parent_type` and `fields` are the output shape; `layer` is the reason-tagged batch
     boundary (`parent_step`/`effect_steps`) the executor seeds and runs this bucket from.
+
+    `deferred` (P7) holds the @defer execution plan hanging off THIS object level — a
+    :class:`DeferPlan` (the per-level ``build_execution_plan`` new-grouped-field-sets + the
+    new defer usages). On 3.2 (and any 3.3 selection with no @defer) it is an empty DeferPlan,
+    so the NamedTuple is byte-identical and the executor's deferred-record capture is a no-op.
     """
 
     parent_type: GraphQLObjectType
     fields: List[FieldPlan]
     layer: LayerPlan
+    deferred: "DeferPlan" = DeferPlan()
 
 
 def plan_object(
@@ -159,6 +193,8 @@ def plan_object(
     parent_step: Optional[Step] = None,
     plan: Optional[Plan] = None,
     reason: LayerReason = LayerReason.NESTED,
+    deferred: Optional["DeferPlan"] = None,
+    details_map: Optional[Dict[str, list]] = None,
 ) -> ObjectPlan:
     """Plan one object selection set into an ObjectPlan.
 
@@ -171,6 +207,12 @@ def plan_object(
     field WITH a plan resolver builds a genuine step depending on `parent_step`, and a
     field WITHOUT one builds a `ResolveStep` adapter that ALSO depends on `parent_step`
     — every field gets a step and passes it down as `$parent` for its sub-selection.
+
+    `deferred` (P7) is the list of @defer'd grouped-field-sets that hang off THIS object
+    level (partitioned out of the collected fields by the caller via the incremental
+    collection seam); it is stored on the returned ObjectPlan for the driver to capture
+    as deferred jobs at completion time. None / empty on 3.2 and on any selection without
+    @defer, so the path is byte-identical.
     """
     # function-local to break the plan.py <-> steps.py import cycle (steps.py imports
     # FieldPlan from this module at module load).
@@ -257,18 +299,44 @@ def plan_object(
         # guard leaves `field_step` None, in which case the inherited step is passed.
         child_parent_step = field_step if field_step is not None else parent_step
 
+        # P7 stream marker: a @stream'd list field completes only items[:initial_count]
+        # inline and the driver streams the rest. Read off the field AST; None on 3.2 and
+        # on any non-streamed list (byte-identical default). A @stream argument coercion error
+        # (non-integer initialCount / non-string label) is captured as a ``StreamError`` marker
+        # surfaced at execution as a located field error (upstream parity), not raised at plan.
+        field_stream = None
+        if plan is not None and getattr(plan, "incremental", False):
+            try:
+                field_stream = _compat.get_stream_usage(
+                    field_nodes[0], context.variable_values
+                )
+            except GraphQLError as raw_error:  # @stream arg coercion → located field error
+                field_stream = _compat.StreamError(raw_error)
+
         completer = build_completer(context, return_type, field_nodes)
         object_completer = find_object_completer(completer)
         if object_completer is not None:
-            sub_fields = context.collect_subfields(
-                object_completer.object_type, field_nodes
+            # P7: collect this field's subfields WITH its defer-usage context (the FieldDetails
+            # for this response key, when incremental) so a deferred subfield splits correctly;
+            # falls back to the plain node-collection seam off (byte-identical).
+            field_details = (
+                details_map.get(response_name) if details_map is not None else None
+            )
+            sub_initial, sub_details, child_deferred = collect_subfields_partitioned(
+                context,
+                plan,
+                object_completer.object_type,
+                field_nodes,
+                field_details,
             )
             child_plan = plan_object(
                 context,
                 object_completer.object_type,
-                sub_fields,
+                sub_initial,
                 parent_step=child_parent_step,
                 plan=plan,
+                deferred=child_deferred,
+                details_map=sub_details,
             )
             completer = attach_child_plan(completer, child_plan)
 
@@ -285,13 +353,83 @@ def plan_object(
                 args_error=args_error,
                 plan_fn=plan_fn,
                 step=field_step,
+                stream=field_stream,
             )
         )
     return ObjectPlan(
         parent_type=parent_type,
         fields=field_plans,
         layer=LayerPlan(reason=reason, parent_step=parent_step),
+        deferred=deferred if deferred is not None else DeferPlan(),
     )
+
+
+def collect_subfields_partitioned(
+    context, plan, object_type, field_nodes, field_details=None
+):
+    """Collect an object field's subfields, splitting off @defer'd groups (P7).
+
+    Returns ``(initial_node_map, initial_details_map, defer_plan)``. When incremental is OFF
+    (3.2, or a 3.3 operation with no @defer/@stream anywhere) this is exactly the legacy
+    ``context.collect_subfields`` node map (with a None details map and an empty DeferPlan) —
+    byte-identical. When ON, it collects the RAW fields preserving each field's ``defer_usage``
+    (so a deferred subfield's usage threads through) and partitions via
+    ``_compat.build_execution_plan_groups`` against the field's own defer-usage-set as the
+    parent — the per-level ``build_execution_plan``.
+
+    ``field_details`` is this object field's own FieldDetails list (when it was itself reached
+    through one or more @defer groups), so its subfields are collected WITH the field's
+    defer_usage as the parent and partitioned against the field's defer-usage-set.
+    """
+    if plan is None or not getattr(plan, "incremental", False):
+        return context.collect_subfields(object_type, field_nodes), None, DeferPlan()
+    collected = _compat.collect_subfields_details(
+        context, object_type, field_details or field_nodes
+    )
+    parent_usages = _field_parent_defer_usages(field_details)
+    return _partition_collected(collected, parent_usages)
+
+
+def _field_parent_defer_usages(field_details):
+    """The filtered defer-usage-set of an object field's own FieldDetails group.
+
+    Its subfields' collection partitions against THIS set: a subfield whose defer-usage-set
+    equals it is initial (already inside the same defer scope), the rest split off — the
+    parent-payload dedup that drops a subfield already present in the parent defer.
+    """
+    if not field_details:
+        return frozenset()
+    return _compat.get_filtered_defer_usage_set(field_details)
+
+
+def _partition_collected(collected, parent_usages=None):
+    """Run the per-level ``build_execution_plan`` and wrap it as a :class:`DeferPlan`.
+
+    Returns ``(initial_node_map, initial_details_map, defer_plan)``. The node map feeds the
+    planner loop; the details map carries each initial field's defer_usage forward so its own
+    subfields collect in the right scope; the DeferPlan holds the new grouped-field-sets (each
+    a grouped-field-set executed at this level, keyed by its defer-usage-set) + the new defer
+    usages minted at this level.
+    """
+    initial_details, initial_nodes, new_groups, new_defer_usages = (
+        _compat.build_execution_plan_groups(collected, parent_usages)
+    )
+    defer_plan = DeferPlan(new_groups=new_groups, new_defer_usages=new_defer_usages)
+    return initial_nodes, initial_details, defer_plan
+
+
+def _primary_label(usage_set):
+    """The @defer label to surface for a grouped-field-set (the single usage's label).
+
+    A grouped-field-set's filtered defer-usage-set is normally a single DeferUsage; its
+    ``label`` is the @defer(label:) the pending result reports. When the set has more than one
+    usage (a multi-fragment merge), the label is left None (upstream reports the id, not a
+    label, for such merged groups).
+    """
+    usages = list(usage_set)
+    if len(usages) == 1:
+        return usages[0].label
+    return None
 
 
 def variable_provenance(
@@ -336,7 +474,9 @@ def attach_child_plan(completer: Completer, child_plan: ObjectPlan) -> Completer
     return completer
 
 
-def plan_operation(context, operation: OperationDefinitionNode, root_type, root_fields):
+def plan_operation(
+    context, operation: OperationDefinitionNode, root_type, root_fields, incremental=False
+):
     """Build the top-level ObjectPlan for an operation's root selection set.
 
     Also builds the operation's step DAG (`Plan`): a `RootStep` seeds the root
@@ -396,16 +536,31 @@ def plan_operation(context, operation: OperationDefinitionNode, root_type, root_
     # record whether this is a mutation so `finalize_plan` can disable hoisting under a
     # mutation root (its fields run serially and must not be reordered across layers).
     plan.is_mutation = operation.operation == OperationType.MUTATION
+    # P7: when the operation carries @defer/@stream (only possible on 3.3), the planner
+    # partitions each object level into initial vs deferred groups and reads @stream markers.
+    # Off (the default, and always on 3.2) => the legacy collection seam runs, byte-identical.
+    plan.incremental = incremental
     root_step = RootStep()
     plan.add_step(root_step)
+
+    # the root collected may be raw (incremental) or a plain node map (legacy); partition the
+    # raw form into the initial root fields planned now plus the root-level deferred groups.
+    root_deferred = DeferPlan()
+    root_details_map = None
+    if incremental:
+        root_initial, root_details_map, root_deferred = _partition_collected(root_fields)
+    else:
+        root_initial = root_fields
 
     object_plan = plan_object(
         context,
         root_type,
-        root_fields,
+        root_initial,
         parent_step=root_step,
         plan=plan,
         reason=LayerReason.ROOT,
+        deferred=root_deferred,
+        details_map=root_details_map,
     )
 
     object_plan = finalize_plan(plan, object_plan)

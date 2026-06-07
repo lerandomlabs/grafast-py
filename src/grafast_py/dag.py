@@ -69,6 +69,11 @@ class Plan:
         # subtrees (which finalize against their own ROOT plan and are reached only from a
         # query/event walk).
         self.is_mutation: bool = False
+        # P7: whether this plan partitions @defer'd groups and reads @stream markers during
+        # the walk. Only set True (by `plan_operation` / `abstract_child_plan`) on graphql-core
+        # 3.3 when the operation carries the incremental directives. False (the default, and
+        # always on 3.2) => the legacy collection seam runs and the plan is byte-identical.
+        self.incremental: bool = False
         # SIDE replacements an `optimize` hook records beyond the one step it returns.
         # A `Step.optimize` rewrites only ITSELF (its return value), but a DEPENDENT-
         # absorbing optimizer (the LATERAL inliner) must ALSO rewrite the children it

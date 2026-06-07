@@ -240,6 +240,12 @@ def __getattr__(name: str):
 # whichever of these modules actually exists — a missing one is skipped, not an error.
 _GRAPHQL_MODULES = ("graphql.execution.execute", "graphql.execution.subscribe")
 _saved_execution_contexts: dict = {}
+# P7: on graphql-core 3.3 the conformance defer/stream/subscribe tests call the MODULE
+# functions ``experimental_execute_incrementally`` / ``subscribe`` (and ``execute``) directly,
+# bypassing the ExecutionContext swap. So under install() we additionally replace those
+# functions on the real execute module (3.3 only); uninstall() restores them. The originals are
+# saved here keyed by function name.
+_saved_module_functions: dict = {}
 
 
 def _graphql_module(name: str):
@@ -278,14 +284,55 @@ def install() -> None:
         _saved_execution_contexts.setdefault(name, module.ExecutionContext)
         module.ExecutionContext = GrafastExecutionContext
 
+    # P7: route the module-level incremental entry points through grafast on 3.3 (the
+    # conformance defer/stream/subscribe tests call them directly). 3.2 lacks these names, so
+    # the leg is skipped and 3.2 install is unchanged.
+    from . import _compat
+
+    if not _compat.supports_incremental():
+        return
+    execute_module = _graphql_module("graphql.execution.execute")
+    if execute_module is None:  # pragma: no cover
+        return
+    from . import entry
+
+    replacements = {
+        "experimental_execute_incrementally": entry.experimental_execute_incrementally,
+        "execute": entry.grafast_execute_plain,
+        "subscribe": entry.grafast_subscribe,
+    }
+    # graphql.execution.execute is the real module; graphql.execution (the package) and
+    # graphql (top-level) RE-EXPORT the same function objects, and callers do
+    # `from graphql.execution import experimental_execute_incrementally` — binding the package
+    # attribute at import time. So replace the name in every namespace that re-exports it, or
+    # the swap never reaches an already-imported caller (the same shadowing dodge install() uses
+    # for ExecutionContext).
+    namespaces = [execute_module]
+    for ns_name in ("graphql.execution", "graphql"):
+        ns = sys.modules.get(ns_name)
+        if ns is not None:
+            namespaces.append(ns)
+    for fn_name, replacement in replacements.items():
+        for index, ns in enumerate(namespaces):
+            if not hasattr(ns, fn_name):
+                continue
+            key = (id(ns), fn_name)
+            _saved_module_functions.setdefault(key, (ns, getattr(ns, fn_name)))
+            setattr(ns, fn_name, replacement)
+
 
 def uninstall() -> None:
-    """Undo `install()`, restoring graphql-core's original `ExecutionContext`."""
+    """Undo `install()`, restoring graphql-core's original `ExecutionContext` + functions."""
     for name, original in list(_saved_execution_contexts.items()):
         module = sys.modules.get(name)
         if module is not None:
             module.ExecutionContext = original
     _saved_execution_contexts.clear()
+
+    for _key, (ns, original) in list(_saved_module_functions.items()):
+        fn_name = _key[1]
+        setattr(ns, fn_name, original)
+    _saved_module_functions.clear()
 
 
 # NOTE: install() is deliberately NOT called on import. Importing grafast_py has no

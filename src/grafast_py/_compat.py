@@ -207,6 +207,62 @@ def collect_subfields_raw(
     )
 
 
+def collect_root_fields_raw(context, root_type: GraphQLObjectType, operation):
+    """Expose the UN-unwrapped root-field collection for the @defer-aware phase (P7).
+
+    On 3.2 this is a plain ``{response_name: [FieldNode]}`` map (no defer bookkeeping);
+    on 3.3 it returns the raw ``CollectedFields`` (whose ``grouped_field_set`` holds
+    ``FieldDetails`` carrying ``defer_usage`` plus the operation's ``new_defer_usages``).
+    The non-incremental path keeps using :func:`collect_root_fields`; this is the feed
+    P7's incremental driver partitions into initial vs deferred groups.
+    """
+    if IS_32:
+        from graphql.execution.collect_fields import collect_fields
+
+        return collect_fields(
+            context.schema,
+            context.fragments,
+            context.variable_values,
+            root_type,
+            operation.selection_set,
+        )
+
+    from graphql.execution.collect_fields import collect_fields
+
+    return collect_fields(
+        context.schema,
+        context.fragments,
+        context.variable_values,
+        root_type,
+        operation,
+    )
+
+
+def collect_subfields_details(context, object_type: GraphQLObjectType, field_group):
+    """Collect subfields of a field group, PRESERVING each field's ``defer_usage`` (P7, 3.3).
+
+    Unlike :func:`collect_subfields_raw` (which wraps raw nodes with a None defer_usage), this
+    feeds the field group's actual ``FieldDetails`` to upstream ``collect_subfields`` so each
+    field's ``defer_usage`` is threaded into its subfields as the parent — the nested-defer /
+    parent-payload-dedup behaviour. ``field_group`` may be a list of ``FieldDetails`` (the
+    incremental path) or, defensively, raw ``FieldNode``s (wrapped with None defer_usage).
+    Returns the raw ``CollectedFields``. 3.3-only (the planner gates on ``plan.incremental``).
+    """
+    from graphql.execution.collect_fields import FieldDetails, collect_subfields
+
+    details = [
+        d if isinstance(d, FieldDetails) else FieldDetails(d, None) for d in field_group
+    ]
+    return collect_subfields(
+        context.schema,
+        context.fragments,
+        context.variable_values,
+        context.operation,
+        object_type,
+        details,
+    )
+
+
 def build_resolve_info(
     context,
     field_def,
@@ -324,7 +380,237 @@ def make_result(
 def supports_incremental() -> bool:
     """Whether the underlying graphql-core supports @defer/@stream incremental delivery.
 
-    True only on 3.3+. P6 does not branch delivery on this; a later phase (P7) consumes it
-    to opt into ``experimental_execute_incrementally`` for deferred/streamed payloads.
+    True only on 3.3+. P7 consumes it to opt into ``experimental_execute_incrementally``
+    for deferred/streamed payloads and to gate the entire incremental driver off on 3.2,
+    where the @defer/@stream directives do not exist (so the 3.2 path is byte-identical).
     """
     return not IS_32
+
+
+def partition_defer(collected, parent_defer_usages=None):
+    """Split a raw ``CollectedFields`` into (initial node map, deferred groups).
+
+    A port of upstream ``build_execution_plan`` (graphql-core 3.3
+    ``build_execution_plan.py``) over the engine's node-map shape: for each response key
+    we compute its FILTERED defer-usage-set (``get_filtered_defer_usage_set`` — a key with
+    ANY non-deferred member is "initial"; otherwise its set is its members minus those that
+    have a parent already in the set). A key whose filtered set EQUALS ``parent_defer_usages``
+    belongs to the level being executed now (initial here); the rest are bucketed by their
+    defer-usage-set into deferred groups.
+
+    Returns ``(initial, deferred)`` where ``initial`` is ``{response_name: [FieldNode]}``
+    and ``deferred`` is a list of ``(defer_usage_set, {response_name: [FieldNode]}, ...)``.
+    Each group's ``defer_usage_set`` is a ``frozenset`` of the (identity-keyed) DeferUsage
+    objects, paired with the per-key node map.
+
+    On 3.2 ``collected`` is already a plain node map (no defer info) → returns
+    ``(node_map, [])`` so the 3.2 path is byte-identical.
+    """
+    if IS_32:
+        return collected, []
+
+    if parent_defer_usages is None:
+        parent_defer_usages = frozenset()
+
+    grouped_field_set = collected.grouped_field_set
+    # the initial / deferred maps carry the full FieldDetails (node + defer_usage) so a field's
+    # subfields are later collected WITH its defer-usage context (the nested-defer threading).
+    initial: Dict[str, list] = {}
+    # preserve first-seen response-key order across groups, keyed by the frozenset of
+    # DeferUsage identities (RefSet-equivalent: DeferUsage is a NamedTuple but upstream
+    # compares by identity via RefSet, so we key by id()).
+    deferred_order: List[frozenset] = []
+    deferred_map: Dict[frozenset, Dict[str, list]] = {}
+    deferred_usages: Dict[frozenset, frozenset] = {}
+
+    parent_key = frozenset(id(du) for du in parent_defer_usages)
+    for response_key, field_group in grouped_field_set.items():
+        filtered = get_filtered_defer_usage_set(field_group)
+        key = frozenset(id(du) for du in filtered)
+        if key == parent_key:
+            initial[response_key] = list(field_group)
+            continue
+        if key not in deferred_map:
+            deferred_order.append(key)
+            deferred_map[key] = {}
+            deferred_usages[key] = filtered
+        deferred_map[key][response_key] = list(field_group)
+
+    deferred = [
+        (deferred_usages[key], deferred_map[key]) for key in deferred_order
+    ]
+    return initial, deferred
+
+
+def build_execution_plan_groups(collected, parent_defer_usages=None):
+    """Port of upstream ``build_execution_plan`` over the engine's group shape (P7, 3.3).
+
+    Returns ``(initial_details, initial_nodes, new_groups, new_defer_usages)``:
+
+    * ``initial_details`` — ``{response_name: [FieldDetails]}`` for the keys whose filtered
+      defer-usage-set equals ``parent_defer_usages`` (executed now at THIS level).
+    * ``initial_nodes`` — the same map projected to raw nodes (what the planner consumes).
+    * ``new_groups`` — a list of ``(defer_usage_set, {response_name: [FieldDetails]})`` in
+      first-seen defer-usage-set order, exactly like upstream's ``new_grouped_field_sets``
+      (a ``RefMap[DeferUsageSet, GroupedFieldSet]``). ``defer_usage_set`` is a tuple of the
+      actual DeferUsage objects (identity-meaningful), preserving first-add order.
+    * ``new_defer_usages`` — the DeferUsage objects NEW at this level (``collected.new_defer_usages``),
+      used to mint deferred-fragment records.
+
+    A direct transcription of ``build_execution_plan``: for each response key compute its
+    filtered defer-usage-set; if it equals the parent set the key is initial, else it is
+    grouped under that set. Multiple keys sharing a filtered set form ONE group (the shared
+    grouped-field-set that lets two overlapping fragments deliver a field once). 3.3-only.
+    """
+    grouped_field_set = collected.grouped_field_set
+    parent_ids = (
+        frozenset(id(du) for du in parent_defer_usages)
+        if parent_defer_usages
+        else frozenset()
+    )
+
+    initial_details: Dict[str, list] = {}
+    # new_grouped_field_sets, keyed by the (order-preserving) defer-usage-set. We compare sets
+    # by membership (RefSet-equivalent), so dedupe by the frozenset of identities but keep the
+    # usage objects + first-seen order for emission/record minting.
+    group_order: List[frozenset] = []
+    group_map: Dict[frozenset, Dict[str, list]] = {}
+    group_usages: Dict[frozenset, tuple] = {}
+
+    for response_key, field_group in grouped_field_set.items():
+        filtered = get_filtered_defer_usage_set(field_group)
+        key = frozenset(id(du) for du in filtered)
+        if key == parent_ids:
+            initial_details[response_key] = list(field_group)
+            continue
+        if key not in group_map:
+            group_order.append(key)
+            group_map[key] = {}
+            # preserve the actual usage objects in a stable order for record minting / paths.
+            group_usages[key] = tuple(filtered)
+        group_map[key][response_key] = list(field_group)
+
+    initial_nodes = {
+        response_name: [detail.node for detail in details]
+        for response_name, details in initial_details.items()
+    }
+    new_groups = [(group_usages[key], group_map[key]) for key in group_order]
+    new_defer_usages = list(getattr(collected, "new_defer_usages", []) or [])
+    return initial_details, initial_nodes, new_groups, new_defer_usages
+
+
+def nest_deferred_groups(deferred, parent_defer_usages=None):
+    """Arrange this object level's deferred groups into a parent/child forest (P7, 3.3).
+
+    ``deferred`` is the flat ``[(usage_set, field_map), ...]`` from :func:`partition_defer`.
+    A group is a ROOT at this level when none of the deferred usages of ANY group at this
+    level is the ``parent_defer_usage`` of this group's usages; otherwise it nests under the
+    group owning its parent usage. Mirrors upstream's record graph
+    (``DeferredFragmentRecord.parent`` + ``_promote_non_empty_to_root``): a nested @defer's
+    pending is emitted only when its parent fragment completes.
+
+    Returns ``[(usage_set, field_map, [children...]), ...]`` of ROOT groups (each child is the
+    same 3-tuple shape), preserving first-seen order at each level.
+    """
+    if IS_32:
+        return deferred
+    # map a DeferUsage identity -> the group whose usage_set CONTAINS it (its owner).
+    owner_of: Dict[int, int] = {}
+    for index, (usage_set, _field_map) in enumerate(deferred):
+        for du in usage_set:
+            owner_of[id(du)] = index
+
+    children: Dict[int, list] = {i: [] for i in range(len(deferred))}
+    roots: List[int] = []
+    for index, (usage_set, _field_map) in enumerate(deferred):
+        parent_index = None
+        for du in usage_set:
+            parent = du.parent_defer_usage
+            while parent is not None:
+                if id(parent) in owner_of and owner_of[id(parent)] != index:
+                    parent_index = owner_of[id(parent)]
+                    break
+                parent = parent.parent_defer_usage
+            if parent_index is not None:
+                break
+        if parent_index is None:
+            roots.append(index)
+        else:
+            children[parent_index].append(index)
+
+    def build(index):
+        usage_set, field_map = deferred[index]
+        return (usage_set, field_map, [build(c) for c in children[index]])
+
+    return [build(i) for i in roots]
+
+
+def get_filtered_defer_usage_set(field_group):
+    """Port of upstream ``get_filtered_defer_usage_set`` (build_execution_plan.py).
+
+    Returns an ORDERED tuple of DeferUsage objects (identity-meaningful, first-seen order — a
+    RefSet-equivalent) that govern this response key's group: empty if any member is
+    non-deferred (the key is "initial"), otherwise the members' defer-usages minus any whose
+    parent defer-usage is also present (so a child-defer key collapses to its nearest in-set
+    ancestor — the dedup that makes a field already in a parent defer not re-emitted in the
+    child). Order is preserved (unlike a set) because pending / defer-record minting order
+    follows it (the wire id assignment order the suite asserts).
+    """
+    filtered: list = []
+    seen = set()
+    for field_detail in field_group:
+        defer_usage = field_detail.defer_usage
+        if defer_usage is None:
+            return ()
+        if id(defer_usage) not in seen:
+            seen.add(id(defer_usage))
+            filtered.append(defer_usage)
+
+    keep = []
+    for defer_usage in filtered:
+        parent = defer_usage.parent_defer_usage
+        pruned = False
+        while parent is not None:
+            if id(parent) in seen:
+                pruned = True
+                break
+            parent = parent.parent_defer_usage
+        if not pruned:
+            keep.append(defer_usage)
+    return tuple(keep)
+
+
+class StreamError:
+    """A @stream argument coercion error captured at plan time (surfaced as a field error).
+
+    ``get_directive_values`` raises on a non-integer ``initialCount`` / non-string ``label``;
+    upstream surfaces that as a located field error nulling the field rather than aborting the
+    whole operation. The planner wraps the raised error here and the stream completer locates it.
+    """
+
+    __slots__ = ("error",)
+
+    def __init__(self, error):
+        self.error = error
+
+
+def get_stream_usage(field_node: FieldNode, variable_values):
+    """Return ``(initial_count, label)`` for a @stream'd list field, else ``None``.
+
+    Mirrors upstream's stream-directive read: a list field carrying ``@stream`` (and not
+    disabled by ``if: false``) is streamed; ``initialCount`` defaults to 0 when omitted.
+    On 3.2 the @stream directive does not exist, so this is always ``None`` and the list
+    path is byte-identical.
+    """
+    if IS_32:
+        return None
+    from graphql.execution.values import get_directive_values
+    from graphql.type import GraphQLStreamDirective
+
+    stream = get_directive_values(GraphQLStreamDirective, field_node, variable_values)
+    if not stream or stream.get("if") is False:
+        return None
+    initial_count = stream.get("initialCount")
+    if initial_count is None:
+        initial_count = 0
+    return initial_count, stream.get("label")

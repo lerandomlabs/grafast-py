@@ -260,29 +260,27 @@ def _gather_fragments(document: DocumentNode) -> Dict[str, FragmentDefinitionNod
     }
 
 
-def grafast_execute(
-    schema: GraphQLSchema,
-    document: Union[str, Source, DocumentNode],
-    root_value: Any = None,
-    context_value: Any = None,
-    variable_values: Optional[Dict[str, Any]] = None,
-    operation_name: Optional[str] = None,
-    field_resolver: Optional[Callable] = None,
-    type_resolver: Optional[Callable] = None,
-    middleware=None,
-    is_awaitable: Optional[Callable[[Any], bool]] = None,
-    config: GrafastConfig = DEFAULT_CONFIG,
-) -> AwaitableOrValue[ExecutionResult]:
-    """Plan-then-execute a GraphQL operation, returning a plain ``ExecutionResult``.
+def _prepare_request(
+    schema,
+    document,
+    root_value,
+    context_value,
+    variable_values,
+    operation_name,
+    field_resolver,
+    type_resolver,
+    middleware,
+    is_awaitable,
+    config,
+):
+    """Run the GraphQL frontend, returning a ready ``(_PlanRunContext, operation)`` or an
+    early ``ExecutionResult`` of errors.
 
-    The function-seam entry point: owns the GraphQL frontend (schema validation, parse,
-    validation, variable coercion, operation selection) with graphql-core's version-stable
-    helpers, runs the engine pipeline over a :class:`_PlanRunContext`, and packages the
-    result via the OWNED :func:`grafast_py._compat.make_result` (deterministic error sort
-    on every version). Returns an awaitable of the result only when execution is async.
-
-    ``document`` may be a query string, a ``Source``, or an already-parsed ``DocumentNode``
-    (mirroring graphql-core's ``graphql_impl``/``execute`` accepting both).
+    The shared front-end for :func:`grafast_execute` and
+    :func:`experimental_execute_incrementally`: schema validation, parse, validation, operation
+    selection, variable coercion, middleware-manager construction, and context build — all via
+    graphql-core's version-stable helpers. Returning the early ``ExecutionResult`` (instead of
+    raising) matches graphql-core's "response with only errors" for an invalid request.
     """
     from graphql.execution.execute import default_field_resolver, default_type_resolver
 
@@ -348,6 +346,49 @@ def grafast_execute(
         is_awaitable=is_awaitable,
         grafast_config=config,
     )
+    return context, operation
+
+
+def grafast_execute(
+    schema: GraphQLSchema,
+    document: Union[str, Source, DocumentNode],
+    root_value: Any = None,
+    context_value: Any = None,
+    variable_values: Optional[Dict[str, Any]] = None,
+    operation_name: Optional[str] = None,
+    field_resolver: Optional[Callable] = None,
+    type_resolver: Optional[Callable] = None,
+    middleware=None,
+    is_awaitable: Optional[Callable[[Any], bool]] = None,
+    config: GrafastConfig = DEFAULT_CONFIG,
+) -> AwaitableOrValue[ExecutionResult]:
+    """Plan-then-execute a GraphQL operation, returning a plain ``ExecutionResult``.
+
+    The function-seam entry point: owns the GraphQL frontend (schema validation, parse,
+    validation, variable coercion, operation selection) with graphql-core's version-stable
+    helpers, runs the engine pipeline over a :class:`_PlanRunContext`, and packages the
+    result via the OWNED :func:`grafast_py._compat.make_result` (deterministic error sort
+    on every version). Returns an awaitable of the result only when execution is async.
+
+    ``document`` may be a query string, a ``Source``, or an already-parsed ``DocumentNode``
+    (mirroring graphql-core's ``graphql_impl``/``execute`` accepting both).
+    """
+    front = _prepare_request(
+        schema,
+        document,
+        root_value,
+        context_value,
+        variable_values,
+        operation_name,
+        field_resolver,
+        type_resolver,
+        middleware,
+        is_awaitable,
+        config,
+    )
+    if isinstance(front, ExecutionResult):
+        return front
+    context, operation = front
 
     try:
         result = run_planned_operation(context, operation, root_value)
@@ -370,6 +411,231 @@ def grafast_execute(
     return _compat.make_result(result, context.errors)
 
 
+UNEXPECTED_MULTIPLE_PAYLOADS = (
+    "Executing this GraphQL operation would unexpectedly produce multiple payloads"
+    " (due to @defer or @stream directive)"
+)
+
+UNEXPECTED_EXPERIMENTAL_DIRECTIVES = (
+    "The provided schema unexpectedly contains experimental directives"
+    " (@defer or @stream). These directives may only be utilized"
+    " if experimental execution features are explicitly enabled."
+)
+
+
+def grafast_execute_plain(
+    schema: GraphQLSchema,
+    document: Union[str, Source, DocumentNode],
+    root_value: Any = None,
+    context_value: Any = None,
+    variable_values: Optional[Dict[str, Any]] = None,
+    operation_name: Optional[str] = None,
+    field_resolver: Optional[Callable] = None,
+    type_resolver: Optional[Callable] = None,
+    subscribe_field_resolver: Optional[Callable] = None,
+    enable_early_execution: bool = False,
+    middleware=None,
+    execution_context_class=None,
+    is_awaitable: Optional[Callable[[Any], bool]] = None,
+    is_async_iterable=None,
+    config: GrafastConfig = DEFAULT_CONFIG,
+    **custom_context_args,
+):
+    """The plain ``execute`` entry: a single ``ExecutionResult``, RAISING on incremental work.
+
+    Mirrors graphql-core 3.3's ``execute``: it delegates to
+    :func:`experimental_execute_incrementally` and, if that would produce multiple payloads
+    (an ``ExperimentalIncrementalExecutionResults``), raises the
+    ``UNEXPECTED_MULTIPLE_PAYLOADS`` error instead — the behaviour the conformance
+    ``original_execute_function_throws_error_if_deferred*`` cases assert. Used to patch the
+    module-level ``execute`` on 3.3 so those tests route through grafast.
+    """
+    from graphql.execution import ExperimentalIncrementalExecutionResults
+
+    # the plain execute() refuses a schema that even DECLARES @defer/@stream (the experimental
+    # directives are only legal under experimental_execute_incrementally), matching upstream.
+    if schema.get_directive("defer") or schema.get_directive("stream"):
+        raise GraphQLError(UNEXPECTED_EXPERIMENTAL_DIRECTIVES)
+
+    result = experimental_execute_incrementally(
+        schema,
+        document,
+        root_value,
+        context_value,
+        variable_values,
+        operation_name,
+        field_resolver,
+        type_resolver,
+        subscribe_field_resolver,
+        enable_early_execution,
+        middleware,
+        execution_context_class,
+        is_awaitable,
+        is_async_iterable,
+        config=config,
+    )
+    if isinstance(result, ExecutionResult):
+        return result
+    if isinstance(result, ExperimentalIncrementalExecutionResults):
+        raise GraphQLError(UNEXPECTED_MULTIPLE_PAYLOADS)
+
+    async def await_result():
+        awaited = await result
+        if isinstance(awaited, ExecutionResult):
+            return awaited
+        raise GraphQLError(UNEXPECTED_MULTIPLE_PAYLOADS)
+
+    return await_result()
+
+
+def run_planned_operation_incremental(context, operation, root_value):
+    """Plan + run the INITIAL incremental tree, returning (root_data, incremental_records).
+
+    Like :func:`run_planned_operation` but plans with ``incremental=True`` (so @defer'd groups
+    are partitioned out and @stream markers read), and installs defer/stream sinks so the
+    executor captures the root-level deferred fragments' execution groups + stream records. The
+    captured records are the initial-result children the publisher promotes to root nodes.
+    Returns the root output dict (deferred keys omitted) plus the captured records; either may
+    arrive via an awaitable when execution is async.
+
+    ``enable_early_execution`` (threaded from the entry) is recorded on the context so the
+    @stream / @defer machinery can run groups eagerly when requested.
+    """
+    from .incremental import make_defer_sink
+
+    config = context.grafast_config
+    context._grafast_on_step_batch = config.on_step_batch
+    context._grafast_concurrency = (
+        asyncio.Semaphore(config.max_step_concurrency)
+        if config.max_step_concurrency is not None
+        else None
+    )
+    # mark the request incremental so abstract concrete-type subtrees partition @defer too.
+    context._grafast_incremental = True
+
+    root_type = context.schema.get_root_type(operation.operation)
+    if root_type is None:
+        raise GraphQLError(
+            "Schema is not configured to execute"
+            f" {operation.operation.value} operation.",
+            operation,
+        )
+
+    root_collected = _compat.collect_root_fields_raw(context, root_type, operation)
+    plan = plan_operation(
+        context, operation, root_type, root_collected, incremental=True
+    )
+
+    captured: List[Any] = []
+    context._grafast_defer_map = None
+    context._grafast_defer_sink = make_defer_sink(context, captured)
+    context._grafast_stream_sink = lambda rec: captured.append(rec)
+
+    if operation.operation == OperationType.MUTATION:
+        results = execute_object_plan_serially(context, plan, [root_value], [None])
+    else:
+        results = execute_object_plan(context, plan, [root_value], [None])
+
+    if context.is_awaitable(results):
+
+        async def await_root():
+            awaited = await _with_timeout(
+                results, config.execution_timeout_s, None
+            )
+            return root_output(awaited[0]), captured
+
+        return await_root()
+    return root_output(results[0]), captured
+
+
+def experimental_execute_incrementally(
+    schema: GraphQLSchema,
+    document: Union[str, Source, DocumentNode],
+    root_value: Any = None,
+    context_value: Any = None,
+    variable_values: Optional[Dict[str, Any]] = None,
+    operation_name: Optional[str] = None,
+    field_resolver: Optional[Callable] = None,
+    type_resolver: Optional[Callable] = None,
+    subscribe_field_resolver: Optional[Callable] = None,
+    enable_early_execution: bool = False,
+    middleware=None,
+    execution_context_class=None,
+    is_awaitable: Optional[Callable[[Any], bool]] = None,
+    is_async_iterable=None,
+    config: GrafastConfig = DEFAULT_CONFIG,
+    **custom_context_args,
+):
+    """Execute a GraphQL operation with @defer / @stream incremental delivery (3.3 only).
+
+    Returns a plain ``ExecutionResult`` when the operation has NO incremental work (no @defer
+    / @stream survives — including ``@defer(if:false)`` and no-directive), else an
+    ``ExperimentalIncrementalExecutionResults`` (initial result + an async generator of
+    subsequent payloads). The non-incremental entry is :func:`grafast_execute`; this one shares
+    its frontend (validate / parse / coerce / select) and only differs in routing the planned
+    run through the incremental driver.
+
+    The signature mirrors graphql-core 3.3's ``experimental_execute_incrementally`` (incl.
+    ``enable_early_execution``) so the conformance harness can call it positionally/by-keyword;
+    ``enable_early_execution`` is accepted for parity but the driver runs deferred groups when
+    their parent completes (the default-path grouping the test suite asserts).
+    """
+    from .incremental import run_incremental
+
+    front = _prepare_request(
+        schema,
+        document,
+        root_value,
+        context_value,
+        variable_values,
+        operation_name,
+        field_resolver,
+        type_resolver,
+        middleware,
+        is_awaitable,
+        config,
+    )
+    if isinstance(front, ExecutionResult):
+        return front
+    context, operation = front
+    # record the early-execution flag so the @defer/@stream machinery can run groups eagerly.
+    context._grafast_enable_early_execution = enable_early_execution
+
+    class _InitialRun:
+        __slots__ = ("data", "errors")
+
+    def package(root_data, incremental_records):
+        if not incremental_records:
+            # no incremental work survived (e.g. @defer(if:false), or every defer collapsed
+            # into the initial payload): a plain ExecutionResult, byte-identical to grafast_execute.
+            return _compat.make_result(root_data, context.errors)
+        run = _InitialRun()
+        run.data = root_data
+        run.errors = list(context.errors)
+        return run_incremental(context, run, incremental_records)
+
+    try:
+        produced = run_planned_operation_incremental(context, operation, root_value)
+    except GraphQLError as error:
+        context.errors.append(error)
+        return _compat.make_result(None, context.errors)
+
+    if context.is_awaitable(produced):
+
+        async def await_incremental():
+            try:
+                root_data, incremental_records = await produced
+            except GraphQLError as error:
+                context.errors.append(error)
+                return _compat.make_result(None, context.errors)
+            return package(root_data, incremental_records)
+
+        return await_incremental()
+
+    root_data, incremental_records = produced
+    return package(root_data, incremental_records)
+
+
 def grafast_subscribe(
     schema: GraphQLSchema,
     document: Union[str, Source, DocumentNode],
@@ -378,64 +644,97 @@ def grafast_subscribe(
     variable_values: Optional[Dict[str, Any]] = None,
     operation_name: Optional[str] = None,
     field_resolver: Optional[Callable] = None,
+    type_resolver: Optional[Callable] = None,
     subscribe_field_resolver: Optional[Callable] = None,
+    enable_early_execution: bool = False,
+    middleware=None,
+    execution_context_class=None,
+    is_awaitable: Optional[Callable[[Any], bool]] = None,
+    is_async_iterable=None,
     config: GrafastConfig = DEFAULT_CONFIG,
+    **custom_context_args,
 ):
-    """Subscribe: build the source event stream, then plan-then-execute each event.
+    """Subscribe: build the source event stream (graphql-core), execute each event.
 
-    Uses graphql-core's version-stable ``create_source_event_stream`` to produce the source
-    stream, then maps each payload through :func:`grafast_execute` (root_value=payload). The
-    map-async-iterable wrapper moved between versions (3.2 ``MapAsyncIterator`` class, 3.3
-    ``map_async_iterable`` function), so this probes for the right one. Non-incremental
-    delivery only — full @defer/@stream subscription delivery is a later phase (P7).
+    Delegates source-stream creation to graphql-core's version-stable
+    ``create_source_event_stream``, then maps each payload through the per-event execution
+    (root_value=payload). Per-event execution routes through the incremental entry so a
+    @defer/@stream on a subscription field surfaces the upstream "not supported on subscription
+    operations" error (raised by collect_fields / the stream completer) as a field error —
+    matching the conformance ``subscribe_function_returns_errors_with_defer/stream`` cases —
+    while ordinary events are plain ``ExecutionResult``s (upstream executes subscription events
+    non-incrementally).
 
-    Returns an async iterator of ``ExecutionResult`` (or a single ``ExecutionResult`` when
-    the source-stream creation itself errored), as an awaitable.
+    MAYBE-AWAITABLE shape (3.3): when ``create_source_event_stream`` returns the stream
+    synchronously, this returns the mapped ``AsyncIterator`` DIRECTLY (so ``isinstance(result,
+    AsyncIterator)`` holds without an await); only when the source creation is async does it
+    return a coroutine. The map-async-iterable wrapper moved between versions, so this probes.
+
+    The signature mirrors graphql-core 3.3's ``subscribe`` so the install hook can swap it in.
     """
-    if isinstance(document, DocumentNode):
-        parsed = document
-    else:
+    # graphql-core's `subscribe` takes an already-parsed DocumentNode and passes it straight to
+    # `create_source_event_stream` (a non-document errors naturally — `should_pass_through_
+    # unexpected_errors_thrown_in_subscribe` asserts an AttributeError on a dict document). Only
+    # parse a string/Source for convenience; pass anything else through untouched.
+    if isinstance(document, (str, Source)):
         try:
             parsed = parse(document)
         except GraphQLError as error:
             return _error_aiter(ExecutionResult(data=None, errors=[error]))
+    else:
+        parsed = document
 
-    async def subscribe_impl():
-        # create_source_event_stream is an ``async def`` on 3.2 (always awaitable) but a
-        # maybe-awaitable plain function on 3.3 (it returns the stream directly when the
-        # subscribe resolver is sync); await only when needed.
-        result_or_stream = create_source_event_stream(
+    async def map_payload(payload: Any):
+        # per-event execution: incremental on 3.3 (so defer/stream-on-subscription errors
+        # surface), plain on 3.2. A subscription event never legitimately produces multiple
+        # payloads (defer/stream are disallowed), so the result is always an ExecutionResult.
+        runner = (
+            experimental_execute_incrementally
+            if _compat.supports_incremental()
+            else grafast_execute
+        )
+        mapped = runner(
             schema,
             parsed,
-            root_value,
-            context_value,
-            variable_values,
-            operation_name,
-            subscribe_field_resolver,
+            root_value=payload,
+            context_value=context_value,
+            variable_values=variable_values,
+            operation_name=operation_name,
+            field_resolver=field_resolver,
+            type_resolver=type_resolver,
+            middleware=middleware,
+            config=config,
         )
-        if default_is_awaitable(result_or_stream):
-            result_or_stream = await result_or_stream
-        if isinstance(result_or_stream, ExecutionResult):
-            return result_or_stream
+        if default_is_awaitable(mapped):
+            return await mapped
+        return mapped
 
-        async def map_payload(payload: Any) -> ExecutionResult:
-            mapped = grafast_execute(
-                schema,
-                parsed,
-                root_value=payload,
-                context_value=context_value,
-                variable_values=variable_values,
-                operation_name=operation_name,
-                field_resolver=field_resolver,
-                config=config,
-            )
-            if default_is_awaitable(mapped):
-                return await mapped
-            return mapped
+    # create_source_event_stream is an ``async def`` on 3.2 (always awaitable) but a
+    # maybe-awaitable plain function on 3.3 (returns the stream directly when the subscribe
+    # resolver is sync); only wrap in a coroutine when the source creation is actually async.
+    result_or_stream = create_source_event_stream(
+        schema,
+        parsed,
+        root_value,
+        context_value,
+        variable_values,
+        operation_name,
+        subscribe_field_resolver,
+    )
 
-        return _map_async_iterable(result_or_stream, map_payload)
+    if default_is_awaitable(result_or_stream):
 
-    return subscribe_impl()
+        async def subscribe_async():
+            stream = await result_or_stream
+            if isinstance(stream, ExecutionResult):
+                return stream
+            return _map_async_iterable(stream, map_payload)
+
+        return subscribe_async()
+
+    if isinstance(result_or_stream, ExecutionResult):
+        return result_or_stream
+    return _map_async_iterable(result_or_stream, map_payload)
 
 
 def _map_async_iterable(source, mapper):
