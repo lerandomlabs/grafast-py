@@ -272,6 +272,7 @@ def _prepare_request(
     middleware,
     is_awaitable,
     config,
+    validate_document=True,
 ):
     """Run the GraphQL frontend, returning a ready ``(_PlanRunContext, operation)`` or an
     early ``ExecutionResult`` of errors.
@@ -281,6 +282,13 @@ def _prepare_request(
     selection, variable coercion, middleware-manager construction, and context build — all via
     graphql-core's version-stable helpers. Returning the early ``ExecutionResult`` (instead of
     raising) matches graphql-core's "response with only errors" for an invalid request.
+
+    ``validate_document`` mirrors the graphql() vs execute() split: :func:`grafast_execute` is
+    the graphql()-equivalent full pipeline and validates (True), while
+    :func:`experimental_execute_incrementally` is the execute()-level entry the conformance suite
+    drives with already-validated (sometimes intentionally schema-invalid-but-executable)
+    documents, so it skips validation (False) — matching graphql-core's own
+    ``experimental_execute_incrementally``, which never validates.
     """
     from graphql.execution.execute import default_field_resolver, default_type_resolver
 
@@ -301,9 +309,13 @@ def _prepare_request(
     # whether or not the caller pre-parsed (matching upstream grafast() / graphql-core's
     # graphql()). A pre-parsed INVALID document previously slipped through here — e.g. an unknown
     # field was silently dropped by the planner instead of surfacing a validation error.
-    validation_errors = validate(schema, parsed)
-    if validation_errors:
-        return ExecutionResult(data=None, errors=validation_errors)
+    # The execute()-level experimental entry opts out (validate_document=False): like graphql-core's
+    # own experimental_execute_incrementally it assumes a pre-validated document and must EXECUTE
+    # the intentionally-invalid-but-executable docs the conformance suite passes it.
+    if validate_document:
+        validation_errors = validate(schema, parsed)
+        if validation_errors:
+            return ExecutionResult(data=None, errors=validation_errors)
 
     selected = _select_operation(parsed, operation_name)
     if isinstance(selected, list):
@@ -594,6 +606,10 @@ def experimental_execute_incrementally(
         middleware,
         is_awaitable,
         config,
+        # execute()-level entry: assume a pre-validated document (matching graphql-core's own
+        # experimental_execute_incrementally), so the conformance suite's intentionally-invalid-
+        # but-executable documents execute rather than short-circuiting to a validation error.
+        validate_document=False,
     )
     if isinstance(front, ExecutionResult):
         return front
