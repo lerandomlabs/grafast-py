@@ -21,6 +21,9 @@ __pycache__/
 *.py[cod]
 *.swp
 .venv/
+# the 3.3 sibling env (built by scripts/venv33.sh) — graphql-core 3.3 alongside the
+# editable package, for the second CI leg; a generated artifact, never committed.
+.venv33/
 .ruff_cache/
 .pytest_cache/
 .benchmarks/

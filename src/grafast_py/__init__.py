@@ -30,6 +30,7 @@ from .config import (
     GrafastTimeoutError,
 )
 from .context import GrafastExecutionContext
+from .entry import grafast_execute, grafast_subscribe
 from .core_steps import (
     AccessStep,
     ConstantStep,
@@ -86,6 +87,9 @@ from .step_model import Step
 
 __all__ = [
     "GrafastExecutionContext",
+    # function-seam entry points (run the engine without an ExecutionContext subclass)
+    "grafast_execute",
+    "grafast_subscribe",
     "install",
     "uninstall",
     # hardening config + error class
@@ -230,16 +234,27 @@ def __getattr__(name: str):
     return value
 
 
+# On 3.2 both `execute` and `subscribe` are submodules carrying their own `ExecutionContext`
+# fallback; on 3.3 `subscribe` was folded into `execute` (there is no `subscribe` submodule),
+# and both `execute()` and `subscribe()` read `ExecutionContext` from `execute`. So patch
+# whichever of these modules actually exists — a missing one is skipped, not an error.
 _GRAPHQL_MODULES = ("graphql.execution.execute", "graphql.execution.subscribe")
 _saved_execution_contexts: dict = {}
 
 
 def _graphql_module(name: str):
-    """Return the real graphql-core submodule (via sys.modules to dodge the package's
-    shadowing of the `execute` submodule by the `execute` function)."""
+    """Return the real graphql-core submodule, or ``None`` if it does not exist.
+
+    Resolved via ``sys.modules`` to dodge the package's shadowing of the ``execute``
+    submodule by the ``execute`` function. Returns ``None`` for a submodule absent on this
+    graphql-core version (the 3.3 line dropped the standalone ``subscribe`` submodule).
+    """
     module = sys.modules.get(name)
     if module is None:
-        __import__(name)
+        try:
+            __import__(name)
+        except ModuleNotFoundError:
+            return None
         module = sys.modules[name]
     return module
 
@@ -256,6 +271,10 @@ def install() -> None:
     """
     for name in _GRAPHQL_MODULES:
         module = _graphql_module(name)
+        if module is None:
+            # submodule absent on this graphql-core version (3.3 folded `subscribe` into
+            # `execute`); the surviving module's ExecutionContext covers both entry points.
+            continue
         _saved_execution_contexts.setdefault(name, module.ExecutionContext)
         module.ExecutionContext = GrafastExecutionContext
 

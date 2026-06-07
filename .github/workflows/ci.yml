@@ -1,0 +1,113 @@
+name: ci
+
+# Two-leg matrix proving the function-seam runs on BOTH graphql-core lines:
+#   leg-A — the default env (graphql-core 3.2.x via the >=3.2.8 pin), the full gate.
+#   leg-B — the .venv33 sibling env (graphql-core 3.3 alpha), the function-seam + the 3.3
+#           execution conformance suite MINUS the incremental modules (@defer/@stream are a
+#           later phase). The two legs share one engine core through grafast_py._compat.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  leg-a-graphql-32:
+    name: "3.2 (default env)"
+    runs-on: ubuntu-latest
+    # the pg data source + the demo seed read GRAFAST_PG_URL. local dev points at a peer-auth
+    # socket (postgresql+asyncpg:///grafast_py_test); CI talks to the service container over TCP.
+    env:
+      GRAFAST_PG_URL: "postgresql+asyncpg://postgres:postgres@localhost:5432/grafast_py_test"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: grafast_py_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: set up python
+        run: uv python install 3.12
+
+      - name: sync (graphql-core 3.2.x via the pin)
+        run: uv sync --extra pg --extra structlog
+
+      - name: seed the grafast_demo schema (pg-backed tests + the pg oracles)
+        # drops+recreates grafast_demo in the service DB and inserts the deterministic rows the
+        # pg tests/oracles read; setup_demo_schema is idempotent (it reseeds on every run).
+        run: uv run python -c "import asyncio; from examples.seed import setup_demo_schema; asyncio.run(setup_demo_schema())"
+
+      - name: verify graphql-core is the 3.2 line
+        run: uv run python -c "import graphql; assert graphql.__version__.startswith('3.2'), graphql.__version__; print(graphql.__version__)"
+
+      - name: fetch the matching conformance suite
+        run: uv run python scripts/fetch_conformance.py
+
+      - name: core is sqlalchemy/asyncpg-free (excluding the pg data source)
+        run: |
+          ! grep -rn -E "^[[:space:]]*(import|from)[[:space:]]+(sqlalchemy|asyncpg)" src/grafast_py --include="*.py" | grep -v "/pg/"
+
+      - name: tests + conformance (baseline)
+        run: uv run pytest tests conformance -q
+
+      - name: conformance under grafast (GRAFAST=1)
+        run: GRAFAST=1 uv run pytest conformance -q
+
+      - name: differential
+        run: uv run pytest tests/differential -q
+
+      - name: oracle modes (plan cache / placeholders / inline relations)
+        run: |
+          GRAFAST_CACHE_PLANS=1 uv run pytest tests -q
+          GRAFAST_PLACEHOLDERS=1 uv run pytest tests -q
+          GRAFAST_INLINE_RELATIONS=1 uv run pytest tests -m pg -q
+
+  leg-b-graphql-33:
+    name: "3.3 (sibling env)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: set up python
+        run: uv python install 3.12
+
+      - name: build the 3.3 sibling env (.venv33)
+        run: bash scripts/venv33.sh
+
+      - name: install the test runner into .venv33
+        # the 3.3 conformance suite drives its async tests with the anyio pytest plugin
+        # (graphql-core 3.3 switched off pytest-asyncio); pytest-describe supplies the
+        # describe_* grouping the suite uses.
+        run: uv pip install --python .venv33 "pytest>=9.0.3" "pytest-describe>=3.1.0" "pytest-asyncio>=1.4.0" anyio
+
+      - name: verify graphql-core is the 3.3 alpha line + grafast_py imports
+        run: |
+          .venv33/bin/python -c "import graphql; assert graphql.__version__ == '3.3.0a12', graphql.__version__; print(graphql.__version__)"
+          .venv33/bin/python -c "import grafast_py; print('grafast_py import OK')"
+
+      - name: fetch the 3.3 conformance suite
+        run: .venv33/bin/python scripts/fetch_conformance.py 3.3.0a12
+
+      - name: function-seam tests under 3.3
+        run: .venv33/bin/python -m pytest tests/test_function_seam.py tests/test_compat.py -p anyio -q
+
+      - name: 3.3 execution conformance under grafast (minus incremental @defer/@stream — P7)
+        run: |
+          GRAFAST=1 .venv33/bin/python -m pytest conformance/_suite/execution -p anyio -q \
+            --ignore=conformance/_suite/execution/test_defer.py \
+            --ignore=conformance/_suite/execution/test_stream.py
