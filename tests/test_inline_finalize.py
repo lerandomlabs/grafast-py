@@ -1,6 +1,6 @@
-"""Step 7: verify ``finalize_plan`` COMPOSES the inlining rewrite end-to-end.
+"""``finalize_plan`` COMPOSES the inlining rewrite end-to-end.
 
-Earlier Wave 3b steps proved the pieces in isolation: the safety predicate
+The inlining pieces are exercised in isolation elsewhere: the safety predicate
 (``test_inline_predicate``), the ``optimize`` hook + ``tree_shake`` over a hand-wired
 ``Plan`` (``test_inline_optimize``), the LATERAL SQL (``test_inline_lateral``), the
 ``NestedExtractStep`` scatter (``test_inline_extract``). This file is the COMPOSITION
@@ -294,11 +294,10 @@ def test_finalize_tree_shakes_orphaned_key_access_and_standalone_child():
 def test_finalize_consumption_roots_reach_extract_and_child_bucket_parent():
     """collect_consumption_root_steps reaches the NestedExtractStep + child bucket parent_step.
 
-    The defining Step 7 assertion: the consumption surface tree_shake measures against must
-    include the NestedExtractStep (a child ``FieldPlan.step`` reads off it) AND the rewritten
-    child bucket ``parent_step`` (the same extract — the bucket boundary the executor seeds).
-    Were either missing, tree_shake would shake the extract out and the child bucket would
-    have no source.
+    The consumption surface tree_shake measures against must include the NestedExtractStep
+    (a child ``FieldPlan.step`` reads off it) AND the rewritten child bucket ``parent_step``
+    (the same extract — the bucket boundary the executor seeds). Were either missing,
+    tree_shake would shake the extract out and the child bucket would have no source.
     """
     _registry, authors, _posts = make_blog_registry()
     schema = build_hasmany_schema(authors)
@@ -411,7 +410,7 @@ def test_finalize_dedup_merges_two_identical_folded_parents():
 def test_finalize_default_off_keeps_batched_child():
     """Inlining OFF: finalize is a no-op — the standalone batched child select survives.
 
-    The Wave 3a no-op invariant THROUGH the full pipeline: with ``inline_relations`` False
+    The no-op invariant THROUGH the full pipeline: with ``inline_relations`` False
     every pg step's ``optimize`` returns ``self``, the parent is NOT replaced, the child stays
     a standalone ``PgSelectStep`` (its own ``WHERE author_id = ANY($1)``), and TWO pg
     statements survive — the correctness baseline the inlined run must match byte-for-byte.

@@ -1,8 +1,8 @@
 """pgUnionAll: a keyset-paged Relay connection over N member tables via ``UNION ALL``.
 
-The CROSS-TABLE polymorphism shape (the ``pgunionall`` feature of the polymorphism wave):
-a GraphQL union (``SearchResult = Article | Snippet``) whose concrete types live in SEPARATE
-tables. :class:`grafast_py.pg.union.PgUnionAllStep` fetches every member in ONE ``UNION ALL``
+The CROSS-TABLE polymorphism shape (the ``pgunionall`` feature): a GraphQL union
+(``SearchResult = Article | Snippet``) whose concrete types live in SEPARATE tables.
+:class:`grafast_py.pg.union.PgUnionAllStep` fetches every member in ONE ``UNION ALL``
 statement whose branches project a SHARED, NULL-PADDED column shape plus a ``__typename``
 literal tag, keyset-slices the merged result over the shared order columns, and (per-parent
 mode) partitions by the match key. The ``resolve_type_from_tag('__typename')`` bridge then
@@ -654,7 +654,7 @@ async def test_plan_helpers_build_the_step():
     assert gated.needs_total is False
 
 
-# ------------------------------------------------ cross-branch keyset totality (DB, the blocker)
+# ------------------------------------------------ cross-branch keyset totality (DB)
 
 
 def make_coll_articles() -> PgResource:
@@ -708,9 +708,9 @@ async def test_cross_branch_keyset_tie_pages_without_dropping_a_row(collision_se
 
     Both members hold id=1 @09:00 and id=2 @10:00, so ``(created, id)`` collides across the
     branches: WITHOUT the ``__typename`` tie-break, a page boundary on one tied row drops or
-    duplicates its peer (the silent-data-loss class the blocker reports). Walking the union in
-    pages of ONE must surface all FOUR distinct (typename, id) rows exactly once, in the total
-    order ``(created, id, __typename)`` — coll_article sorts before coll_snippet on the tag.
+    duplicates its peer (a silent-data-loss class). Walking the union in pages of ONE must
+    surface all FOUR distinct (typename, id) rows exactly once, in the total order
+    ``(created, id, __typename)`` — coll_article sorts before coll_snippet on the tag.
     """
     expected = [
         ("CollArticle", 1),
@@ -733,7 +733,7 @@ async def test_cross_branch_keyset_tie_pages_without_dropping_a_row(collision_se
                 break
             after = conn["pageInfo"]["endCursor"]
 
-    # every distinct row seen exactly once, in total order — no drop (the blocker) and no dup.
+    # every distinct row seen exactly once, in total order — no drop and no dup.
     assert walked == expected
     assert len(walked) == len(set(walked)) == 4
 

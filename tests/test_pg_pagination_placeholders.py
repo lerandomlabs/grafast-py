@@ -229,8 +229,8 @@ def test_select_offset_placeholder_keys_by_source():
 def test_select_literal_first_offset_unchanged():
     """CRUX 4: literal-only ``first`` / ``offset`` keep their value-discriminated dedup.
 
-    The regression gate from ``test_pg_pagination`` re-asserted under the placeholder-aware
-    code: identical literals merge; different literal sizes do not.
+    The literal-path behaviour holds alongside the placeholder-aware key path: identical
+    literals merge; different literal sizes do not.
     """
     a = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"], first=2)
     b = PgSelectStep(make_posts(), constant(None), "author_id", order_by=["id"], first=2)
@@ -265,13 +265,13 @@ def test_root_collection_placeholder_emits_value_agnostic_sql():
 
 
 def test_root_collection_literal_sql_unchanged():
-    """A literal root LIMIT/OFFSET inlines exactly as before — ``run_params`` is ``None``."""
+    """A literal root LIMIT/OFFSET inlines its values directly — ``run_params`` is ``None``."""
     lit = PgSelectAllStep(make_posts(), order_by=["id"], first=5, offset=3).for_parent(
         constant(None)
     )
     sql = str(lit.build_query())
     # SQLAlchemy renders the inlined literal as an auto-named bound (value baked on), so
-    # no explicit per-request params are needed — byte-identical to pre-Wave-4.
+    # no explicit per-request params are needed — byte-identical to the placeholder-free path.
     assert ":root_first" not in sql and ":root_offset" not in sql
     assert lit.run_params() is None
 
@@ -360,8 +360,8 @@ def test_connection_after_cursor_placeholder_crux():
 def test_connection_literal_cursor_unchanged():
     """CRUX 4: literal ``after`` cursors keep their value-discriminated dedup (no regression).
 
-    Identical literal cursors merge; different literal cursors do not — the pre-Wave-4
-    behaviour, re-asserted under the placeholder-aware key path.
+    Identical literal cursors merge; different literal cursors do not — the literal-path
+    behaviour, preserved alongside the placeholder-aware key path.
     """
     posts = make_posts()
     cur1 = cursor_for(posts, 10)

@@ -6,8 +6,8 @@ of `count` entries flowing through a layer together). `execute(count, values)`
 returns a list of length `count` — one output per bucket position — and `values[d]`
 is the already-computed output column (also length `count`) of the step's `d`-th
 dependency. Running a step once per bucket — rather than re-entering a resolver per
-(field, parent) pair — is what makes batching automatic: a future `loadMany` step
-sees EVERY key in its bucket in a single `execute`, so it can issue one batch call.
+(field, parent) pair — is what makes batching automatic: a `loadMany` step sees EVERY
+key in its bucket in a single `execute`, so it can issue one batch call.
 
 This module ships the base class and the executor. The concrete value steps (access,
 lambda, constant, list, object, loadOne/loadMany), the plan-resolver API, and the
@@ -108,7 +108,7 @@ class Step:
         """Self-rewrite during the optimize pass: return `self` to keep, or a
         replacement `Step` to be wired in for `self`. Default: identity.
 
-        Passed the owning `Plan` so a dependent-absorbing optimizer (the future
+        Passed the owning `Plan` so a dependent-absorbing optimizer (the
         query-inlining step) can find ITS dependents via `plan.dependents_of(self)`
         and register a freshly built replacement step. A replacement returned here is
         re-wired into the DAG by the pass; per the class contract above, an optimizer
@@ -148,7 +148,7 @@ def run_steps(
     fresh argument per call, never shared mutable state.
 
     Returns a dict mapping `step.id -> output column`. When any step's `execute`
-    returns a coroutine (an async *column*, e.g. a future batched load), the whole
+    returns a coroutine (an async *column*, e.g. a batched load), the whole
     call returns a coroutine resolving to that dict; steps are then awaited in
     dependency order so a dependent never runs before its dependency's column is
     materialised. `is_awaitable` is the context's awaitable predicate.

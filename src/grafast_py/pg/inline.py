@@ -1,4 +1,4 @@
-"""LATERAL relation inlining: the fold spec and the nested-row extract step (Wave 3b).
+"""LATERAL relation inlining: the fold spec and the nested-row extract step.
 
 Inlining is an OPPORTUNISTIC, EQUIVALENCE-PRESERVING optimization: a parent pg select
 absorbs a safe-to-fold child relation into its OWN statement via a ``LEFT JOIN LATERAL``
@@ -20,9 +20,8 @@ two data structures that survive the fold into execution:
   NO database work (the parent already fetched the rows), it is a pure synchronous step.
 
 The wiring that DECIDES a fold (the parent's ``optimize`` and the strict safety predicate)
-and that EMITS the LATERAL (the parent's ``build_query``) live in later Wave 3b steps; this
-module is the substrate they build on, unit-tested here in isolation against fake parent
-rows carrying a json column — no optimize wiring yet.
+and that EMITS the LATERAL (the parent's ``build_query``) live on the parent pg steps; this
+module is the substrate they build on.
 """
 
 from dataclasses import dataclass, field
@@ -77,7 +76,7 @@ class InlineSpec:
     ``local_columns`` / ``remote_columns``
         the FK correlation: the parent's local key column(s) equated to the child's remote
         column(s) inside the LATERAL's ``WHERE`` (``parent.local = child.remote``), the
-        textbook single-column (this wave) or composite-tuple correlation.
+        textbook single-column or composite-tuple correlation.
     ``order_by``
         the child's normalized ORDER BY (incl. the PK tie-break) reproduced inside
         ``json_agg(... ORDER BY ...)`` so the nested list order matches the standalone child.
@@ -277,7 +276,7 @@ def access_column_path(step: Step) -> Optional[Tuple[str, ...]]:
     path with no fallback — and ``None`` otherwise (a composite key is a
     :class:`grafast_py.core_steps.ListStep` of accesses, a deeper/fallback access, or any
     other step), so the safety predicate folds only the textbook single-column correlation
-    this wave supports.
+    it currently supports.
     """
     if not isinstance(step, AccessStep):
         return None
@@ -298,10 +297,10 @@ def find_inline_candidates(
     A PURE function (no DAG mutation, no SQL): it inspects ``parent`` and its dependents in
     ``plan`` and returns ``[(child_step, InlineSpec), ...]`` for each child relation step that
     is PROVABLY equivalent to fold into ``parent``'s statement via a ``LEFT JOIN LATERAL``.
-    The parent's ``optimize`` (a later Wave 3b step) consumes this list to build the
-    replacement parent + rewrite each folded child into a :class:`NestedExtractStep`; here we
-    only DECIDE, conservatively. Returns ``[]`` when inlining is off, or when no child passes
-    — the no-op invariant (``optimize`` then returns ``self``).
+    The parent's ``optimize`` consumes this list to build the replacement parent + rewrite
+    each folded child into a :class:`NestedExtractStep`; here we only DECIDE, conservatively.
+    Returns ``[]`` when inlining is off, or when no child passes — the no-op invariant
+    (``optimize`` then returns ``self`` unchanged).
 
     Inlining is opportunistic and equivalence-preserving: the result with a fold MUST be
     byte-identical to the batched ``= ANY($1)`` path. So a fold of child C into parent P is
@@ -316,12 +315,11 @@ def find_inline_candidates(
        risk is a resource in a different schema/database — not foldable), AND C is not the
        SAME table as P (a SELF-referential relation: the flat ``build_lateral`` cannot alias
        the inner table apart from the outer parent, so its correlation would collapse — SKIP
-       and keep the batched path until the per-select alias subsystem lands).
+       and keep the batched path; aliasing the inner select apart is not yet supported).
     3. FK-CORRELATABLE: C is a relation select whose dep 0 is a single-column
        :class:`AccessStep` reading ONE column off P's rows (the local FK), with C's
        ``match_columns`` the remote columns — the textbook ``parent.local = child.remote``.
-       (A composite key is a :class:`ListStep`, handled only in a later composite branch;
-       this wave SKIPS it.)
+       A composite key is a :class:`ListStep` and is not inlined (kept on the batched path).
     4. NOT SIDE-EFFECTING: both P and C are ``dedupable`` (a mutation is ``dedupable=False`` —
        NEVER inlined).
     5. UNPAGINATED hasMany: C is not window-sliced (``is_limited`` False); a hasOne is
@@ -329,16 +327,17 @@ def find_inline_candidates(
     6. ORDERING FAITHFUL: C's ``order_by`` is expressible inside ``json_agg`` — it names only
        stored / computed columns (``assert_order_terms_stored`` already forbids ordering by a
        projection-only computed column); a violation SKIPS.
-    7. CUSTOMIZATION REPRODUCIBLE: this wave SKIPS any child carrying a host WHERE predicate
-       (a ``select_customizer`` scope or a per-plan ``.where()``) — reproducing an arbitrary
-       correlated predicate inside the LATERAL with a proven-identical customization signature
-       is deferred. An UNFILTERED child folds with ``where_predicates=()``.
+    7. CUSTOMIZATION REPRODUCIBLE: any child carrying a host WHERE predicate (a
+       ``select_customizer`` scope or a per-plan ``.where()``) is not inlined — reproducing
+       an arbitrary correlated predicate inside the LATERAL with a proven-identical
+       customization signature is not yet supported. An UNFILTERED child folds with
+       ``where_predicates=()``.
     8. COLUMNS JSON-STABLE: every folded child column survives ``to_jsonb`` -> JSON -> ``to_py``
        to the SAME Python value as the batched row decode (``resource.is_inline_json_safe``);
        a non-native codec OR a non-native / UNKNOWN-typed bare column (timestamptz / numeric /
        bytea / array / range / composite) SKIPS — an unprovable column is never assumed native.
     9. NO CONNECTION: C is a relation select, never a :class:`PgConnectionStep` (paginated /
-       aggregate / keyset) — always SKIPPED this wave. (Enforced by the type check in 3.)
+       aggregate / keyset) — never inlined. (Enforced by the type check in 3.)
     """
     # local imports break the steps <-> inline import cycle (steps imports inline at module
     # load; inline only needs the concrete classes here, inside the predicate).
@@ -397,8 +396,8 @@ def inline_candidate_for(
     fire; a pass returns the spec the LATERAL is built from. Pure: it never mutates ``parent``
     or ``child``.
     """
-    # 9 / 3 (type): a connection is paginated/aggregate/keyset — never folded this wave; and
-    # only a relation SELECT (single = hasOne, plain = hasMany) is a fold candidate. A
+    # 9 / 3 (type): a connection is paginated/aggregate/keyset — never folded; and only a
+    # relation SELECT (single = hasOne, plain = hasMany) is a fold candidate. A
     # PgSelectAllStep is a ROOT collection (no key match), never a child relation.
     if isinstance(child, connection_cls):
         log.debug("inline skip", reason="connection", child=child.resource.name)
@@ -432,9 +431,10 @@ def inline_candidate_for(
     # build_lateral emits the LATERAL child as a bare `table(spec.resource.table)` with the
     # SAME unaliased name as the outer parent, so the `parent_table.c[local]` correlation
     # would resolve to the INNER table inside the subquery — collapsing the outer
-    # correlation into a within-row comparison so EVERY parent silently gets [] / None. Until
-    # the per-select alias subsystem exists, SKIP a self-relation and keep the proven batched
-    # `= ANY($1)` path (one extra statement), matching the limited/filtered/composite skips.
+    # correlation into a within-row comparison so EVERY parent silently gets [] / None.
+    # Without an inner-select alias distinct from the outer parent, SKIP a self-relation and
+    # keep the proven batched `= ANY($1)` path (one extra statement), matching the
+    # limited/filtered/composite skips.
     if child.resource.table == parent.resource.table:
         log.debug(
             "inline skip", reason="self_relation",
@@ -452,13 +452,13 @@ def inline_candidate_for(
         log.debug("inline skip", reason="mutation", child=child.resource.name)
         return None
 
-    # 5. UNPAGINATED hasMany — a per-parent window slice cannot ride a json_agg this wave.
+    # 5. UNPAGINATED hasMany — a per-parent window slice cannot ride a json_agg.
     if child.is_limited:
         log.debug("inline skip", reason="limited", child=child.resource.name)
         return None
 
-    # 7. CUSTOMIZATION — defer any filtered child (a select_customizer scope or per-plan
-    # .where()); we fold only an UNFILTERED relation this wave.
+    # 7. CUSTOMIZATION — skip any filtered child (a select_customizer scope or per-plan
+    # .where()); only an UNFILTERED relation is inlined.
     if child.where_predicates:
         log.debug("inline skip", reason="filtered", child=child.resource.name)
         return None
@@ -489,8 +489,8 @@ def inline_candidate_for(
         local_columns=tuple(local_path),
         remote_columns=remote_columns,
         order_by=tuple(child.order_by),
-        # condition 7 guaranteed an unfiltered child, so no predicates ride the LATERAL this
-        # wave; computed projections are emitted from the child resource at build time.
+        # condition 7 guaranteed an unfiltered child, so no predicates ride the LATERAL;
+        # computed projections are emitted from the child resource at build time.
         where_predicates=(),
         computed=tuple(child.resource.computed_projections()),
     )
