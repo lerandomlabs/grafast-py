@@ -30,6 +30,8 @@ from grafast_py import (
     lambda_step,
     load_many,
     load_one,
+    resolve_type_from_discriminator,
+    resolve_type_from_tag,
 )
 
 # --------------------------------------------------------------------- seed data
@@ -177,6 +179,86 @@ def objects_for(query_plans: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         },
         "Comment": {"id": leaf("id"), "body": leaf("body")},
     }
+
+
+# ----------------------------------------------------- polymorphism (abstract types)
+# Interface + union over a list of MIXED concrete types — the batching profile the
+# blog corpus never exercised. The decisive case: a relation selected on two concrete
+# types in one list must fire each loader ONCE (per concrete-type group), which the
+# differ cross-checks against reference Node Grafast. Mirrors node/corpus.mjs SDL_POLY.
+SDL_POLY = """
+  type Query {
+    feed: [Content!]!
+    item(id: Int!): Content
+    search: [Hit!]!
+  }
+  interface Content { id: Int! }
+  type Article implements Content { id: Int! headline: String! author: Author }
+  type Photo implements Content { id: Int! caption: String! tags: [Tag!]! }
+  type Author { id: Int! name: String! }
+  type Tag { id: Int! label: String! }
+  union Hit = Article | Photo
+"""
+
+# Each row carries BOTH a `kind` discriminator (interface bridge) and a `__typename`
+# tag (union bridge). Articles point at AUTHOR_BY_ID; photos at TAGS_BY_PHOTO.
+FEED: List[Dict[str, Any]] = [
+    {"id": 1, "kind": "article", "__typename": "Article", "headline": "H1", "authorId": 1},
+    {"id": 2, "kind": "photo", "__typename": "Photo", "caption": "C2"},
+    {"id": 3, "kind": "article", "__typename": "Article", "headline": "H3", "authorId": 2},
+    {"id": 4, "kind": "photo", "__typename": "Photo", "caption": "C4"},
+    {"id": 5, "kind": "article", "__typename": "Article", "headline": "H5", "authorId": 1},
+]
+FEED_BY_ID: Dict[int, Dict[str, Any]] = {r["id"]: r for r in FEED}
+
+TAGS_BY_PHOTO: Dict[int, List[Dict[str, Any]]] = {
+    2: [{"id": 201, "label": "sky"}],
+    4: [{"id": 202, "label": "sea"}, {"id": 203, "label": "sun"}],
+}
+
+
+def load_tags_by_photo(ids: List[int]) -> List[Any]:
+    return [TAGS_BY_PHOTO.get(i, []) for i in ids]
+
+
+LOADERS["loadTagsByPhoto"] = load_tags_by_photo
+
+
+def poly_objects_for(query_plans: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Plan map for the abstract schema: Article/Photo each load a DIFFERENT relation.
+
+    Article.author re-uses the shared ``loadAuthors`` (loadOne by id); Photo.tags uses
+    ``loadTagsByPhoto`` (loadMany by photo id). A query selecting both on a Content list
+    runs each in its own concrete-type group bucket — one batched call apiece.
+    """
+    return {
+        "Query": query_plans,
+        "Article": {
+            "id": leaf("id"),
+            "headline": leaf("headline"),
+            "author": lambda p, args, info: load_one(
+                access(p, ["authorId"]), LOADERS["loadAuthors"]
+            ),
+        },
+        "Photo": {
+            "id": leaf("id"),
+            "caption": leaf("caption"),
+            "tags": lambda p, args, info: load_many(
+                access(p, ["id"]), LOADERS["loadTagsByPhoto"]
+            ),
+        },
+        "Author": {"id": leaf("id"), "name": leaf("name")},
+        "Tag": {"id": leaf("id"), "label": leaf("label")},
+    }
+
+
+# The resolve_type bridges: interface by discriminator column, union by typename tag.
+POLY_TYPE_RESOLVERS = {
+    "Content": resolve_type_from_discriminator(
+        "kind", {"article": "Article", "photo": "Photo"}
+    ),
+    "Hit": resolve_type_from_tag("__typename"),
+}
 
 
 # ----------------------------------------------------------------- the fixtures
@@ -393,6 +475,61 @@ FIXTURES = [
         "sdl": SDL_BLOG,
         "plans": objects_for({"boom": lambda p, a, i: _boom_step()}),
         "query": "{ boom }",
+        "variables": {},
+    },
+    # ---- polymorphism: interface/union batching over mixed concrete-type lists ----
+    {
+        "name": "iface_list_typename",
+        "sdl": SDL_POLY,
+        "plans": poly_objects_for({"feed": lambda p, a, i: constant(FEED)}),
+        "type_resolvers": POLY_TYPE_RESOLVERS,
+        # pure projection (__typename + interface id): no loader fires.
+        "query": "{ feed { __typename id } }",
+        "variables": {},
+    },
+    {
+        "name": "iface_list_relation_one_type",
+        "sdl": SDL_POLY,
+        "plans": poly_objects_for({"feed": lambda p, a, i: constant(FEED)}),
+        "type_resolvers": POLY_TYPE_RESOLVERS,
+        # only the Photo group loads tags -> loadTagsByPhoto once over [2, 4].
+        "query": "{ feed { ... on Photo { tags { label } } } }",
+        "variables": {},
+    },
+    {
+        "name": "iface_list_relation_both_types",
+        "sdl": SDL_POLY,
+        "plans": poly_objects_for({"feed": lambda p, a, i: constant(FEED)}),
+        "type_resolvers": POLY_TYPE_RESOLVERS,
+        # Article group -> loadAuthors once over [1,2,1]; Photo group -> loadTagsByPhoto
+        # once over [2,4]. The headline multi-concrete-type-over-a-list batching case.
+        "query": (
+            "{ feed { id ... on Article { author { name } } "
+            "... on Photo { tags { label } } } }"
+        ),
+        "variables": {},
+    },
+    {
+        "name": "iface_single_relation",
+        "sdl": SDL_POLY,
+        "plans": poly_objects_for(
+            {"item": lambda p, a, i: constant(FEED_BY_ID.get(a.get("id")))}
+        ),
+        "type_resolvers": POLY_TYPE_RESOLVERS,
+        # a single nullable interface value (an Article) -> loadAuthors once (1 key).
+        "query": "{ item(id: 1) { ... on Article { author { name } } } }",
+        "variables": {},
+    },
+    {
+        "name": "union_list_relation_both",
+        "sdl": SDL_POLY,
+        "plans": poly_objects_for({"search": lambda p, a, i: constant(FEED)}),
+        "type_resolvers": POLY_TYPE_RESOLVERS,
+        # same shape as iface_list_relation_both_types but via the union tag bridge.
+        "query": (
+            "{ search { ... on Article { author { name } } "
+            "... on Photo { tags { label } } } }"
+        ),
         "variables": {},
     },
 ]
