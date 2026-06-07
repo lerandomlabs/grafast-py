@@ -1,10 +1,9 @@
-"""The inlining OPTIMIZE wiring (Wave 3b, step 6): ``PgSelect*Step.optimize``.
+"""The inlining OPTIMIZE wiring: ``PgSelect*Step.optimize``.
 
-Step 5 added the pure safety PREDICATE (``inline_candidates``); this step adds the
-``optimize`` hook that ACTS on it — building the replacement parent carrying the
-:class:`InlineSpec`\\ s and rewriting each folded child relation step into a
-:class:`NestedExtractStep` that reads the parent's nested column. These tests pin the DAG
-transform in ISOLATION (no DB):
+The ``optimize`` hook ACTS on the pure safety PREDICATE (``inline_candidates``) — building
+the replacement parent carrying the :class:`InlineSpec`\\ s and rewriting each folded child
+relation step into a :class:`NestedExtractStep` that reads the parent's nested column. These
+tests pin the DAG transform in ISOLATION (no DB):
 
 - a parent with foldable children returns a REPLACEMENT carrying the specs, and records
   ``child -> NestedExtractStep`` so the optimize pass repoints every reference to the child;
@@ -199,8 +198,8 @@ def test_optimize_then_tree_shake_drops_orphaned_key_access():
 def test_nested_fold_is_single_level_and_comments_falls_back_batched():
     """authors -> posts -> comments folds ONE level: posts into authors; comments batched.
 
-    Nested LATERAL (comments INSIDE posts' LATERAL inside authors) is NOT supported by this
-    wave's flat ``build_lateral`` — an :class:`InlineSpec` carries no nested child spec. The
+    Nested LATERAL (comments INSIDE posts' LATERAL inside authors) is NOT supported by the
+    flat ``build_lateral`` — an :class:`InlineSpec` carries no nested child spec. The
     fold is therefore SINGLE-LEVEL: the outer relation (posts) folds into the root, and the
     deeper relation (comments) FALLS BACK to its batched ``WHERE post_id = ANY($1)`` path,
     reading the post ids off the extracted post rows (its key access is rewired to the posts

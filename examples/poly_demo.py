@@ -1,4 +1,4 @@
-"""End-to-end Postgres polymorphism demo for grafast-py (Wave 2).
+"""End-to-end Postgres polymorphism demo for grafast-py.
 
 Mirrors :mod:`examples.pg_blog` but for INTERFACES and UNIONS backed by Postgres. It
 seeds the ``grafast_demo`` polymorphism fixtures, builds the schema from

@@ -52,8 +52,8 @@ from .from_sqlalchemy import (
     resource_from_model,
     resources_from_models,
 )
-# LATERAL relation inlining substrate (Wave 3b): the fold spec + nested-row extract step
-# the parent's optimize/build_query (later steps) reproduce a child relation through.
+# LATERAL relation inlining substrate: the fold spec + nested-row extract step the
+# parent's optimize/build_query reproduce a child relation through.
 from .inline import (
     InlineSpec,
     NestedExtractStep,
@@ -68,8 +68,8 @@ from .mutations import (
     pg_update_single,
 )
 from .ordering import OrderTerm, normalize_order, order_clauses
-# value-agnostic placeholders (Wave 4): a source-tagged WHERE bindparam (`pg_placeholder`)
-# and a `Placeholder` sentinel for a variable-derived pagination value (first/offset/after/
+# value-agnostic placeholders: a source-tagged WHERE bindparam (`pg_placeholder`) and a
+# `Placeholder` sentinel for a variable-derived pagination value (first/offset/after/
 # before), both dedup-keyed by their stable source tag, not their runtime value.
 from .placeholders import (
     Placeholder,
@@ -118,7 +118,7 @@ __all__ = [
     "PgSelectStep",
     "PgSelectSingleStep",
     "PgSelectAllStep",
-    # LATERAL relation inlining substrate (Wave 3b)
+    # LATERAL relation inlining substrate
     "InlineSpec",
     "NestedExtractStep",
     "inline_spec_from_relation",
@@ -172,7 +172,7 @@ __all__ = [
     "check_predicate",
     "predicate_key",
     "resolve_customizer_predicates",
-    # value-agnostic placeholders for a variable-derived value (Wave 4): WHERE bindparam +
+    # value-agnostic placeholders for a variable-derived value: WHERE bindparam +
     # the pagination-value (first/offset/after/before) sentinel
     "pg_placeholder",
     "placeholder_source",

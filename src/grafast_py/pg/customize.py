@@ -20,7 +20,7 @@ KEY only — the step EXECUTES the predicate with its bindparams intact, never w
 value, which :func:`check_predicate` enforces (an unbound bind, or a bind reusing a
 reserved skeleton name, fails loud).
 
-A PLACEHOLDER (Wave 4) is the value-AGNOSTIC counterpart: when the value came from a GraphQL
+A PLACEHOLDER is the value-AGNOSTIC counterpart: when the value came from a GraphQL
 ``$variable``, the host wraps it as ``pg_placeholder(field_args.source("status"),
 args["status"])`` — a bindparam that carries the request's value (so it still rides
 ``compiled.params`` at execute, unchanged) but is tagged with a STABLE source (``var:status``,
@@ -29,8 +29,9 @@ WITHOUT ``literal_binds`` (value-agnostic ``status = %(name)s``) plus the sorted
 so two requests of the same document key IDENTICALLY (one shared plan), two different variable
 sources never merge, and a placeholder never merges with a coincidentally equal-valued inlined
 literal (``$1`` vs an inlined ``'published'`` are different SQL). A predicate with NO
-placeholder binds is UNAFFECTED — it keeps the value-included ``literal_binds`` key, so every
-existing merge/count stays byte-identical. The discriminator is membership in the per-step
+placeholder binds is UNAFFECTED — it keeps the value-included ``literal_binds`` key, so a
+purely literal predicate keys exactly as it would without placeholder support. The
+discriminator is membership in the per-step
 ``placeholder_binds`` registry, populated by :meth:`PgCustomizable.add_where` when it sees a
 source-tagged bind (see :mod:`grafast_py.pg.placeholders`).
 """
@@ -109,13 +110,13 @@ def predicate_key(
     (e.g. ``{"grafast_ph_3": "var:status"}``), as populated by
     :meth:`PgCustomizable.add_where`. It splits the predicate into two key regimes:
 
-    LITERAL (no placeholder binds — the default, and EVERY pre-Wave-4 predicate): compiled
+    LITERAL (no placeholder binds — the default, and every purely literal predicate): compiled
     with the Postgres dialect and ``literal_binds`` so every bound value renders INLINE —
     ``status = 'published'`` and ``status = 'draft'`` produce DIFFERENT strings, so two
     differently-filtered selects never dedup-merge, while identical predicates yield the
     identical string (and DO merge). Valid only because every bind carries a plan-time value
-    — :func:`check_predicate` guarantees that. This path is BYTE-IDENTICAL to pre-Wave-4, so
-    every existing merge/count is preserved.
+    — :func:`check_predicate` guarantees that. This path is BYTE-IDENTICAL whether or not
+    placeholder support is in play, so every literal-predicate merge/count is preserved.
 
     PLACEHOLDER (one or more binds are in ``placeholder_binds``): the value is NOT known at
     plan time (it is a per-request variable), so the key MUST NOT inline it. Compiled WITHOUT
@@ -284,7 +285,7 @@ class PgCustomizable(Step):
         # stable). Resource-customizer predicates come first, then per-plan .where()s.
         self.where_predicates: List[ColumnElement] = list(predicates)
         # per-step placeholder registry: placeholder bind NAME -> stable source tag (e.g.
-        # "var:status"), populated as add_where sees a source-tagged bind (Wave 4). Read by
+        # "var:status"), populated as add_where sees a source-tagged bind. Read by
         # predicate_key to take the value-agnostic key path for a placeholder-bearing
         # predicate; EMPTY for a literal-only step (the default), so its key stays the
         # byte-identical value-included literal key. Seed it from any predicates passed in
