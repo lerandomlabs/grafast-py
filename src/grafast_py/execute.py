@@ -61,13 +61,13 @@ def run_bucket_steps(context, plan: ObjectPlan, parents: List[Any]):
 
     Returns a dict `step.id -> output column` (or a coroutine resolving to it when an
     async load is in the sub-DAG), or `None` when the bucket has no plan-field steps
-    (the pure legacy-resolver path, unchanged).
+    (the pure legacy-resolver path).
 
     `plan.layer.effect_steps` are side-effecting steps an optimizer orphaned (a mutation whose
     return value was inlined): no field consumes them, so they are added to the run
     targets here to RUN FOR EFFECT in this bucket — their output column is discarded but
     the write executes. With the default identity optimize `effect_steps` is empty, so
-    the targets (and the run) are byte-identical to before.
+    the targets and the run reduce to just the plan-field steps.
     """
     if plan.layer.parent_step is None:
         return None
@@ -198,7 +198,7 @@ def execute_object_plan_serially(
     return value) are run FOR EFFECT up front: a mutation whose result is not selected
     still must write. If that run is async the whole serial pass becomes a coroutine that
     awaits the effects before completing any field. With the default identity optimize
-    `effect_steps` is empty, so this is skipped and the path is byte-identical.
+    `effect_steps` is empty, so this step is skipped entirely.
     """
     state = FieldCompletion(len(parents))
 
@@ -289,7 +289,7 @@ def complete_field(
     `step_columns` (the batched step DAG already ran once over the whole bucket —
     `field_plan.step` is the field's value step) rather than re-entering a resolver
     per parent; that is where automatic batching is realised. A field WITHOUT a plan
-    resolver takes the legacy per-parent `ResolveStep` adapter, unchanged.
+    resolver takes the legacy per-parent `ResolveStep` adapter.
     """
     live_idx = [i for i in range(len(parents)) if is_live(state, i)]
     if not live_idx:

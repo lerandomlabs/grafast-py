@@ -6,14 +6,14 @@ of `count` entries flowing through a layer together). `execute(count, values)`
 returns a list of length `count` — one output per bucket position — and `values[d]`
 is the already-computed output column (also length `count`) of the step's `d`-th
 dependency. Running a step once per bucket — rather than re-entering a resolver per
-(field, parent) pair — is what makes batching automatic: a future `loadMany` step
-sees EVERY key in its bucket in a single `execute`, so it can issue one batch call.
+(field, parent) pair — is what makes batching automatic: a `loadMany` step sees EVERY
+key in its bucket in a single `execute`, so it can issue one batch call.
 
-This module ships the base class and the executor plus the legacy-resolver adapter
+This module holds the base class and the executor plus the legacy-resolver adapter
 (`ResolveStep`). The concrete value steps (access, lambda, constant, list, object,
-loadOne/loadMany) and the plan-resolver API arrive in the next build stage; they all
-subclass `Step` and obey the same `execute` contract, so the executor here is the
-single place steps are run.
+loadOne/loadMany) and the plan-resolver API live elsewhere; they all subclass `Step`
+and obey the same `execute` contract, so the executor here is the single place steps
+are run.
 """
 
 from contextlib import nullcontext
@@ -100,7 +100,7 @@ class Step:
         """Self-rewrite during the optimize pass: return `self` to keep, or a
         replacement `Step` to be wired in for `self`. Default: identity.
 
-        Passed the owning `Plan` so a dependent-absorbing optimizer (the future
+        Passed the owning `Plan` so a dependent-absorbing optimizer (the
         query-inlining step) can find ITS dependents via `plan.dependents_of(self)`
         and register a freshly built replacement step. A replacement returned here is
         re-wired into the DAG by the pass; per the class contract above, an optimizer
@@ -114,7 +114,7 @@ class Step:
     def rebind_placeholders(self, values_by_source: Dict[str, Any]) -> None:
         """Re-point this step's variable-derived placeholder VALUES (default: no-op).
 
-        The plan-cache rebind hook (Wave 4): a CACHED plan's steps were built carrying the
+        The plan-cache rebind hook: a CACHED plan's steps were built carrying the
         FIRST request's placeholder values (a ``pg_placeholder`` bindparam's ``value=``, a
         pagination ``Placeholder``'s ``value``). On a cache HIT for a DIFFERENT request, the
         cache re-points each placeholder to THIS request's value before execution, keyed by
@@ -153,7 +153,7 @@ def run_steps(
     None. It wraps the batch boundary — the exact point Grafast batches a layer.
 
     Returns a dict mapping `step.id -> output column`. When any step's `execute`
-    returns a coroutine (an async *column*, e.g. a future batched load), the whole
+    returns a coroutine (an async *column*, e.g. a batched load), the whole
     call returns a coroutine resolving to that dict; steps are then awaited in
     dependency order so a dependent never runs before its dependency's column is
     materialised. `is_awaitable` is the context's awaitable predicate.
