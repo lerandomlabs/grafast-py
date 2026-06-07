@@ -15,6 +15,23 @@ jobs:
   leg-a-graphql-32:
     name: "3.2 (default env)"
     runs-on: ubuntu-latest
+    # the pg data source + the demo seed read GRAFAST_PG_URL. local dev points at a peer-auth
+    # socket (postgresql+asyncpg:///grafast_py_test); CI talks to the service container over TCP.
+    env:
+      GRAFAST_PG_URL: "postgresql+asyncpg://postgres:postgres@localhost:5432/grafast_py_test"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: grafast_py_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -26,6 +43,11 @@ jobs:
 
       - name: sync (graphql-core 3.2.x via the pin)
         run: uv sync --extra pg --extra structlog
+
+      - name: seed the grafast_demo schema (pg-backed tests + the pg oracles)
+        # drops+recreates grafast_demo in the service DB and inserts the deterministic rows the
+        # pg tests/oracles read; setup_demo_schema is idempotent (it reseeds on every run).
+        run: uv run python -c "import asyncio; from examples.seed import setup_demo_schema; asyncio.run(setup_demo_schema())"
 
       - name: verify graphql-core is the 3.2 line
         run: uv run python -c "import graphql; assert graphql.__version__.startswith('3.2'), graphql.__version__; print(graphql.__version__)"

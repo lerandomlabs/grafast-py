@@ -160,6 +160,20 @@ def test_seam_accepts_parsed_document():
     assert result.data == {"greeting": "hello world"}
 
 
+def test_seam_validates_a_pre_parsed_document():
+    """A caller-supplied (invalid) DocumentNode is validated just like the string path —
+    grafast_execute is the full graphql() pipeline, so parse('{ missing }') and the string
+    '{ missing }' must yield the SAME validation error, not silently-dropped success."""
+    schema = make_schema()
+    from_string = grafast_execute(schema, "{ nonExistentField }")
+    from_parsed = grafast_execute(schema, graphql.parse("{ nonExistentField }"))
+    assert from_parsed.data is None
+    assert from_parsed.errors is not None
+    assert "nonExistentField" in from_parsed.errors[0].message
+    # the two entry shapes agree (the bug was the parsed path skipping validation)
+    assert [e.message for e in from_parsed.errors] == [e.message for e in from_string.errors]
+
+
 # A shared cross-version fixture: the SAME query executed by grafast_execute must produce
 # this EXACT ``.formatted`` payload on EVERY graphql-core version. Both CI legs (3.2 and
 # 3.3) run this test against the same golden, so a pass on both legs proves

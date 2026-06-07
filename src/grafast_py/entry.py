@@ -298,9 +298,14 @@ def grafast_execute(
         except GraphQLError as error:
             return ExecutionResult(data=None, errors=[error])
 
-        validation_errors = validate(schema, parsed)
-        if validation_errors:
-            return ExecutionResult(data=None, errors=validation_errors)
+    # validate BOTH a freshly-parsed document AND a caller-supplied DocumentNode: grafast_execute
+    # is the graphql()-equivalent full pipeline, so it must report the same validation errors
+    # whether or not the caller pre-parsed (matching upstream grafast() / graphql-core's
+    # graphql()). A pre-parsed INVALID document previously slipped through here — e.g. an unknown
+    # field was silently dropped by the planner instead of surfacing a validation error.
+    validation_errors = validate(schema, parsed)
+    if validation_errors:
+        return ExecutionResult(data=None, errors=validation_errors)
 
     selected = _select_operation(parsed, operation_name)
     if isinstance(selected, list):
