@@ -564,6 +564,17 @@ def plan_operation(
 
     object_plan = finalize_plan(plan, object_plan)
 
+    # a resource select_customizer that baked a plan-time LITERAL (the 1-arg legacy form, or a
+    # 2-arg customizer that returned a non-placeholder predicate) makes the plan VALUE-SPECIFIC:
+    # the per-request context value lives in the SHARED step, so a cache HIT would serve a later
+    # request the FIRST request's scope (a cross-context leak). Refuse to cache such a plan — it
+    # re-plans per request, exactly like an inlined $variable or an abstract field. Duck-typed so
+    # core takes NO pg/sqlalchemy import (the pg step sets the flag in seed_resource_customization;
+    # a non-pg step never carries it). A 2-arg placeholder customizer leaves the flag False and
+    # stays cacheable (its value is re-read per request from the context in where_params).
+    if any(getattr(step, "customizer_bakes_literal", False) for step in plan.steps):
+        plan.cacheable = False
+
     # an ABSTRACT field's per-concrete-type subtree is planned LAZILY at execute time (in
     # `completion.abstract_child_plan`), AFTER this operation plan is stored, and its steps are
     # held on the completer (NOT in `plan.steps`), so the operation-level placeholder rebind

@@ -35,7 +35,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 from graphql import graphql, graphql_sync, parse
-from sqlalchemy import column
+from sqlalchemy import String, column
 
 import grafast_py.plan as plan_module
 from grafast_py.cache import (
@@ -962,3 +962,131 @@ async def test_cached_result_byte_identical_to_uncached(seeded):
     assert cached_count.count == uncached_count.count
     # the cached context ran twice: the first primed the cache (miss), the measured run hit it.
     assert cache.hits == 1 and cache.misses == 1
+
+
+# ----------------------------------- select_customizer convergence to selectAuth (DB)
+#
+# A resource select_customizer (the selectAuth analogue) scopes reads by the per-request
+# context. The cross-request plan cache shares a finalized plan across requests; a 1-arg
+# customizer that bakes the context value as a LITERAL into that shared plan leaks one
+# request's scope to the next. The convergence: a literal customizer is forced NON-cacheable
+# (the safety floor) so it can never leak, while a value-agnostic placeholder customizer
+# (the 2-arg form) stays cacheable and re-binds its value per request — structure fixed at
+# plan time, value supplied per request at execute time, exactly as upstream selectAuth.
+
+
+CUSTOMIZER_WIDGETS_SDL = """
+type Query { widgets: [Widget!]! }
+type Widget { id: Int! status: String! }
+"""
+
+
+def build_customizer_widgets_schema(select_customizer):
+    """A widgets schema whose root list applies a resource ``select_customizer`` (no GraphQL arg).
+
+    The filter comes entirely from the per-request context via the customizer, so two requests
+    of the SAME document (no variables) differ only by their bound context — the setup that
+    exposes a cache leak if the context value is baked into the shared cached plan.
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    registry = PgRegistry()
+    widgets = PgResource(
+        "widgets", "grafast_demo", "widgets",
+        ["id", "owner_id", "title", "status", "deleted_at"],
+        registry=registry, select_customizer=select_customizer,
+    )
+
+    def widgets_plan(parent, args, info):
+        return PgSelectAllStep(widgets, order_by=["id"]).for_parent(parent)
+
+    return make_grafast_schema(
+        CUSTOMIZER_WIDGETS_SDL,
+        {
+            "Query": {"widgets": widgets_plan},
+            "Widget": {
+                "id": lambda p, a, i: access(p, ("id",)),
+                "status": lambda p, a, i: access(p, ("status",)),
+            },
+        },
+    )
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_literal_select_customizer_leaks_across_contexts_under_cache(seeded):
+    """A 1-arg (literal) customizer must NOT be cached (else it leaks across contexts).
+
+    Request A (context status=published) plans a select with ``status = 'published'`` BAKED in.
+    Without the safety floor that plan is wrongly cacheable, so request B (context status=draft,
+    SAME document) hits the cache and is served request A's published rows — a cross-context
+    leak. The fix forces a literal customizer NON-cacheable, so request B re-plans with ITS
+    context and gets ITS own rows.
+    """
+
+    def only_status(ctx):
+        return [column("status") == ctx["status"]]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_customizer_widgets_schema(only_status)
+    query = "{ widgets { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "published"}):
+        a = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "draft"}):
+        b = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert a.errors is None and b.errors is None
+    # the literal customizer is value-pinned, so NEITHER request may reuse the other's plan.
+    assert cache.misses == 2 and cache.hits == 0
+    # each request gets ITS OWN context's rows — no leak.
+    assert sorted(w["id"] for w in a.data["widgets"]) == [1, 3, 4, 6]
+    assert sorted(w["id"] for w in b.data["widgets"]) == [2, 5]
+    assert {w["status"] for w in b.data["widgets"]} == {"draft"}
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_placeholder_select_customizer_cacheable_no_leak(seeded):
+    """A 2-arg (placeholder) customizer stays CACHEABLE and re-binds its value per request.
+
+    The convergence to upstream selectAuth: the predicate STRUCTURE (``status = :ctx``) is fixed
+    at plan time and the VALUE is read per request from the context at execute. Request A
+    (published) caches the value-independent plan; request B (draft, SAME document) is a cache HIT
+    that re-binds ITS context — so the plan is SHARED (hits==1) AND each request gets ITS OWN rows
+    (no leak across the shared plan). This is what the 1-arg literal form cannot do (it is forced
+    non-cacheable; see test_literal_select_customizer_leaks_across_contexts_under_cache).
+    """
+
+    def only_status(ctx, sources):
+        return [column("status") == sources.placeholder("status", type_=String)]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_customizer_widgets_schema(only_status)
+    query = "{ widgets { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "published"}):
+        a = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "draft"}):
+        b = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert a.errors is None and b.errors is None
+    # the placeholder customizer is value-independent: the plan is SHARED across the two requests.
+    assert cache.misses == 1 and cache.hits == 1
+    # yet each request bound ITS OWN context value off the shared plan — no leak.
+    assert sorted(w["id"] for w in a.data["widgets"]) == [1, 3, 4, 6]
+    assert sorted(w["id"] for w in b.data["widgets"]) == [2, 5]
+    assert {w["status"] for w in a.data["widgets"]} == {"published"}
+    assert {w["status"] for w in b.data["widgets"]} == {"draft"}

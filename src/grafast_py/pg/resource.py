@@ -30,6 +30,7 @@ Resources register in a :class:`PgRegistry` so relations resolve their target by
 name regardless of declaration order.
 """
 
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -46,10 +47,18 @@ from ..core_steps import access, list_step
 from ..step_model import Step
 from .ordering import OrderTerm
 
-# A resource select-customizer: context -> list of Core predicates ANDed onto EVERY
-# batched select for the resource (the selectAuth analogue for soft-delete / tenant
-# scoping / visibility). Resolved once per planned step against the per-request context.
-SelectCustomizer = Callable[[Any], Sequence[Any]]
+# A resource select-customizer: predicates ANDed onto EVERY batched select for the resource
+# (the selectAuth analogue for soft-delete / tenant scoping / visibility), applied to READS
+# only (never to mutations — write authorization is Postgres RLS via pgSettings). Two forms:
+#   * 1-arg  ``customizer(context) -> [Core predicate]``         — values inlined as plan-time
+#     LITERALS (the plan is value-specific, so non-cacheable under cache_plans);
+#   * 2-arg  ``customizer(context, sources) -> [Core predicate]`` — the cacheable form, where
+#     ``sources.placeholder(key)`` mints a value-LESS ``ctx:`` placeholder resolved per request
+#     at execute (structure at plan time, value per request — the convergence to selectAuth).
+# Resolved once per planned step against the per-request context.
+SelectCustomizer = Union[
+    Callable[[Any], Sequence[Any]], Callable[[Any, Any], Sequence[Any]]
+]
 
 # The PROVABLY-json-stable SQL type classes for the inlining fold (the json-stability
 # condition of the inlining safety predicate). A folded column's value travels
@@ -350,10 +359,34 @@ class PgResource:
             derived_types.update(column_types)
         self.column_types: Mapping[str, TypeEngine] = derived_types
         self.relations: Dict[str, PgRelation] = {}
-        # the selectAuth analogue: context -> list[Core predicate], resolved ONCE per
-        # planned step and ANDed onto every batched select for this resource. None means
-        # no default scoping. NOT an RLS framework — flat AND-combined predicates only.
+        # the selectAuth analogue, applied to READS only (pg_select / pg_select_single /
+        # connection steps) — NEVER to mutations (pg_insert/update/delete); write authorization
+        # is Postgres RLS via pgSettings (see pg/executor.py set_config). Resolved ONCE per
+        # planned step and ANDed onto every batched select for this resource. None means no
+        # default scoping. NOT an RLS framework — flat AND-combined predicates only. A 1-arg
+        # customizer inlines values as plan-time literals (non-cacheable); a 2-arg customizer
+        # (context, sources) uses sources.placeholder(key) to stay value-independent + cacheable.
         self.select_customizer = select_customizer
+        # the customizer's parameter count (1 or 2), validated + memoized here so each planned
+        # step reads it without re-inspecting; None when there is no customizer.
+        # seed_resource_customization uses it to pick the legacy-literal vs placeholder call form.
+        self.select_customizer_arity: Optional[int] = None
+        if select_customizer is not None:
+            # count POSITIONAL params only, so a trailing *args / **kwargs does not inflate the
+            # count and a var-positional-only customizer is rejected loudly rather than silently
+            # mistaken for the 1-arg form.
+            params = inspect.signature(select_customizer).parameters.values()
+            count = sum(
+                1
+                for p in params
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+            )
+            if count not in (1, 2):
+                raise TypeError(
+                    f"select_customizer for resource {name!r} must take 1 positional arg "
+                    f"(context) or 2 (context, sources); got {count}"
+                )
+            self.select_customizer_arity = count
         if registry is not None:
             registry.add(self)
 

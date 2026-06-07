@@ -16,6 +16,14 @@ the value at execute time); the attribute's codec ``to_pg`` encodes it before bi
 Omitted columns fall back to the DB default; a NOT NULL no-default column with no value
 fails LOUD with a clear message rather than a raw DB error.
 
+AUTHORIZATION: write steps deliberately DO NOT apply the resource's ``select_customizer``
+(the read-time selectAuth analogue). update/delete are keyed by PRIMARY KEY alone and insert
+is unscoped — matching upstream Grafast, where ``selectAuth`` is a pgSelect (read) concern and
+the write authorization boundary is the database itself (Postgres ROW-LEVEL SECURITY). Scope
+writes with RLS policies via per-request ``pgSettings`` (see :mod:`grafast_py.pg.executor`
+``set_config`` / ``pg_request_context(settings=...)``), under a DB role that does not bypass
+RLS. Do NOT assume ``select_customizer`` scopes writes — it does not.
+
 Deferred (NOT in this v1 scope): bulk / multi-row mutations, arbitrary-unique-key ``getBy``
 (update/delete are PK-keyed only), and SAVEPOINT nesting for nested mutations.
 """
@@ -41,6 +49,11 @@ class PgWriteSingleStep(Step):
     are step DEPENDENCIES (resolved from the bucket column at execute time) vs plan-time
     literals (bound directly). Subclasses build their specific Core statement in
     :meth:`build_statement` and run it per bucket entry via :meth:`execute`.
+
+    Subclasses ``Step`` directly (NOT ``PgCustomizable``): a write deliberately does not apply
+    the resource ``select_customizer`` — update/delete are PRIMARY-KEY keyed and insert is
+    unscoped. The write authorization boundary is Postgres RLS via ``pgSettings`` (module
+    docstring), not this read-time hook.
     """
 
     is_sync_and_safe = False

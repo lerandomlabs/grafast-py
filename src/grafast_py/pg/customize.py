@@ -36,7 +36,8 @@ discriminator is membership in the per-step
 source-tagged bind (see :mod:`grafast_py.pg.placeholders`).
 """
 
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
+import collections.abc
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from sqlalchemy import literal_column
 from sqlalchemy.dialects import postgresql
@@ -49,7 +50,7 @@ from ..step_model import Step
 from .conditions import Condition, compile_condition
 from .executor import current_pg_request
 from .ordering import OrderTerm
-from .placeholders import placeholder_source
+from .placeholders import pg_placeholder, placeholder_source
 
 # The bind names the batched skeleton itself owns; a host predicate may not reuse them
 # (it would shadow the skeleton's own value at execute time).
@@ -265,6 +266,50 @@ def placeholder_binds_in(predicate: ColumnElement) -> Dict[str, str]:
     return binds
 
 
+class ContextSources:
+    """The plan-time placeholder factory handed to a 2-arg ``select_customizer``.
+
+    The cache-safe counterpart of the 1-arg ``customizer(context)`` form (whose values are
+    plan-time LITERALS). ``placeholder(key)`` mints a value-LESS ``pg_placeholder`` tagged
+    ``ctx:<key>``; its value is read from ``current_pg_request().context[key]`` PER REQUEST at
+    execute time (in :meth:`PgCustomizable.where_params`), so the predicate's STRUCTURE is fixed
+    at plan time while its VALUE is supplied per request — the grafast-py analogue of upstream
+    ``selectAuth`` embedding a runtime step. A customizer built this way is value-INDEPENDENT, so
+    its plan is cacheable and a cache HIT re-binds each request's OWN context value rather than
+    serving the first request's baked literal.
+    """
+
+    def placeholder(self, key: str, *, type_: Optional[Any] = None) -> BindParameter:
+        """A value-LESS placeholder whose value is ``context[key]``, read per request at execute.
+
+        ``key`` names the per-request context entry to bind, read at execute from
+        ``current_pg_request().context`` (``context[key]`` for a Mapping, else
+        ``getattr(context, key)``); ``type_`` is the column's SQLAlchemy type, so the injected
+        value is cast correctly. No value is taken here — the plan stays value-independent and the
+        value rides the compiled statement's params per request, resolved by the ``ctx:<key>``
+        source tag. A derived/transformed scoping value (not a bare context entry) is not
+        expressible this way; expose it under its own context key, or use the 1-arg form (which
+        inlines a literal and is non-cacheable).
+        """
+        return pg_placeholder(f"ctx:{key}", type_=type_)
+
+
+def predicate_bakes_literal(predicate: ColumnElement) -> bool:
+    """Whether a customizer predicate carries a non-placeholder (plan-time literal) bind.
+
+    Such a bound value may be PER-REQUEST (resolved from the context at plan time), so a plan
+    carrying it cannot be shared across requests — it forces the plan non-cacheable (the safety
+    floor). A predicate whose binds are ALL placeholders (``ctx:`` / ``var:`` source-tagged), or
+    which has no binds at all (a static ``deleted_at IS NULL``), is value-independent and stays
+    cacheable. ``check_predicate`` already rejects an unbound bind, so every bind here is either a
+    source-tagged placeholder or a plan-time literal.
+    """
+    for bind in visitors.iterate(predicate):
+        if isinstance(bind, BindParameter) and placeholder_source(bind) is None:
+            return True
+    return False
+
+
 class PgCustomizable(Step):
     """Shared customization state for a batched pg select / connection step.
 
@@ -278,12 +323,34 @@ class PgCustomizable(Step):
     this base owns only what is identical across them.
     """
 
-    def init_customization(self, predicates: Sequence[ColumnElement] = ()) -> None:
-        """Seed the customization list (call from the subclass ``__init__``)."""
+    # True when the resource customizer baked a plan-time LITERAL into the WHERE (so the plan
+    # carries a possibly-per-request value and must not be cached — the cache safety floor reads
+    # this duck-typed). Set on EVERY instance by init_customization, so its absence on a
+    # PgCustomizable would signal a missed init rather than silently defaulting to cacheable.
+    customizer_bakes_literal: bool = False
+    # how many of the leading where_predicates came from the resource customizer (the rest are
+    # per-plan .where()s); has_literal_customization inspects only these.
+    _customizer_predicate_count: int = 0
+
+    def init_customization(
+        self,
+        predicates: Sequence[ColumnElement] = (),
+        *,
+        bakes_literal: bool = False,
+        customizer_predicate_count: int = 0,
+    ) -> None:
+        """Seed the customization list (call from the subclass ``__init__``).
+
+        ``bakes_literal`` records that the resource customizer contributed a plan-time literal
+        (so the cache safety floor forces the plan non-cacheable); ``customizer_predicate_count``
+        is how many leading predicates are the customizer's (vs per-plan ``.where()``s).
+        """
         # AND-combined onto the batched WHERE in insertion order (and_(...) operand order
         # is preserved in the compiled string, so a stable order keeps the dedup key
         # stable). Resource-customizer predicates come first, then per-plan .where()s.
         self.where_predicates: List[ColumnElement] = list(predicates)
+        self.customizer_bakes_literal = bakes_literal
+        self._customizer_predicate_count = customizer_predicate_count
         # per-step placeholder registry: placeholder bind NAME -> stable source tag (e.g.
         # "var:status"), populated as add_where sees a source-tagged bind. Read by
         # predicate_key to take the value-agnostic key path for a placeholder-bearing
@@ -303,13 +370,26 @@ class PgCustomizable(Step):
         Resolves the customizer ONCE against the per-request context. The context is only
         read when the resource actually has a customizer, so a step built outside a request
         (e.g. a no-DB dedup test over an un-customized resource) needs no bound context.
+
+        A 1-arg customizer (``customizer(context)``) inlines values as plan-time LITERALS; a
+        2-arg customizer (``customizer(context, sources)``) uses ``sources.placeholder(key)`` to
+        emit value-LESS ``ctx:`` placeholders whose value is read per request at execute (in
+        :meth:`where_params`). A customizer that baked a literal marks the plan non-cacheable
+        (the safety floor); a pure-placeholder customizer stays cacheable.
         """
         customizer = resource.select_customizer
         if customizer is None:
             self.init_customization()
             return
         context = current_pg_request().context
-        self.init_customization(resolve_customizer_predicates(customizer, context))
+        predicates, bakes_literal = resolve_customizer_predicates(
+            customizer, context, resource.select_customizer_arity
+        )
+        self.init_customization(
+            predicates,
+            bakes_literal=bakes_literal,
+            customizer_predicate_count=len(predicates),
+        )
 
     def add_where(self, predicate: ColumnElement) -> None:
         """AND a validated UNIFORM Core predicate onto the batched WHERE.
@@ -336,23 +416,43 @@ class PgCustomizable(Step):
     def where_params(self, source_values: Mapping[str, Any]) -> Dict[str, Any]:
         """The execute-time params for this step's WHERE placeholder binds (name -> value).
 
-        The deepcopy-free render seam: a ``pg_placeholder`` bind is value-LESS,
-        so its runtime value is supplied per request in the compiled statement's ``params``
-        rather than baked on the SHARED bind. This maps each placeholder bind's NAME to THIS
-        request's value, resolved by the bind's stable SOURCE tag against ``source_values``
-        (the source-tag -> value map threaded via ``BucketExtra``). A literal-only step has an
-        empty ``placeholder_binds`` registry, so this returns ``{}`` — a byte-identical no-op
-        for the default cache-off path. A source absent from the map resolves to ``None`` (an
-        omitted no-default variable). The subclass seeds these into the ``params`` it hands
-        ``executor.run`` alongside ``keys`` / pagination params, so the value rides
-        ``compiled.params`` per request and never mutates the cached statement.
+        The deepcopy-free render seam: a ``pg_placeholder`` bind is value-LESS, so its runtime
+        value is supplied per request in the compiled statement's ``params`` rather than baked on
+        the SHARED bind. Each placeholder bind resolves by its stable SOURCE tag:
+
+        * a ``var:`` source (a GraphQL ``$variable``) resolves from ``source_values`` — the
+          source-tag -> value map threaded via ``BucketExtra`` (a source absent from the map
+          resolves to ``None``, an omitted no-default variable);
+        * a ``ctx:`` source (a resource ``select_customizer`` value) resolves from THIS request's
+          context (``context[key]`` for a Mapping, else ``getattr(context, key)`` for an
+          object/dataclass context), read FRESH per request — so a cache HIT over the SHARED plan
+          binds THIS request's context value, never the one the plan was built with. A missing
+          context key fails LOUD (``KeyError`` / ``AttributeError`` propagate), not a silent
+          ``None`` that would render ``col = NULL`` and silently widen the scope.
+
+        A literal-only step has an empty ``placeholder_binds`` registry, so this returns ``{}`` —
+        a byte-identical no-op for the default cache-off path; ``current_pg_request()`` is touched
+        only when a ``ctx:`` bind is actually present (so var:-only steps and no-request unit tests
+        are unchanged). The subclass seeds these into the ``params`` it hands ``executor.run``
+        alongside ``keys`` / pagination params, so the value rides ``compiled.params`` per request
+        and never mutates the cached statement.
         """
         if not self.placeholder_binds:
             return {}
-        return {
-            name: source_values.get(source)
-            for name, source in self.placeholder_binds.items()
-        }
+        context = None
+        if any(source.startswith("ctx:") for source in self.placeholder_binds.values()):
+            context = current_pg_request().context
+        params: Dict[str, Any] = {}
+        for name, source in self.placeholder_binds.items():
+            if source.startswith("ctx:"):
+                key = source[len("ctx:") :]
+                if isinstance(context, collections.abc.Mapping):
+                    params[name] = context[key]
+                else:
+                    params[name] = getattr(context, key)
+            else:
+                params[name] = source_values.get(source)
+        return params
 
     def copy_customization_from(self, other: "PgCustomizable") -> None:
         """Copy ``other``'s already-resolved customization onto this step verbatim.
@@ -361,12 +461,29 @@ class PgCustomizable(Step):
         re-resolving the resource customizer; it must copy the PLACEHOLDER registry alongside
         ``where_predicates`` so a placeholder-bearing predicate keeps its value-agnostic key
         on the clone (a registry left empty would silently revert that predicate to the
-        value-included literal path, desyncing the clone's key from the original's). Resets
-        the signature cache so the clone recomputes against the copied state.
+        value-included literal path, desyncing the clone's key from the original's). The cache
+        safety-floor decision (``customizer_bakes_literal`` + the customizer predicate count)
+        travels too, so a clone of a literal-baking step stays non-cacheable rather than silently
+        re-enabling caching. Resets the signature cache so the clone recomputes against the copied
+        state.
         """
         self.where_predicates = list(other.where_predicates)
         self.placeholder_binds = dict(other.placeholder_binds)
+        self.customizer_bakes_literal = other.customizer_bakes_literal
+        self._customizer_predicate_count = other._customizer_predicate_count
         self._signature_cache = None
+
+    def has_literal_customization(self) -> bool:
+        """Whether the RESOURCE customizer contributed a plan-time literal (so it can't be cached).
+
+        Inspects only the leading customizer-origin predicates (not per-plan ``.where()``s):
+        True if any carries a non-placeholder bind. Equivalent to the ``customizer_bakes_literal``
+        flag set at seed time; exposed for tests and as the readable discriminator.
+        """
+        return any(
+            predicate_bakes_literal(p)
+            for p in self.where_predicates[: self._customizer_predicate_count]
+        )
 
     def where_tree(self, condition: "Condition") -> None:
         """Compile a structured filter :class:`Condition` and AND it onto the batched WHERE.
@@ -502,27 +619,45 @@ class PgSelectQueryBuilder:
 
 
 def resolve_customizer_predicates(
-    customizer: Union[Callable[[Any], Sequence[Any]], None],
+    customizer: Optional[Callable[..., Sequence[Any]]],
     context: Any,
-) -> List[ColumnElement]:
+    arity: int,
+) -> Tuple[List[ColumnElement], bool]:
     """Resolve a resource ``select_customizer`` against the per-request context, ONCE.
 
-    The customizer is the selectAuth analogue (soft-delete / tenant scoping / visibility):
-    ``context -> list[Core predicate]``. Resolved once per planned step (at construction),
-    every predicate validated as a Core expression (never a raw string, fully bound, no
-    reserved bind name) and AND-combined onto EVERY batched select for the resource.
-    ``None`` customizer yields no predicates.
+    The customizer is the selectAuth analogue (soft-delete / tenant scoping / visibility),
+    applied to READS only — never to mutations (see :mod:`grafast_py.pg.mutations`; write
+    authorization is Postgres RLS via pgSettings). Two forms, by ``arity``:
+
+    * 1-arg ``customizer(context) -> [Core predicate]`` — the legacy form; values are inlined as
+      plan-time LITERALS, so the plan is value-specific (forced non-cacheable by the safety floor).
+    * 2-arg ``customizer(context, sources) -> [Core predicate]`` — the cacheable form;
+      ``sources.placeholder(key)`` mints a value-LESS ``ctx:`` placeholder whose value is read per
+      request at execute, so the plan stays value-INDEPENDENT (structure at plan time, value per
+      request — the convergence to upstream ``selectAuth``).
+
+    A 2-arg customizer that wants caching MUST be a PURE function of (context KEYS, schema)
+    varying only VALUES — never predicate STRUCTURE — across requests of the same resource;
+    structural branching on context is unsupported under ``cache_plans`` (use the 1-arg,
+    non-cacheable form). Every predicate is validated as a Core expression (never a raw string,
+    fully bound, no reserved bind name) and AND-combined onto EVERY batched select for the
+    resource. Returns ``(predicates, bakes_literal)`` where ``bakes_literal`` is True if ANY
+    predicate carries a non-placeholder (plan-time literal) bind — the cache safety-floor signal.
     """
     if customizer is None:
-        return []
-    produced = customizer(context)
+        return [], False
+    produced = (
+        customizer(context) if arity == 1 else customizer(context, ContextSources())
+    )
     predicates = [check_predicate(p) for p in produced]
+    bakes_literal = any(predicate_bakes_literal(p) for p in predicates)
     log.debug(
         "pg resolve select customizer",
         predicates=len(predicates),
+        cacheable=not bakes_literal,
         has_context=context is not None,
     )
-    return predicates
+    return predicates, bakes_literal
 
 
 __all__ = [
@@ -533,6 +668,8 @@ __all__ = [
     "sentinel_placeholders",
     "structural_placeholder_predicate_key",
     "structural_predicate_key",
+    "predicate_bakes_literal",
+    "ContextSources",
     "PgCustomizable",
     "PgSelectQueryBuilder",
     "resolve_customizer_predicates",
