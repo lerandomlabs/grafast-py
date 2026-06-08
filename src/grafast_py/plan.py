@@ -564,6 +564,17 @@ def plan_operation(
 
     object_plan = finalize_plan(plan, object_plan)
 
+    # a resource select_customizer that baked a plan-time LITERAL (the 1-arg legacy form, or a
+    # 2-arg customizer that returned a non-placeholder predicate) makes the plan VALUE-SPECIFIC:
+    # the per-request context value lives in the SHARED step, so a cache HIT would serve a later
+    # request the FIRST request's scope (a cross-context leak). Refuse to cache such a plan — it
+    # re-plans per request, exactly like an inlined $variable or an abstract field. Duck-typed so
+    # core takes NO pg/sqlalchemy import (the pg step sets the flag in seed_resource_customization;
+    # a non-pg step never carries it). A 2-arg placeholder customizer leaves the flag False and
+    # stays cacheable (its value is re-read per request from the context in where_params).
+    if any(getattr(step, "customizer_bakes_literal", False) for step in plan.steps):
+        plan.cacheable = False
+
     # an ABSTRACT field's per-concrete-type subtree is planned LAZILY at execute time (in
     # `completion.abstract_child_plan`), AFTER this operation plan is stored, and its steps are
     # held on the completer (NOT in `plan.steps`), so the operation-level placeholder rebind
@@ -642,6 +653,17 @@ def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
         # a stale `id(schema)` collision (a freed schema's id reused by this one) — treat as a
         # miss so we never serve a plan built against a different schema.
         return None
+    # structural-divergence guard: a resource select_customizer whose predicate SHAPE depends on
+    # the request (it branches its STRUCTURE on context — e.g. no filter for an admin vs a scoped
+    # filter for a user) would otherwise let this HIT reuse the FIRST request's structure. Re-resolve
+    # each customizer-bearing step against THIS request; a STRUCTURAL change forces a re-plan (a
+    # miss). A value-only change is NOT a divergence — the placeholder re-binds per request, so a
+    # well-behaved value-varying customizer still hits. Duck-typed: core takes no pg import (the
+    # method lives on the pg step; a non-pg step never carries it).
+    for step in cached.plan.steps:
+        matches = getattr(step, "customizer_structure_matches", None)
+        if matches is not None and not matches():
+            return None
     # the SHARED triple is read-only at execute (no per-request value lives on it); each request
     # carries its OWN source map, so no copy is needed (the deepcopy-free hit path).
     context._grafast_source_values = values_by_source(context.variable_values, operation)

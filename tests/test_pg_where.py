@@ -32,7 +32,7 @@ do not alter authors/posts/comments.
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import bindparam, column
+from sqlalchemy import String, bindparam, column
 
 from grafast_py.core_steps import constant
 from grafast_py.dag import Plan
@@ -401,8 +401,10 @@ def test_customizer_derived_predicate_participates_in_key():
     assert scoped.peer_key != plain.peer_key
     assert scoped.dedup_params() != plain.dedup_params()
     assert dedup_key(scoped) != dedup_key(plain)
-    # the customizer predicate's content key is present in the signature.
+    # the signature LEADS with the customizer identity (so a customizer step never merges with an
+    # unscoped peer — even when the customizer returns no predicates), then the predicate content key.
     assert scoped.customization_signature() == (
+        id(scope),
         predicate_key(column("status") == "scoped"),
     )
 
@@ -496,3 +498,170 @@ async def test_select_all_first_offset_pages_root(seeded):
     assert counter.count == 1
     # all widgets ordered by id are 1..6; offset 1 + first 2 -> ids 2,3.
     assert [r["id"] for r in out[0]] == [2, 3]
+
+
+# ------------------------- 2-arg placeholder customizer (cacheable, value-per-request)
+#
+# The convergence to upstream selectAuth: a 2-arg ``customizer(context, sources)`` uses
+# ``sources.placeholder(key)`` to emit a value-LESS ``ctx:`` bind whose value is read from
+# the request context PER request at execute (in ``where_params``). The predicate STRUCTURE is
+# fixed at plan time; the VALUE is supplied per request — so the plan stays value-independent
+# (cacheable) instead of baking one request's context value as a literal.
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+async def test_two_arg_placeholder_customizer_filters_from_context(seeded):
+    """A 2-arg customizer filters by the context status via a value-AGNOSTIC bind."""
+
+    def only_status(ctx, sources):
+        return [column("status") == sources.placeholder("status", type_=String)]
+
+    widgets = make_widgets(select_customizer=only_status)
+    engine = get_engine()
+    with pg_request_context(SQLAlchemyExecutor(engine), context={"status": "published"}):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+        out = await step.execute(2, [[1, 2]])
+        sql = str(step.build_query())
+
+    # owner 1 published: 1,3; owner 2 published: 4,6 — exactly the 1-arg customizer's result.
+    assert [r["id"] for r in out[0]] == [1, 3]
+    assert [r["id"] for r in out[1]] == [4, 6]
+    # value-agnostic: the status is a bound :param, NOT inlined into the SQL text (so the plan
+    # is shareable across contexts — the cacheable form).
+    assert "'published'" not in sql
+    assert "status = :" in sql
+
+
+def test_two_arg_placeholder_customizer_is_value_less_and_resolves_per_request():
+    """The ctx placeholder is value-LESS; ``where_params`` re-reads the context PER request."""
+
+    def only_status(ctx, sources):
+        return [column("status") == sources.placeholder("status")]
+
+    widgets = make_widgets(select_customizer=only_status)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "published"}):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+        ph_bind = step.where_predicates[0].right
+        assert ph_bind.value is None  # value-LESS — no request value lives on the shared bind
+        assert step.customizer_bakes_literal is False  # a placeholder customizer stays cacheable
+        name = ph_bind.key
+        # the value is read from THIS request's context at render.
+        assert step.where_params({}) == {name: "published"}
+    # a DIFFERENT request re-reads ITS OWN context off the SAME step — no baked value, no bleed.
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "draft"}):
+        assert step.where_params({}) == {name: "draft"}
+
+
+def test_one_arg_literal_customizer_marks_bakes_literal():
+    """A 1-arg (literal) customizer marks the step ``customizer_bakes_literal`` (the floor signal)."""
+
+    def only_status(ctx):
+        return [column("status") == ctx["status"]]
+
+    widgets = make_widgets(select_customizer=only_status)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "published"}):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+    assert step.customizer_bakes_literal is True
+    assert step.has_literal_customization() is True
+
+
+def test_two_arg_customizer_ignoring_sources_still_bakes_literal():
+    """A 2-arg customizer that inlines a literal (ignoring ``sources``) is STILL non-cacheable.
+
+    Guards a host mistake: using the 2-arg form but reading ``ctx[...]`` into the predicate
+    instead of ``sources.placeholder(...)`` must not silently re-enable caching of a per-request
+    value (which would leak across contexts).
+    """
+
+    def only_status(ctx, sources):
+        return [column("status") == ctx["status"]]  # a literal — ignores sources
+
+    widgets = make_widgets(select_customizer=only_status)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "published"}):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+    assert step.customizer_bakes_literal is True
+
+
+def test_static_customizer_with_no_value_stays_cacheable():
+    """A customizer with NO per-request value (a static ``IS NULL``) is value-independent."""
+
+    def hide_deleted(ctx):
+        return [column("deleted_at").is_(None)]
+
+    widgets = make_widgets(select_customizer=hide_deleted)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={}):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+    # no bound value at all => nothing per-request is baked => the plan stays cacheable.
+    assert step.customizer_bakes_literal is False
+
+
+def test_ctx_placeholder_missing_key_fails_loud():
+    """A ctx placeholder for a key ABSENT from the request context fails LOUD at render.
+
+    Not a silent ``None`` (which would render ``owner_id = NULL`` and silently widen the scope):
+    a missing scoping value is a wiring bug, so the ``KeyError`` propagates.
+    """
+
+    def only_tenant(ctx, sources):
+        return [column("owner_id") == sources.placeholder("tenant")]
+
+    widgets = make_widgets(select_customizer=only_tenant)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={}):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+        with pytest.raises(KeyError):
+            step.where_params({})
+
+
+def test_customizer_with_too_many_args_fails_loud():
+    """A select_customizer taking >2 args is rejected at resource construction (clear TypeError)."""
+    with pytest.raises(TypeError):
+        make_widgets(select_customizer=lambda a, b, c: [])
+
+
+def test_inline_clone_preserves_bakes_literal_flag():
+    """An inlining clone (copy_customization_from) keeps the safety-floor flag + predicate count.
+
+    A clone of a literal-baking customizer step must stay non-cacheable; dropping the flag on the
+    clone would silently re-enable caching of a per-request value (a cross-context leak).
+    """
+
+    def only_status(ctx):
+        return [column("status") == ctx["status"]]
+
+    widgets = make_widgets(select_customizer=only_status)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "published"}):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+        clone = step.clone_with_inline_specs([])
+    assert step.customizer_bakes_literal is True
+    assert clone.customizer_bakes_literal is True
+    assert clone._customizer_predicate_count == step._customizer_predicate_count
+
+
+def test_customizer_structure_matches_detects_shape_change_not_value_change():
+    """The cache-hit structural-divergence guard: same SHAPE (different value) matches; a different
+    SHAPE does not — so a value-varying customizer hits the cache while a structure-varying one is
+    forced to re-plan rather than inherit another request's structure.
+    """
+
+    def scope(ctx, sources):
+        if ctx.get("role") == "admin":
+            return []  # admin: a different predicate SHAPE (no filter)
+        return [column("status") == sources.placeholder("status")]
+
+    widgets = make_widgets(select_customizer=scope)
+    # build the cached step under a USER context (the scoped-filter shape).
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "status": "published"}
+    ):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+        # SAME shape, even built under this very request -> matches.
+        assert step.customizer_structure_matches() is True
+    # a DIFFERENT user VALUE keeps the SAME shape -> still matches (the placeholder re-binds).
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "status": "draft"}
+    ):
+        assert step.customizer_structure_matches() is True
+    # an ADMIN context yields a DIFFERENT shape ([]) -> does NOT match -> the guard re-plans.
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        assert step.customizer_structure_matches() is False

@@ -193,11 +193,22 @@ That O(depth) batching property holds across the full feature set:
 
 - **Structured `ORDER BY`** — per-term direction + `NULLS FIRST/LAST`, multi-column,
   with a primary-key tie-break appended for a stable non-unique order.
-- **Filtering** — a resource `select_customizer(context)` (the selectAuth analogue for
-  soft-delete / tenant scoping), per-plan `.where(<Core predicate>)`, AND a structured
-  **filter `Condition` tree** (`And` / `Or` / `Not` + leaf ops `eq` / `ne` / `lt` / `le` /
-  `gt` / `ge` / `in` / `like` / `ilike` / `is_null`) that compiles to a Core predicate —
-  all AND-combined onto the batched `WHERE` before paging.
+- **Filtering** — a resource `select_customizer` (the selectAuth analogue for soft-delete /
+  tenant scoping, applied to **reads only** — see note below), per-plan `.where(<Core
+  predicate>)`, AND a structured **filter `Condition` tree** (`And` / `Or` / `Not` + leaf ops
+  `eq` / `ne` / `lt` / `le` / `gt` / `ge` / `in` / `like` / `ilike` / `is_null`) that compiles
+  to a Core predicate — all AND-combined onto the batched `WHERE` before paging. The customizer
+  has two forms: `customizer(context)` inlines values as plan-time literals (value-specific, so
+  **not** plan-cacheable under `cache_plans`); `customizer(context, sources)` uses
+  `sources.placeholder(key)` to emit a value-less placeholder read from `context[key]` per
+  request at execute, so the plan stays value-independent and **cacheable** (structure fixed at
+  plan time, value supplied per request — the convergence to upstream `selectAuth`). A customizer
+  that varies only its *values* across requests (the common tenant case) is shared from the cache
+  and re-binds per request. A customizer that varies its predicate *structure* by context (e.g.
+  `return [] if ctx["role"] == "admin" else [scope]`) is still **correct** — a structural-
+  divergence guard re-resolves the customizer on a cache hit and re-plans whenever the shape
+  differs from the cached one, so a request can never inherit another request's customizer-decided
+  structure — it just doesn't share one cached plan across the differing shapes.
 - **Per-parent paging** — `first` / `offset` slice **each parent's** rows in SQL via a
   `row_number()` window partitioned by the match column (never a bucket-wide `LIMIT`).
 - **Keyset Relay connections** — forward (`first`/`after`) **and** reverse
@@ -395,6 +406,13 @@ enforcement is your `CREATE POLICY` + `ENABLE ROW LEVEL SECURITY` and a database
 that does **not** bypass RLS (a superuser/`BYPASSRLS` role is never subject to a policy).
 With `settings=None` the executor takes the plain no-transaction path, so the O(depth)
 batching profile is unchanged.
+
+RLS is also the **write** authorization boundary. A resource `select_customizer` scopes
+**reads only** — `pg_insert_single` / `pg_update_single` / `pg_delete_single` do **not**
+apply it (update/delete are primary-key keyed), matching upstream Grafast, where `selectAuth`
+is a read-time concern. To scope writes, rely on RLS policies (`USING` for `UPDATE`/`DELETE`,
+`WITH CHECK` for `INSERT`/`UPDATE`) via the same per-request `pgSettings`. Do not assume
+`select_customizer` protects writes — it does not.
 
 ### Query cost / depth limiting — use your validation layer
 

@@ -99,7 +99,13 @@ class PgUnionMember:
     NOTE: a member resource's ``select_customizer`` is NOT auto-applied by the union (only
     PgSelect auto-applies its resource's auth scope; pgUnionAll requires host-supplied member
     scoping). A scoped member (soft-delete / tenant / visibility) must RESTATE that predicate
-    here via ``where=``; the union will not add it for you.
+    here via ``where=``; the union will not add it for you. Under ``cache_plans`` a per-request
+    value in such a ``where=`` must ride a ``pg_placeholder`` (value-agnostic, resolved per
+    request), NEVER a baked per-request CONTEXT literal — the union step is not a PgCustomizable,
+    so neither the cacheability floor nor the cache-hit structural guard covers it, and a baked
+    context value would be shared across requests of the same document. This is the same rule as a
+    raw ``.where()`` (see ``PgSelectQueryBuilder.where``): scope by ``select_customizer`` (which IS
+    cache-safe) or a placeholder, never a hand-baked context value.
 
     Frozen + hashable so the member tuple folds straight into the union step's dedup key;
     ``where`` is excluded from the dataclass identity (Core predicates have no stable hash —

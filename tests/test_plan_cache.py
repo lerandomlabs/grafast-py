@@ -35,7 +35,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 from graphql import graphql, graphql_sync, parse
-from sqlalchemy import column
+from sqlalchemy import Integer, String, Text, column
 
 import grafast_py.plan as plan_module
 from grafast_py.cache import (
@@ -962,3 +962,344 @@ async def test_cached_result_byte_identical_to_uncached(seeded):
     assert cached_count.count == uncached_count.count
     # the cached context ran twice: the first primed the cache (miss), the measured run hit it.
     assert cache.hits == 1 and cache.misses == 1
+
+
+# ----------------------------------- select_customizer convergence to selectAuth (DB)
+#
+# A resource select_customizer (the selectAuth analogue) scopes reads by the per-request
+# context. The cross-request plan cache shares a finalized plan across requests; a 1-arg
+# customizer that bakes the context value as a LITERAL into that shared plan leaks one
+# request's scope to the next. The convergence: a literal customizer is forced NON-cacheable
+# (the safety floor) so it can never leak, while a value-agnostic placeholder customizer
+# (the 2-arg form) stays cacheable and re-binds its value per request — structure fixed at
+# plan time, value supplied per request at execute time, exactly as upstream selectAuth.
+
+
+CUSTOMIZER_WIDGETS_SDL = """
+type Query { widgets: [Widget!]! }
+type Widget { id: Int! status: String! }
+"""
+
+
+def build_customizer_widgets_schema(select_customizer):
+    """A widgets schema whose root list applies a resource ``select_customizer`` (no GraphQL arg).
+
+    The filter comes entirely from the per-request context via the customizer, so two requests
+    of the SAME document (no variables) differ only by their bound context — the setup that
+    exposes a cache leak if the context value is baked into the shared cached plan.
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    registry = PgRegistry()
+    widgets = PgResource(
+        "widgets", "grafast_demo", "widgets",
+        ["id", "owner_id", "title", "status", "deleted_at"],
+        registry=registry, select_customizer=select_customizer,
+    )
+
+    def widgets_plan(parent, args, info):
+        return PgSelectAllStep(widgets, order_by=["id"]).for_parent(parent)
+
+    return make_grafast_schema(
+        CUSTOMIZER_WIDGETS_SDL,
+        {
+            "Query": {"widgets": widgets_plan},
+            "Widget": {
+                "id": lambda p, a, i: access(p, ("id",)),
+                "status": lambda p, a, i: access(p, ("status",)),
+            },
+        },
+    )
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_literal_select_customizer_leaks_across_contexts_under_cache(seeded):
+    """A 1-arg (literal) customizer must NOT be cached (else it leaks across contexts).
+
+    Request A (context status=published) plans a select with ``status = 'published'`` BAKED in.
+    Without the safety floor that plan is wrongly cacheable, so request B (context status=draft,
+    SAME document) hits the cache and is served request A's published rows — a cross-context
+    leak. The fix forces a literal customizer NON-cacheable, so request B re-plans with ITS
+    context and gets ITS own rows.
+    """
+
+    def only_status(ctx):
+        return [column("status") == ctx["status"]]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_customizer_widgets_schema(only_status)
+    query = "{ widgets { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "published"}):
+        a = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "draft"}):
+        b = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert a.errors is None and b.errors is None
+    # the literal customizer is value-pinned, so NEITHER request may reuse the other's plan.
+    assert cache.misses == 2 and cache.hits == 0
+    # each request gets ITS OWN context's rows — no leak.
+    assert sorted(w["id"] for w in a.data["widgets"]) == [1, 3, 4, 6]
+    assert sorted(w["id"] for w in b.data["widgets"]) == [2, 5]
+    assert {w["status"] for w in b.data["widgets"]} == {"draft"}
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_placeholder_select_customizer_cacheable_no_leak(seeded):
+    """A 2-arg (placeholder) customizer stays CACHEABLE and re-binds its value per request.
+
+    The convergence to upstream selectAuth: the predicate STRUCTURE (``status = :ctx``) is fixed
+    at plan time and the VALUE is read per request from the context at execute. Request A
+    (published) caches the value-independent plan; request B (draft, SAME document) is a cache HIT
+    that re-binds ITS context — so the plan is SHARED (hits==1) AND each request gets ITS OWN rows
+    (no leak across the shared plan). This is what the 1-arg literal form cannot do (it is forced
+    non-cacheable; see test_literal_select_customizer_leaks_across_contexts_under_cache).
+    """
+
+    def only_status(ctx, sources):
+        return [column("status") == sources.placeholder("status", type_=String)]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_customizer_widgets_schema(only_status)
+    query = "{ widgets { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "published"}):
+        a = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"status": "draft"}):
+        b = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert a.errors is None and b.errors is None
+    # the placeholder customizer is value-independent: the plan is SHARED across the two requests.
+    assert cache.misses == 1 and cache.hits == 1
+    # yet each request bound ITS OWN context value off the shared plan — no leak.
+    assert sorted(w["id"] for w in a.data["widgets"]) == [1, 3, 4, 6]
+    assert sorted(w["id"] for w in b.data["widgets"]) == [2, 5]
+    assert {w["status"] for w in a.data["widgets"]} == {"published"}
+    assert {w["status"] for w in b.data["widgets"]} == {"draft"}
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_structure_branching_customizer_does_not_leak_across_contexts(seeded):
+    """A customizer that BRANCHES its predicate STRUCTURE on context must not leak across requests.
+
+    An admin context yields NO filter (all rows); a user context yields a scoped filter. Both
+    branches are value-independent (no baked literal), so the literal safety floor does NOT trip.
+    Without a structural-divergence guard, request A (admin) caches the UNFILTERED plan and request
+    B (user, SAME document) hits it and sees ALL rows — a privilege-escalation leak. The guard
+    re-resolves the customizer per request and re-plans when the STRUCTURE differs, so the user
+    gets only their scoped rows.
+    """
+
+    def scope(ctx, sources):
+        if ctx.get("role") == "admin":
+            return []  # admin sees everything (no filter)
+        return [column("status") == sources.placeholder("status", type_=String)]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_customizer_widgets_schema(scope)
+    query = "{ widgets { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        admin = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "status": "draft"}
+    ):
+        user = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert admin.errors is None and user.errors is None
+    # the two requests share a cache KEY (same document/config), so the user's lookup matches the
+    # admin's entry — exactly the collision that leaked before the guard.
+    assert cache.hits == 1
+    # ...yet the user still sees ONLY their scoped (draft) rows, never admin's full set: the
+    # structural-divergence guard rejected the shape mismatch and re-planned.
+    assert sorted(w["id"] for w in admin.data["widgets"]) == [1, 2, 3, 4, 5, 6]
+    assert sorted(w["id"] for w in user.data["widgets"]) == [2, 5]
+    assert {w["status"] for w in user.data["widgets"]} == {"draft"}
+
+
+AUTHORS_POSTS_SDL = """
+type Query { authors: [Author!]! }
+type Author { id: Int! posts: [Post!]! }
+type Post { id: Int! title: String! }
+"""
+
+
+def build_authors_posts_schema(posts_customizer):
+    """authors -> posts, where the posts RELATION child carries a ``select_customizer``.
+
+    The posts relation is an inline-fold candidate (an unfiltered hasMany), so this exercises the
+    path where a customizer-bearing CHILD could be folded out of ``plan.steps`` under
+    ``inline_relations`` — the place the structural-divergence guard would otherwise never see.
+    """
+    from grafast_py.schema import make_grafast_schema
+    from grafast_py.pg.resource import PgColumn
+
+    registry = PgRegistry()
+    authors = PgResource(
+        "authors", "grafast_demo", "authors",
+        [PgColumn("id", sql_type=Integer()), PgColumn("name", sql_type=Text())],
+        registry=registry,
+    )
+    posts = PgResource(
+        "posts", "grafast_demo", "posts",
+        [
+            PgColumn("id", sql_type=Integer()),
+            PgColumn("author_id", sql_type=Integer()),
+            PgColumn("title", sql_type=Text()),
+        ],
+        registry=registry, select_customizer=posts_customizer,
+    )
+    authors.has_many("posts", target=posts, local_column="id", remote_column="author_id")
+
+    return make_grafast_schema(
+        AUTHORS_POSTS_SDL,
+        {
+            "Query": {
+                "authors": lambda p, a, i: PgSelectAllStep(authors, order_by=["id"]).for_parent(p)
+            },
+            "Author": {
+                "id": lambda p, a, i: access(p, ("id",)),
+                "posts": lambda p, a, i: authors.related_many(p, "posts"),
+            },
+            "Post": {
+                "id": lambda p, a, i: access(p, ("id",)),
+                "title": lambda p, a, i: access(p, ("title",)),
+            },
+        },
+    )
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_structure_branching_customizer_on_inlined_relation_does_not_leak(seeded):
+    """A structure-branching customizer on an INLINE-FOLDED relation child must not leak.
+
+    Under ``cache_plans`` + ``inline_relations`` the admin branch returns ``[]`` (all posts), and
+    folding that unfiltered child would drop it from ``plan.steps`` so the structural-divergence
+    guard could not re-check it — a later user request would then inherit the admin's unfiltered
+    posts (privilege escalation). The fold-skip for customizer-bearing children keeps the child on
+    the batched path, where the guard runs and re-plans the user.
+    """
+
+    def posts_scope(ctx, sources):
+        if ctx.get("role") == "admin":
+            return []  # admin sees ALL posts
+        return [column("title") == sources.placeholder("title")]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, inline_relations=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_authors_posts_schema(posts_scope)
+    query = "{ authors { id posts { id } } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        admin = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "title": "no-such-title"}
+    ):
+        user = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert admin.errors is None and user.errors is None
+    # admin sees every author's posts (9 total across 3 authors); the user, scoped to a title that
+    # matches nothing, must see NONE — never the admin's posts.
+    assert sum(len(a["posts"]) for a in admin.data["authors"]) == 9
+    assert sum(len(a["posts"]) for a in user.data["authors"]) == 0
+    # the two requests collide on the cache key (a hit), yet the user stays isolated: the
+    # customizer-bearing child is not folded, so the structural guard re-planned for the user.
+    assert cache.hits == 1
+
+
+def build_same_table_two_resource_schema(scoped_customizer):
+    """Two resources over the SAME widgets table (same columns) — one plain, one customizer-scoped.
+
+    Selected as two root fields in one operation. When the scoped customizer returns [] for the
+    planning request, the scoped select looks IDENTICAL to the plain one (same table, columns,
+    empty customization signature), so dedup could merge the scoped step into the plain peer.
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    cols = ["id", "owner_id", "title", "status", "deleted_at"]
+    registry = PgRegistry()
+    plain = PgResource("widgets_plain", "grafast_demo", "widgets", cols, registry=registry)
+    scoped = PgResource(
+        "widgets_scoped", "grafast_demo", "widgets", cols, registry=registry,
+        select_customizer=scoped_customizer,
+    )
+    return make_grafast_schema(
+        "type Query { plain: [W!]! scoped: [W!]! }\ntype W { id: Int! status: String! }",
+        {
+            "Query": {
+                "plain": lambda p, a, i: PgSelectAllStep(plain, order_by=["id"]).for_parent(p),
+                "scoped": lambda p, a, i: PgSelectAllStep(scoped, order_by=["id"]).for_parent(p),
+            },
+            "W": {
+                "id": lambda p, a, i: access(p, ("id",)),
+                "status": lambda p, a, i: access(p, ("status",)),
+            },
+        },
+    )
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_dedup_merging_customizer_step_into_uncustomized_peer_does_not_leak(seeded):
+    """A scoped customizer step must not dedup-merge into an uncustomized same-table peer and leak.
+
+    Request A (admin) -> the scoped customizer returns [] -> the scoped select looks identical to
+    the plain select and could merge into it; if cached, request B (user) would read the plain
+    (unfiltered) result for the scoped field. The scoped step must stay distinct/visible to the
+    cache-hit structural guard so the user gets only their scoped rows.
+    """
+
+    def scope(ctx, sources):
+        if ctx.get("role") == "admin":
+            return []
+        return [column("status") == sources.placeholder("status")]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_same_table_two_resource_schema(scope)
+    query = "{ plain { id } scoped { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        admin = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "status": "draft"}
+    ):
+        user = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert admin.errors is None and user.errors is None, (admin.errors, user.errors)
+    # admin: both fields see all 6 widgets. user: plain still all 6, but scoped MUST be only [2,5].
+    assert sorted(w["id"] for w in admin.data["scoped"]) == [1, 2, 3, 4, 5, 6]
+    assert sorted(w["id"] for w in user.data["plain"]) == [1, 2, 3, 4, 5, 6]
+    assert sorted(w["id"] for w in user.data["scoped"]) == [2, 5]
