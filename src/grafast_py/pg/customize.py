@@ -498,6 +498,9 @@ class PgCustomizable(Step):
         an admin and a scoped filter for a user — yields a DIFFERENT key, so the caller treats the
         hit as a miss and re-plans rather than letting this request inherit another request's
         customizer-decided structure. A step with no resource customizer trivially matches.
+
+        Runs on EVERY cache hit (it re-invokes the host customizer and re-compiles its predicate
+        keys), so the customizer callback must stay cheap and PURE — no DB, no I/O, no side effects.
         """
         customizer = self.resource.select_customizer
         if customizer is None:
@@ -598,7 +601,17 @@ class PgSelectQueryBuilder:
         self._step = step
 
     def where(self, predicate: ColumnElement) -> "PgSelectQueryBuilder":
-        """AND a UNIFORM Core predicate onto the batched WHERE (raw string fails loud)."""
+        """AND a UNIFORM Core predicate onto the batched WHERE (raw string fails loud).
+
+        A ``.where()`` value must derive only from GraphQL ARGUMENTS/variables (e.g.
+        ``column("status") == args["status"]``): a ``$variable`` value the plan resolver inlines is
+        detected as value-pinned and makes the plan non-cacheable, and a constant arg is stable
+        across requests of the same document — both are safe under ``cache_plans``. Do NOT inline
+        the per-request CONTEXT into a ``.where()`` (e.g. ``== info.context["tenant"]``): the cache
+        key does not see the context, so a later request of the same document would reuse this
+        request's baked value. Scope by request context with the resource ``select_customizer``
+        (which IS cache-safe — see :func:`resolve_customizer_predicates`), never a raw ``.where()``.
+        """
         self._step.add_where(check_predicate(predicate))
         return self
 

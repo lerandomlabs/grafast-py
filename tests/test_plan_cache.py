@@ -35,7 +35,7 @@ import asyncio
 import pytest
 import pytest_asyncio
 from graphql import graphql, graphql_sync, parse
-from sqlalchemy import String, column
+from sqlalchemy import Integer, String, Text, column
 
 import grafast_py.plan as plan_module
 from grafast_py.cache import (
@@ -1136,3 +1136,99 @@ async def test_structure_branching_customizer_does_not_leak_across_contexts(seed
     assert sorted(w["id"] for w in admin.data["widgets"]) == [1, 2, 3, 4, 5, 6]
     assert sorted(w["id"] for w in user.data["widgets"]) == [2, 5]
     assert {w["status"] for w in user.data["widgets"]} == {"draft"}
+
+
+AUTHORS_POSTS_SDL = """
+type Query { authors: [Author!]! }
+type Author { id: Int! posts: [Post!]! }
+type Post { id: Int! title: String! }
+"""
+
+
+def build_authors_posts_schema(posts_customizer):
+    """authors -> posts, where the posts RELATION child carries a ``select_customizer``.
+
+    The posts relation is an inline-fold candidate (an unfiltered hasMany), so this exercises the
+    path where a customizer-bearing CHILD could be folded out of ``plan.steps`` under
+    ``inline_relations`` — the place the structural-divergence guard would otherwise never see.
+    """
+    from grafast_py.schema import make_grafast_schema
+    from grafast_py.pg.resource import PgColumn
+
+    registry = PgRegistry()
+    authors = PgResource(
+        "authors", "grafast_demo", "authors",
+        [PgColumn("id", sql_type=Integer()), PgColumn("name", sql_type=Text())],
+        registry=registry,
+    )
+    posts = PgResource(
+        "posts", "grafast_demo", "posts",
+        [
+            PgColumn("id", sql_type=Integer()),
+            PgColumn("author_id", sql_type=Integer()),
+            PgColumn("title", sql_type=Text()),
+        ],
+        registry=registry, select_customizer=posts_customizer,
+    )
+    authors.has_many("posts", target=posts, local_column="id", remote_column="author_id")
+
+    return make_grafast_schema(
+        AUTHORS_POSTS_SDL,
+        {
+            "Query": {
+                "authors": lambda p, a, i: PgSelectAllStep(authors, order_by=["id"]).for_parent(p)
+            },
+            "Author": {
+                "id": lambda p, a, i: access(p, ("id",)),
+                "posts": lambda p, a, i: authors.related_many(p, "posts"),
+            },
+            "Post": {
+                "id": lambda p, a, i: access(p, ("id",)),
+                "title": lambda p, a, i: access(p, ("title",)),
+            },
+        },
+    )
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_structure_branching_customizer_on_inlined_relation_does_not_leak(seeded):
+    """A structure-branching customizer on an INLINE-FOLDED relation child must not leak.
+
+    Under ``cache_plans`` + ``inline_relations`` the admin branch returns ``[]`` (all posts), and
+    folding that unfiltered child would drop it from ``plan.steps`` so the structural-divergence
+    guard could not re-check it — a later user request would then inherit the admin's unfiltered
+    posts (privilege escalation). The fold-skip for customizer-bearing children keeps the child on
+    the batched path, where the guard runs and re-plans the user.
+    """
+
+    def posts_scope(ctx, sources):
+        if ctx.get("role") == "admin":
+            return []  # admin sees ALL posts
+        return [column("title") == sources.placeholder("title")]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, inline_relations=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_authors_posts_schema(posts_scope)
+    query = "{ authors { id posts { id } } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        admin = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "title": "no-such-title"}
+    ):
+        user = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert admin.errors is None and user.errors is None
+    # admin sees every author's posts (9 total across 3 authors); the user, scoped to a title that
+    # matches nothing, must see NONE — never the admin's posts.
+    assert sum(len(a["posts"]) for a in admin.data["authors"]) == 9
+    assert sum(len(a["posts"]) for a in user.data["authors"]) == 0
+    # the two requests collide on the cache key (a hit), yet the user stays isolated: the
+    # customizer-bearing child is not folded, so the structural guard re-planned for the user.
+    assert cache.hits == 1

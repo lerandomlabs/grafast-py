@@ -457,8 +457,22 @@ def inline_candidate_for(
         log.debug("inline skip", reason="limited", child=child.resource.name)
         return None
 
-    # 7. CUSTOMIZATION — skip any filtered child (a select_customizer scope or per-plan
-    # .where()); only an UNFILTERED relation is inlined.
+    # 7. CUSTOMIZATION — never fold a customizer-bearing child, and never fold a per-plan-filtered
+    # child; only an UNFILTERED, un-customized relation is inlined.
+    #
+    # A child whose resource carries a select_customizer is request-SCOPED: the predicates it
+    # produced THIS request may differ next request — in particular a structure-branching customizer
+    # can return NO predicates this request (e.g. an admin branch) and a scoping filter the next. If
+    # we folded it, the child leaves `plan.steps` (it becomes a NestedExtractStep on the parent and
+    # tree_shake drops the original), so the cache-hit structural-divergence guard
+    # (lookup_cached_plan / customizer_structure_matches) could no longer re-check it, and a later
+    # request would inherit THIS request's (here unfiltered) child rows — a cross-context leak under
+    # cache_plans + inline_relations. So keep ANY customizer-bearing child on the batched path, where
+    # its step stays in `plan.steps` and the guard runs. (An un-customized child with a per-plan
+    # `.where()` carries those predicates directly, so the `where_predicates` check below skips it.)
+    if child.resource.select_customizer is not None:
+        log.debug("inline skip", reason="customizer", child=child.resource.name)
+        return None
     if child.where_predicates:
         log.debug("inline skip", reason="filtered", child=child.resource.name)
         return None
