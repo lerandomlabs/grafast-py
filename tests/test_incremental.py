@@ -387,6 +387,60 @@ def test_stream_threads_hoisted_columns_into_streamed_items():
     assert off == expected
 
 
+def test_defer_threads_hoisted_columns_into_deferred_group():
+    """@defer + hoist: a deferred fragment whose field is request-constant (hoisted) is byte-identical.
+
+    The @defer companion to the @stream+hoist test above (the @stream case was covered; @defer was
+    not). ``Person.tag = load_one(constant, …)`` is request-constant (hoisted to root); it is
+    delivered in a DEFERRED payload. The deferred group must still seed its hoisted-out column, so
+    the initial + deferred payloads are BYTE-IDENTICAL whether hoisting is on or off, and the
+    hoisted ``tag`` is actually delivered.
+    """
+    from grafast_py import access, constant, load_one, make_grafast_schema
+
+    rows = [{"id": 1}, {"id": 2}, {"id": 3}]
+    sdl = "type Query { people: [Person!]! } type Person { id: Int! tag: Int! }"
+    query = "{ people { id ... @defer { tag } } }"
+
+    def build_schema():
+        def plan_people(parent, args, info):
+            return load_one(constant("all"), lambda keys: [rows for _ in keys])
+
+        def plan_tag(parent, args, info):
+            return load_one(constant("k"), lambda keys: [100 for _ in keys])
+
+        return make_grafast_schema(
+            sdl,
+            {
+                "Query": {"people": plan_people},
+                "Person": {"id": lambda p, a, i: access(p, ("id",)), "tag": plan_tag},
+            },
+        )
+
+    async def collect(hoist):
+        from graphql.execution import ExperimentalIncrementalExecutionResults
+
+        result = experimental_execute_incrementally(
+            build_schema(), parse(query), None, config=GrafastConfig(hoist=hoist)
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+        assert isinstance(result, ExperimentalIncrementalExecutionResults)
+        subsequent = []
+        async for patch in result.subsequent_results:
+            subsequent.append(patch.formatted)
+        return result.initial_result.formatted, subsequent
+
+    on_init, on_sub = asyncio.run(collect(hoist=True))
+    off_init, off_sub = asyncio.run(collect(hoist=False))
+
+    # initial payload identical; deferred payloads identical as a multiset (order-independent).
+    assert on_init == off_init
+    assert sorted(map(repr, on_sub)) == sorted(map(repr, off_sub))
+    # the hoisted tag=100 was actually delivered in a deferred payload (not dropped).
+    assert any("100" in repr(p) for p in on_sub)
+
+
 # ----------------------------------------------------------- defer-batching proof
 def test_defer_relation_fires_same_batch_count_as_non_deferred():
     """A @defer'd loader relation over N parents fires the SAME number of batches as inline.

@@ -27,7 +27,7 @@ that occur inside a list item — matching graphql-core, which reuses that field
 recursion rather than re-deriving it per item.
 """
 
-from typing import Any, AsyncIterable, List, NamedTuple, Optional
+from typing import Any, AsyncIterable, Dict, List, NamedTuple, Optional
 
 from graphql.error import GraphQLError, located_error
 from graphql.pyutils import Path, Undefined, inspect, is_iterable
@@ -97,22 +97,22 @@ Completer = Any
 class HoistBridge(NamedTuple):
     """The channel carrying a parent bucket's HOISTED columns down to a child bucket.
 
-    When a step is hoisted to a shallower (parent) layer, its column is produced in the
-    PARENT bucket but a child bucket still needs it (keyed by the hoisted step id). This
-    bridge threads that down through the value-completion recursion so `run_object_children`
-    can seed the child layer from `parent_store` (the parent bucket store, indexed by parent
-    bucket position) projected by `value_owner` (which parent bucket position each completed
-    `values[j]` belongs to).
+    When the planner lifts a step to a shallower (parent) layer, its column is produced in the
+    PARENT bucket but a child bucket still needs it (keyed by the hoisted step id). This bridge
+    carries those columns PROJECTED TO THE CURRENT COMPLETION-VALUE GRANULARITY: ``columns[hid]``
+    is parallel to the ``values`` being completed (one entry per completion value), so it RESHAPES
+    IN LOCKSTEP with ``values`` through the completion walk (list flatten / object scatter) — there
+    is no separate position-owner array that could drift out of alignment. At the child-object
+    boundary ``run_object_children`` reindexes each column by the SAME ``keep_origin`` index map it
+    uses to seed the child's parent value, so a hoisted step is READ (never re-run) in the child.
 
-    `value_owner[j]` is the parent BUCKET position of completion value `j` — it follows the
-    list flatten / object scatter so the hoisted column (produced at parent bucket granularity)
-    is expanded to each child position correctly. It is `None` (the default everywhere) when no
-    field in this descent has any hoisted-out column, so every non-hoisting path is
-    byte-identical (the bridge is never built and never read).
+    This mirrors upstream Grafast's model: a hoisted (copied-down) value rides the store and is
+    reindexed at each layer boundary by that boundary's parent->child map — never a hand-reshaped
+    multi-hop owner array. It is ``None`` (the default everywhere) when no field in this descent has
+    a hoisted-out column, so every non-hoisting path is byte-identical (the bridge is never built).
     """
 
-    parent_store: dict
-    value_owner: List[int]
+    columns: Dict[int, List[Any]]
 
 
 def build_completer(
@@ -205,7 +205,7 @@ def complete_values(
         )
     if isinstance(completer, AbstractCompleter):
         return complete_abstract_values(
-            context, completer, values, paths, infos, field_nodes
+            context, completer, values, paths, infos, field_nodes, bridge
         )
     raise TypeError(f"unknown completer: {completer!r}")
 
@@ -424,10 +424,11 @@ def build_list_results(
     # parallel to item_values: each list item reuses its source list's field info
     # (graphql-core threads the field's single `info` through list completion)
     item_infos: List[Any] = []
-    # hoist channel: parallel to item_values, the parent BUCKET position of each item's
-    # source list (carried from `bridge.value_owner[i]`) so the item-level bridge can project
-    # the hoisted column per flattened item. Built only when a bridge is present.
-    item_owner: List[int] = [] if bridge is not None else None
+    # hoist channel: each hoisted column reshapes IN LOCKSTEP with item_values — when an item
+    # flattens from source list i, its hoisted value (`bridge.columns[hid][i]`) is appended too, so
+    # the item-level columns stay element-for-element aligned with item_values by construction (no
+    # separate owner array to drift). Built only when a bridge is present.
+    item_columns = {hid: [] for hid in bridge.columns} if bridge is not None else None
     # spans[i] is (start, length) into item_values for source list i, the sentinel
     # ("null",) when the value is null, or None when the value is invalid (with the
     # located error stashed in `invalid[i]`)
@@ -455,13 +456,12 @@ def build_list_results(
             item_values.append(item)
             item_paths.append(paths[i].add_key(index, None))
             item_infos.append(infos[i])
-            if item_owner is not None:
-                item_owner.append(bridge.value_owner[i])
+            if item_columns is not None:
+                for hid, col in bridge.columns.items():
+                    item_columns[hid].append(col[i])
         spans.append((start, len(item_values) - start))
 
-    item_bridge = (
-        bridge._replace(value_owner=item_owner) if bridge is not None else None
-    )
+    item_bridge = HoistBridge(columns=item_columns) if bridge is not None else None
     completed_items = complete_values(
         context,
         completer.item_completer,
@@ -688,24 +688,31 @@ def invalid_return_type_error(object_type, result, field_nodes) -> GraphQLError:
 def build_hoist_parent_store(child_plan, bridge, keep_origin):
     """Build the child bucket's `parent_store` for the steps hoisted OUT of its layer.
 
-    For each step id in `child_plan.layer.hoisted_out_ids`, the planner relocated the step to
-    a shallower (parent) layer; its column lives in the PARENT bucket store (`bridge.parent_store`,
-    indexed by parent bucket position). We project it to the kept child positions: kept child k
-    came from completion value `keep_origin[k]`, whose parent bucket position is
-    `bridge.value_owner[keep_origin[k]]`. The resulting column is element-for-element aligned with
-    `keep_objs`, so the child layer reads each hoisted step's value at its own bucket position
-    without re-running the step. Returns `None` when nothing was hoisted out (the default path —
-    `run_layer` then seeds only the `parent_step` boundary, byte-identical).
+    For each step id in `child_plan.layer.hoisted_out_ids`, the planner relocated the step to a
+    shallower (parent) layer; the bridge carries its column at the CURRENT completion-value
+    granularity (`bridge.columns[hid]`, parallel to the values just completed). We reindex it to the
+    kept child positions via `keep_origin` (kept child k came from completion value `keep_origin[k]`)
+    — the SAME index map `run_object_children` uses to seed the child's parent value, so the hoisted
+    column is element-for-element aligned with `keep_objs` and the child layer reads each hoisted
+    step's value at its own bucket position without re-running it. Returns `None` when nothing was
+    hoisted out (the default path — `run_layer` then seeds only the `parent_step` boundary,
+    byte-identical).
     """
     hoisted_out = child_plan.layer.hoisted_out_ids
-    if not hoisted_out or bridge is None:
+    if not hoisted_out:
         return None
-    value_owner = bridge.value_owner
-    parent_store = bridge.parent_store
+    if bridge is None:
+        # a layer hoisted steps OUT but no bridge reached it — the hoisted column would be missing
+        # (read as a re-run / KeyError). On every threaded path the bridge is present whenever a
+        # child has hoisted-out steps, so this fires only if a completer path forgot to carry it.
+        raise AssertionError(
+            f"hoist bridge missing for a layer that hoisted out {sorted(hoisted_out)}"
+        )
+    columns = bridge.columns
     child_store = {}
     for hid in hoisted_out:
-        parent_column = parent_store[hid]
-        child_store[hid] = [parent_column[value_owner[o]] for o in keep_origin]
+        column = columns[hid]
+        child_store[hid] = [column[o] for o in keep_origin]
     return child_store
 
 
@@ -714,7 +721,9 @@ def build_hoist_parent_store(child_plan, bridge, keep_origin):
 # ---------------------------------------------------------------------------
 
 
-def complete_abstract_values(context, completer, values, paths, infos, field_nodes):
+def complete_abstract_values(
+    context, completer, values, paths, infos, field_nodes, bridge=None
+):
     """Complete a batch of interface/union values by resolving each runtime type.
 
     Raw awaitable values are awaited first (mirroring object completion). Then each
@@ -722,6 +731,13 @@ def complete_abstract_values(context, completer, values, paths, infos, field_nod
     or the context `type_resolver`, sync or async), validated, and values are
     grouped by concrete type for batched recursion. A resolve_type/validation
     failure for a value becomes a `Bubble` located at that value's field path.
+
+    `bridge` (the hoist channel) is threaded uniformly, exactly like the object/list path, so a
+    hoisted column reaches each concrete-type group's bucket. The concrete-type subtrees are
+    self-contained (their own RootStep, so `hoisted_out_ids` is empty), so the bridge is inert
+    today — but threading it keeps the carry uniform across ALL completers (no special-cased
+    abstract path the bridge can skip), and `build_hoist_parent_store` fails loud if a group ever
+    has a hoisted-out step with no bridge.
     """
     pending = resolve_awaitable_values(context, values)
     if pending is not None:
@@ -729,17 +745,21 @@ def complete_abstract_values(context, completer, values, paths, infos, field_nod
         async def finish_inputs():
             await pending
             built = resolve_abstract_bucket(
-                context, completer, values, paths, infos, field_nodes
+                context, completer, values, paths, infos, field_nodes, bridge
             )
             if context.is_awaitable(built):
                 return await built
             return built
 
         return finish_inputs()
-    return resolve_abstract_bucket(context, completer, values, paths, infos, field_nodes)
+    return resolve_abstract_bucket(
+        context, completer, values, paths, infos, field_nodes, bridge
+    )
 
 
-def resolve_abstract_bucket(context, completer, values, paths, infos, field_nodes):
+def resolve_abstract_bucket(
+    context, completer, values, paths, infos, field_nodes, bridge=None
+):
     """Resolve each value's runtime type (sync or async), then dispatch by type.
 
     `runtimes[i]` holds the resolved type name, an Exception (resolve_type raised),
@@ -767,12 +787,12 @@ def resolve_abstract_bucket(context, completer, values, paths, infos, field_node
         async def finish():
             await settle_runtimes(context, runtimes, awaitable_idx)
             return dispatch_abstract(
-                context, completer, values, paths, infos, field_nodes, runtimes
+                context, completer, values, paths, infos, field_nodes, runtimes, bridge
             )
 
         return finish()
     return dispatch_abstract(
-        context, completer, values, paths, infos, field_nodes, runtimes
+        context, completer, values, paths, infos, field_nodes, runtimes, bridge
     )
 
 
@@ -790,7 +810,9 @@ def settle_runtimes(context, runtimes, awaitable_idx):
     return run()
 
 
-def dispatch_abstract(context, completer, values, paths, infos, field_nodes, runtimes):
+def dispatch_abstract(
+    context, completer, values, paths, infos, field_nodes, runtimes, bridge=None
+):
     """Validate runtime types, group values by concrete type, recurse per group.
 
     Returns a results list (parallel to `values`) or a coroutine. Each value's
@@ -846,8 +868,13 @@ def dispatch_abstract(context, completer, values, paths, infos, field_nodes, run
         child_plan = abstract_child_plan(context, completer, object_type)
         if capture is not None:
             capture(object_type, child_plan, objs, origin, group_paths, values)
+        # uniform hoist carry: reindex the bridge columns by this group's `origin` (which abstract
+        # value each group object came from) — the same map run_object_children uses. Inert today
+        # (a concrete-type subtree is self-contained, so hoisted_out_ids is empty -> None), but it
+        # keeps the abstract path identical to the object path and fails loud if that ever changes.
+        group_parent_store = build_hoist_parent_store(child_plan, bridge, origin)
         child_results = execute_object_plan_for_group(
-            context, child_plan, objs, group_paths
+            context, child_plan, objs, group_paths, group_parent_store
         )
         if context.is_awaitable(child_results):
             pending.append((child_results, origin))
@@ -943,7 +970,9 @@ def abstract_child_plan(context, completer, object_type):
     return child_plan
 
 
-def execute_object_plan_for_group(context, child_plan, objs, group_paths):
+def execute_object_plan_for_group(
+    context, child_plan, objs, group_paths, parent_store=None
+):
     from .execute import execute_object_plan
 
-    return execute_object_plan(context, child_plan, objs, group_paths)
+    return execute_object_plan(context, child_plan, objs, group_paths, parent_store)

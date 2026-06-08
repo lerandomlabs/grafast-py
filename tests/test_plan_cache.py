@@ -204,13 +204,15 @@ def test_cache_key_differs_by_plan_affecting_config():
     d = GrafastConfig(placeholders=True, cache_plans=True, execution_timeout_s=5.0)
     assert compute_cache_key(schema, op, None, a) == compute_cache_key(schema, op, None, d)
     # hoist changes the finalized LayerPlan run_steps/boundary, so it re-keys too — else a
-    # hoist=True request could be served a non-hoisted cached plan (or vice-versa).
-    e = GrafastConfig(placeholders=True, cache_plans=True, hoist=True)
+    # hoist=True request could be served a non-hoisted cached plan (or vice-versa). hoist is now ON
+    # by default, so the contrast config turns it OFF; toggling it in EITHER direction re-keys.
+    e = GrafastConfig(placeholders=True, cache_plans=True, hoist=False)
     assert compute_cache_key(schema, op, None, a) != compute_cache_key(schema, op, None, e)
-    # the fingerprint is exactly the four plan-affecting flags, in (inline, placeholders, cache, hoist) order.
-    assert config_fingerprint(a) == (False, True, True, False)
+    # the fingerprint is exactly the four plan-affecting flags, in (inline, placeholders, cache, hoist)
+    # order; `a` carries the default hoist=True, `e` the explicit hoist=False.
+    assert config_fingerprint(a) == (False, True, True, True)
     assert config_fingerprint(None) == (False, False, False, False)
-    assert config_fingerprint(e) == (False, True, True, True)
+    assert config_fingerprint(e) == (False, True, True, False)
 
 
 def test_two_configs_sharing_default_cache_do_not_bleed():

@@ -24,6 +24,7 @@ once-per-request instead of once-per-child-bucket, with data byte-identical:
 
 from typing import Any, List
 
+import pytest
 from graphql import parse
 from graphql.execution.collect_fields import collect_fields
 
@@ -34,7 +35,7 @@ from grafast_py.core_steps import RootStep, access, constant, load_one
 from grafast_py.dag import order_steps
 from grafast_py.entry import grafast_execute
 from grafast_py.plan import plan_operation
-from grafast_py.schema import make_grafast_schema
+from grafast_py.schema import make_grafast_schema, resolve_type_from_tag
 from grafast_py.step_model import Step
 
 
@@ -496,3 +497,72 @@ def test_mutation_disables_hoisting():
                 visit(child.child_plan)
 
     visit(object_plan)
+
+
+# ------------------------------------------------- (d) abstract + hoist coverage + the guard
+
+
+ABSTRACT_HOIST_SDL = """
+type Query { items: [Item!]! }
+interface Item { id: Int! }
+type Widget implements Item { id: Int! tag: Int! }
+"""
+
+
+def test_abstract_field_with_hoist_is_byte_identical():
+    """A hoistable load under an interface concrete-type field: hoist ON == OFF, no error.
+
+    ``test_hoist.py`` otherwise has ZERO abstract coverage, and the hoist carry now threads the
+    bridge UNIFORMLY through the abstract completion path (no special-cased path the bridge can
+    skip). This exercises that path under hoist and proves byte-identity. The concrete-type subtree
+    is self-contained (its own RootStep), so the bridge is inert here — but the path is now uniform
+    and the fail-loud guard (below) backs the invariant.
+    """
+    rows = [{"id": 1, "__typename": "Widget"}, {"id": 2, "__typename": "Widget"}]
+
+    def run(hoist):
+        def plan_items(parent, args, info):
+            return constant(rows)
+
+        def plan_tag(parent, args, info):
+            return load_one(constant("k"), lambda keys: [100 for _ in keys])
+
+        schema = make_grafast_schema(
+            ABSTRACT_HOIST_SDL,
+            {
+                "Query": {"items": plan_items},
+                "Widget": {"id": leaf("id"), "tag": plan_tag},
+            },
+            type_resolvers={"Item": resolve_type_from_tag("__typename")},
+        )
+        return grafast_execute(
+            schema,
+            "{ items { id ... on Widget { tag } } }",
+            config=GrafastConfig(hoist=hoist),
+        )
+
+    off_result = run(False)
+    on_result = run(True)
+    expected = {"items": [{"id": 1, "tag": 100}, {"id": 2, "tag": 100}]}
+    assert off_result.errors is None and on_result.errors is None
+    assert off_result.data == expected
+    assert on_result.data == expected
+
+
+def test_build_hoist_parent_store_fails_loud_when_bridge_missing():
+    """A layer that hoisted steps OUT but got no bridge fails LOUD — never a silent missing column.
+
+    On every threaded completer path the bridge is present whenever a child has hoisted-out steps,
+    so this can't fire in practice; the guard makes a future regression (a completer path that
+    forgets to carry the bridge) crash loudly rather than read a missing/re-run column.
+    """
+    from types import SimpleNamespace
+
+    from grafast_py.completion import build_hoist_parent_store
+
+    hoisted = SimpleNamespace(layer=SimpleNamespace(hoisted_out_ids=frozenset({7})))
+    with pytest.raises(AssertionError):
+        build_hoist_parent_store(hoisted, None, [0, 1])
+    # the no-hoist case stays a quiet None (the byte-identical default path).
+    plain = SimpleNamespace(layer=SimpleNamespace(hoisted_out_ids=frozenset()))
+    assert build_hoist_parent_store(plain, None, [0, 1]) is None

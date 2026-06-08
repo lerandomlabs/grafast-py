@@ -76,7 +76,9 @@ jobs:
           GRAFAST_CACHE_PLANS=1 uv run pytest tests -q
           GRAFAST_PLACEHOLDERS=1 uv run pytest tests -q
           GRAFAST_INLINE_RELATIONS=1 uv run pytest tests -m pg -q
-          GRAFAST_HOIST=1 uv run pytest tests -q
+          # hoist is ON by default (the default leg above already exercises it); this is the
+          # byte-identity OFF baseline — forcing hoist off must yield the same result assertions.
+          GRAFAST_HOIST=0 uv run pytest tests -q
 
   leg-b-graphql-33:
     name: "3.3 (sibling env)"

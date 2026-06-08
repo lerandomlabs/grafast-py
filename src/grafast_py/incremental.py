@@ -674,9 +674,9 @@ def complete_stream_item(context, field_plan, item_completer, item, item_path, i
     inside the item are captured as the item's ``children`` (per-item defer records). SYNC →
     a StreamItemResult; async → a coroutine resolving to one.
 
-    `item_bridge` is the per-parent hoist seed (a 1-element ``value_owner``): completing this
-    single item descends into the child layer owned by that parent bucket row, so it seeds the
-    columns hoisted OUT of that layer. None (the default / hoist-off) leaves completion byte-identical.
+    `item_bridge` is the per-parent hoist seed (1-element columns): completing this single item
+    descends into the child layer carrying that parent's hoisted values, so it seeds the columns
+    hoisted OUT of that layer. None (the default / hoist-off) leaves completion byte-identical.
     """
     from .completion import NonNullCompleter, complete_values
 

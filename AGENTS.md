@@ -41,10 +41,10 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
   schema.py            plan-resolver API: set_field_plan, make_grafast_schema, FieldArgs;
                        resolve_type bridges for pg interfaces/unions (resolve_type_from_discriminator /
                        resolve_type_from_tag, attach_type_resolvers) — host wiring, no pg import
-  config.py            GrafastConfig (execution timeout, concurrency, logging, tracing; the opt-in
-                       optimizer flags inline_relations / cache_plans / placeholders /
-                       hoist, all default OFF) + error class (query cost/depth limiting is a
-                       validation-layer concern, not here)
+  config.py            GrafastConfig (execution timeout, concurrency, logging, tracing; the
+                       optimizer flags inline_relations / cache_plans / placeholders (opt-in,
+                       default OFF) + hoist (default ON, like upstream) + error class (query
+                       cost/depth limiting is a validation-layer concern, not here)
   pg/                  Postgres data source — the optional `[pg]` extra (SQLAlchemy/asyncpg):
                        resource.py (PgResource: attributes/codecs/relations, select_customizer,
                          single- OR composite-column match keys; decode_row/decode_value),
@@ -111,9 +111,10 @@ GRAFAST_CACHE_PLANS=1 uv run pytest tests             # suite-wide caching oracl
 GRAFAST_PLACEHOLDERS=1 uv run pytest tests            # suite-wide placeholders oracle: the variable
                                                       # provenance + placeholder dedup path forced
                                                       # on WITHOUT caching (A/B'd independently)
-GRAFAST_HOIST=1 uv run pytest tests                   # CI hoist-on oracle: cross-parent hoisting
-                                                      # forced on suite-wide — changes only WHERE a
-                                                      # step runs, so byte-identical (incl. counts)
+GRAFAST_HOIST=0 uv run pytest tests                   # CI hoist OFF-baseline oracle: hoist is ON by
+                                                      # default, so this forces it off suite-wide —
+                                                      # must be byte-identical (incl. counts), since
+                                                      # hoisting changes only WHERE a step runs
 uv run python examples/plan_blog.py                   # see batching with no DB
 
 # conformance (graphql-core's own execution suite as an oracle)

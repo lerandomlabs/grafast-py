@@ -157,8 +157,10 @@ class GrafastConfig:
         ``inline_relations`` this is a PLAN-LEVEL constant (one operation = one decision)
         read once via ``type(context).grafast_config`` and stashed on the plan; it is
         DISABLED entirely under mutation operations (a mutation root runs serially and must
-        not be reordered). ``False`` (default) ships it dark — the finalize pass is a no-op
-        and every executed result is byte-identical to a build without this flag.
+        not be reordered). Defaults ``True`` (like upstream Grafast, which hoists
+        unconditionally): the `GRAFAST_HOIST` byte-identity oracle proves hoist-on == hoist-off
+        across the whole suite + conformance, so the optimization is on by default and a host can
+        set ``hoist=False`` to opt out (e.g. to A/B the optimization).
     placeholders
         Per-argument variable provenance for value-agnostic predicates: when ON,
         ``plan_operation`` computes which field arguments originated from a GraphQL
@@ -195,7 +197,7 @@ class GrafastConfig:
     inline_relations: bool = False
     cache_plans: bool = False
     placeholders: bool = False
-    hoist: bool = False
+    hoist: bool = True
 
     # the bounded-LRU plan cache the operation reads/writes when ``cache_plans`` is on. Left
     # ``None`` (the default), the process-global ``cache.default_cache()`` is used so every

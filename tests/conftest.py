@@ -31,15 +31,15 @@ unaffected (caching + placeholders are off by default).
 
 The hoisting switch does the same for cross-parent hoisting, via :func:`hoist_suite_toggle`:
 
-- `GRAFAST_HOIST=1` forces `hoist=True` across the suite. Hoisting only LIFTS a step whose
-  inputs are constant across a child bucket to a shallower layer — it changes WHERE a step
-  runs, never WHETHER it runs, so the data stays BYTE-IDENTICAL. The existing corpus contains
-  no hoistable shape (every plan-resolver field builds its step from the child boundary, so
-  nothing is request-/parent-constant inside a deeper bucket), so `GRAFAST_HOIST=1` is
-  byte-identical INCLUDING fetchCounts; the dedicated `tests/test_hoist.py` is what constructs
-  a hoistable shape and proves the ON path (relocation + fire-once + guards). It is OFF by
-  default, so a plain `uv run pytest tests` and the conformance run are unaffected (hoisting
-  is off by default).
+- Hoisting is ON by DEFAULT now (like upstream Grafast), so the plain `uv run pytest tests`,
+  the conformance run, and every other oracle leg already exercise hoist-ON. The byte-identity
+  oracle therefore runs the OFF baseline: `GRAFAST_HOIST=0` forces `hoist=False` across the
+  suite, and it must produce the SAME result assertions as the default-on run — proving hoisting
+  only LIFTS a step to a shallower layer (changing WHERE a step runs, never WHETHER), so the data
+  is BYTE-IDENTICAL whether on or off. The existing corpus has no count-asserted hoistable shape,
+  so it is byte-identical INCLUDING fetchCounts; the dedicated `tests/test_hoist.py` constructs a
+  hoistable shape and proves the ON path (relocation + fire-once + guards). `GRAFAST_HOIST=1`
+  forces it ON (redundant with the default, kept for explicitness).
 """
 
 import os
@@ -104,9 +104,17 @@ def placeholders_enabled() -> bool:
     return _env_flag(PLACEHOLDERS_ENV_VAR) or cache_plans_enabled()
 
 
-def hoist_enabled() -> bool:
-    """Whether the hoisting switch asked for cross-parent hoisting ON across the whole suite."""
-    return _env_flag(HOIST_ENV_VAR)
+def hoist_override():
+    """Explicit hoist override from ``GRAFAST_HOIST``: True (force on), False (force off), or None.
+
+    Hoisting now defaults ON, so the byte-identity oracle needs the OFF baseline too: ``=0`` /
+    ``false`` forces it OFF across the suite, ``=1`` forces it ON (redundant with the default but
+    explicit), and unset (None) leaves the default. Three-state, unlike the other on/off toggles.
+    """
+    val = os.environ.get(HOIST_ENV_VAR)
+    if val is None or val == "":
+        return None
+    return val not in ("0", "false", "False")
 
 
 def pytest_configure(config):
@@ -253,28 +261,32 @@ def cache_plans_suite_toggle(request):
 
 @pytest.fixture(autouse=True)
 def hoist_suite_toggle(request):
-    """Flip cross-parent hoisting ON for the whole suite under `GRAFAST_HOIST=1`.
+    """Force the suite's cross-parent hoisting setting for the byte-identity oracle — BOTH ways.
 
-    The cross-parent hoisting "broadest oracle" — the sibling of :func:`inline_relations_suite_toggle`:
-    run the EXISTING result-asserting suite with hoisting forced on, proving it changes only
-    WHERE a step runs (lifting a request-/parent-constant step to a shallower layer), never the
-    data — so the whole result-asserting suite stays BYTE-IDENTICAL. We monkeypatch the BASE
-    :class:`GrafastExecutionContext`'s class-level ``grafast_config`` to ``hoist=True`` and
-    restore it after each test.
+    Hoisting now defaults ON (config.py / upstream), so the default run, the conformance run, and
+    every other oracle leg already exercise hoist-ON. The byte-identity oracle therefore needs the
+    OFF baseline: ``GRAFAST_HOIST=0`` forces hoisting OFF across the whole result-asserting suite,
+    and the default (no env) leaves it ON — both must produce the same result assertions, proving
+    hoisting changes only WHERE a step runs (lifting a request-/parent-constant step to a shallower
+    layer), never the data. ``GRAFAST_HOIST=1`` forces it ON (redundant with the default, kept for
+    explicitness). We monkeypatch the BASE :class:`GrafastExecutionContext`'s class-level
+    ``grafast_config`` and restore it after each test.
 
-    Surgical, exactly like the inlining/caching toggles:
+    Surgical, like the inlining/caching toggles:
 
-    - A NO-OP unless ``GRAFAST_HOIST`` is set, so the default run and the conformance run are
-      untouched — hoisting is off by default.
+    - A NO-OP unless ``GRAFAST_HOIST`` is set OR the test is ``hoist_off``-marked, so the default
+      run is untouched (it uses the on-by-default config).
     - A test that defines its OWN ``grafast_config`` on a context subclass (e.g.
-      ``tests/test_hoist.py`` uses ``GrafastConfig(hoist=True)`` explicitly) shadows this base
-      attribute, so its explicit config wins — we never fight an intentional config.
-    - A test marked ``hoist_off`` (it asserts the EXACT per-child-bucket fetchCount, which a
-      legal hoist reduces) is left on the naive layout; its data oracle still holds, only its
-      count would differ. No corpus test needs this today (the corpus has no hoistable shape),
-      so under ``GRAFAST_HOIST=1`` the whole suite is byte-identical INCLUDING counts.
+      ``tests/test_hoist.py``) shadows this base attribute, so its explicit config wins.
+    - A test marked ``hoist_off`` (it asserts the EXACT per-child-bucket fetchCount, which a legal
+      hoist reduces) is pinned OFF regardless of the default. No corpus test needs this today (the
+      corpus has no count-asserted hoistable shape), so the whole suite is byte-identical INCLUDING
+      counts whether hoist is on or off.
     """
-    if not hoist_enabled() or request.node.get_closest_marker("hoist_off"):
+    override = hoist_override()
+    if request.node.get_closest_marker("hoist_off"):
+        override = False
+    if override is None:
         yield
         return
 
@@ -282,7 +294,7 @@ def hoist_suite_toggle(request):
     from grafast_py.context import GrafastExecutionContext
 
     previous = GrafastExecutionContext.__dict__.get("grafast_config")
-    GrafastExecutionContext.grafast_config = GrafastConfig(hoist=True)
+    GrafastExecutionContext.grafast_config = GrafastConfig(hoist=override)
     try:
         yield
     finally:
