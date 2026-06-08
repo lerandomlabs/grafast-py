@@ -49,8 +49,9 @@ That single decision defines what this library is and isn't — read it before a
 - The gap vs upstream Grafast is **constant-factor** (round-trips, a few redundant step
   runs), **not asymptotic** — and the optimizers (LATERAL inlining, cross-parent hoisting,
   plan caching) intentionally cover fewer cases and **fall back** to the batched path on any
-  uncertain shape. Inlining and hoisting are **off by default** (opt-in `GrafastConfig`
-  flags).
+  uncertain shape. Cross-parent hoisting is **on by default** (like upstream Grafast, proven
+  byte-identical by its oracle); inlining and plan caching are off by default (opt-in
+  `GrafastConfig` flags).
 - We remain **coupled to graphql-core's type system, validation and execution semantics**
   (the deliberate reuse), and to its release lines: incremental delivery / subscriptions
   ride the **graphql-core 3.3 alpha** line (the 3.2 line has no incremental delivery).
@@ -583,29 +584,31 @@ caching — every existing exact-data **and** statement-count assertion still ho
 hit changes only whether planning re-runs and a placeholder changes only how a value-agnostic value
 is dedup-keyed, never the SQL or the data.
 
-## Cross-parent step hoisting (experimental, opt-in)
+## Cross-parent step hoisting (on by default)
 
-`hoist` (a `GrafastConfig` field, default **OFF**) is a pure optimization that **lifts** a step
+`hoist` (a `GrafastConfig` field, default **ON** — like upstream Grafast) is a pure optimization that **lifts** a step
 whose inputs are constant across a child bucket up into a shallower layer, so it runs
 once-per-request (or once-per-few-parents) instead of once-per-child-bucket. It changes *where* a
 step runs, never *whether* it runs — no step is replaced, no `FieldPlan.step` reference moves, only
 the column's production layer shifts — so the data is **byte-identical** to the naive plan; the
 hoisted column is produced in the parent bucket and threaded down to the child bucket as an extra
 `parent_store` seed (the child reads it, never re-runs it). It is **disabled entirely under
-mutations** (a serial mutation root must not be reordered). With the flag off (the default) the
-finalize pass is a no-op.
+mutations** (a serial mutation root must not be reordered). It defaults **on**: the `GRAFAST_HOIST`
+byte-identity oracle proves hoist-on == hoist-off across the whole suite + conformance, and the
+carry is a faithful port of upstream Grafast's bucket-boundary model.
 
 ```python
 from grafast_py import GrafastConfig, GrafastExecutionContext
 
-class HoistContext(GrafastExecutionContext):
-    grafast_config = GrafastConfig(hoist=True)   # default False
+class NoHoistContext(GrafastExecutionContext):
+    grafast_config = GrafastConfig(hoist=False)  # opt OUT (hoist defaults True)
 ```
 
-Like inlining/caching, you can flip it on suite-wide as a byte-identical oracle:
-`GRAFAST_HOIST=1 uv run pytest tests` re-runs everything with hoisting forced on (the existing
-corpus has no hoistable shape, so it is byte-identical including fetchCounts; `tests/test_hoist.py`
-constructs a hoistable shape and proves relocation + fire-once + the mutation guard).
+You can run the suite with hoisting forced OFF as the byte-identity oracle (the default already runs it on):
+`GRAFAST_HOIST=0 uv run pytest tests` re-runs everything with hoisting forced OFF (the default
+already runs it on, so this is the byte-identity baseline; the existing corpus has no hoistable
+shape, so it is byte-identical including fetchCounts). `tests/test_hoist.py` constructs a hoistable
+shape and proves relocation + fire-once + the mutation guard.
 
 ## Incremental delivery: `@defer` / `@stream` / subscriptions (graphql-core 3.3 only)
 
@@ -662,19 +665,21 @@ in this engine — do it in your validation layer (see above).
 
 **Deferred in the `grafast_py.pg` data source**: `HAVING` on aggregates is not yet exposed.
 
-**Experimental / opt-in**: opportunistic `LATERAL` relation inlining
-(`inline_relations`, default **OFF**), cross-request **plan caching** (`cache_plans`, default
-**OFF**), runtime **placeholders** (`placeholders`, default **OFF**), and cross-parent step
-**hoisting** (`hoist`, default **OFF**). With all of them off — the default — each resource layer
-is its own batched `= ANY($1)` round-trip and every operation plans per-request, inlining each
-`$variable` value as a SQL literal. Turning inlining on folds a *safe-to-prove* hasOne /
-unpaginated-hasMany child into the parent's statement to cut SQL round-trips; turning placeholders
-on lets a host express a variable-derived filter / pagination value as a *value-agnostic* bindparam
-tagged by its source variable, so the resulting plan is value-independent; turning caching on
-reuses that value-independent plan across requests of the same document (re-binding only the values,
-no deepcopy); turning hoisting on lifts a child-bucket-constant step to a shallower layer so it runs
-once instead of once-per-child-bucket. All four ship **dark** and are gated so the default build is
-byte-identical (see
+**Optimizers**: opportunistic `LATERAL` relation inlining (`inline_relations`, opt-in, default
+**OFF**), cross-request **plan caching** (`cache_plans`, opt-in, default **OFF**), runtime
+**placeholders** (`placeholders`, opt-in, default **OFF**), and cross-parent step **hoisting**
+(`hoist`, default **ON**, like upstream Grafast). With the three opt-in optimizers off — their
+default — each resource layer is its own batched `= ANY($1)` round-trip and every operation plans
+per-request, inlining each `$variable` value as a SQL literal. Turning inlining on folds a
+*safe-to-prove* hasOne / unpaginated-hasMany child into the parent's statement to cut SQL
+round-trips; turning placeholders on lets a host express a variable-derived filter / pagination
+value as a *value-agnostic* bindparam tagged by its source variable, so the resulting plan is
+value-independent; turning caching on reuses that value-independent plan across requests of the same
+document (re-binding only the values, no deepcopy); hoisting (on by default) lifts a
+child-bucket-constant step to a shallower layer so it runs once instead of once-per-child-bucket.
+The three opt-in optimizers ship **dark** (default off); hoisting is **on by default** (proven
+byte-identical by its `GRAFAST_HOIST` oracle). All are gated so the result is byte-identical
+regardless of which are enabled (see
 [LATERAL relation inlining](#lateral-relation-inlining-experimental-opt-in),
 [Plan caching + runtime placeholders](#plan-caching--runtime-placeholders-experimental-opt-in), and
 [Cross-parent step hoisting](#cross-parent-step-hoisting-experimental-opt-in) above).
@@ -684,7 +689,7 @@ The engine provides: the explicit two-tree
 (every field is a step, one execution path); the function-level `grafast_execute()` /
 `grafast_subscribe()` seam + the `GrafastExecutionContext` drop-in shim; dual graphql-core 3.2
 **and** 3.3 support; `@defer`/`@stream`/subscriptions as the 3.3-only tier (with the 7-case caveat
-above); cross-parent hoisting (`hoist`, off by default); and the deepcopy-free plan cache. The
+above); cross-parent hoisting (`hoist`, on by default); and the deepcopy-free plan cache. The
 Postgres data source also provides: multi-column (composite) relation keys, the single-shared-request-transaction mode,
 connection `GROUP BY` / aggregates, a codec type library (recursive arrays / ranges / enums /
 composites), and GraphQL **interfaces / unions** backed by Postgres — column-discriminator

@@ -944,6 +944,18 @@ def _is_hoistable(
       4. EVERY dependency lives at/above the PARENT boundary (`liftable_above`) — upstream's
          "none of its deps are in the same bucket" guard. A dep that is an in-layer step NOT
          already lifted pins `step` to this bucket, so it is not hoistable.
+
+    TODO (future layer reasons): upstream's hoistStep ALSO gates on the child LAYER's REASON — it
+    does not lift a step OUT of a @defer / @stream / subscription / polymorphic / mutationField
+    boundary (an eagerly-evaluated hoist could change incremental-payload timing, cross a
+    polymorphic split, or reorder a serial mutation; in particular a non-`is_sync_and_safe` step
+    must not be hoisted across a defer/stream boundary). grafast-py only ever constructs ROOT and
+    NESTED layer reasons today (the others are defined-but-never-built — `_hoist_layer` recurses
+    only through object/list child plans, and hoisting is disabled entirely under mutations), so
+    those per-reason gates are deliberately OMITTED because they cannot fire. When plan-time
+    @defer / @stream / polymorphic LAYERS are wired, this function MUST gain the corresponding gate
+    (do not hoist out of such a boundary). See upstream
+    grafast/grafast/src/engine/OperationPlan.ts hoistStep.
     """
     from .core_steps import ItemStep, RootStep
 

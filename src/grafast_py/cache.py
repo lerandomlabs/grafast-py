@@ -128,8 +128,10 @@ def config_fingerprint(config: Any) -> ConfigFingerprint:
     cross-parent hoist pass relocates steps, which changes each LayerPlan's run_steps/boundary
     and so the finalized DAG shape). The limit/concurrency/tracing knobs do not change the plan,
     so they are excluded — two configs differing only in those SHARE a cache entry, as they
-    should. A ``None`` config (a direct unit-test key) fingerprints as all-False, matching the
-    default config.
+    should. A ``None`` config is a direct unit-test key and fingerprints as all-False; note this no
+    longer equals the DEFAULT config's fingerprint (``hoist`` now defaults True), but the cache path
+    never passes ``None`` (it always carries the request's real config), so the distinction is
+    confined to direct-key unit tests.
     """
     if config is None:
         return (False, False, False, False)
