@@ -513,7 +513,13 @@ class PgCustomizable(Step):
         fresh_keys = tuple(
             predicate_key(p, placeholder_binds_in(p) or None) for p in fresh
         )
-        cached_keys = self.customization_signature()[: self._customizer_predicate_count]
+        # the cached customizer-origin predicates (the leading ones) keyed the SAME value-agnostic
+        # way, computed directly from where_predicates (not customization_signature, whose leading
+        # element is the customizer identity, not a predicate key).
+        cached_keys = tuple(
+            predicate_key(p, placeholder_binds_in(p) or None)
+            for p in self.where_predicates[: self._customizer_predicate_count]
+        )
         return fresh_keys == cached_keys
 
     def where_tree(self, condition: "Condition") -> None:
@@ -534,11 +540,19 @@ class PgCustomizable(Step):
     def customization_signature(self) -> tuple:
         """A content-based, hashable dedup component for the customization (cached).
 
-        A tuple of per-predicate :func:`predicate_key` strings in insertion order
-        (resource-customizer predicates first, then per-plan ``.where()``s): equal
-        predicate lists yield equal tuples and different VALUES differ, so byte-different
-        statements never merge. Computed once per step (both ``peer_key`` and
-        ``dedup_params`` read it) and invalidated when a ``.where()`` mutates the list.
+        Leads with the resource customizer's IDENTITY, then the per-predicate
+        :func:`predicate_key` strings in insertion order (resource-customizer predicates first,
+        then per-plan ``.where()``s): equal predicate lists yield equal tuples and different VALUES
+        differ, so byte-different statements never merge. Computed once per step (both ``peer_key``
+        and ``dedup_params`` read it) and invalidated when a ``.where()`` mutates the list.
+
+        The leading customizer identity stops a customizer-bearing step from dedup-merging into a
+        peer with a DIFFERENT customizer (or none) — even when the customizer returned NO predicates
+        THIS request (an empty predicate list would otherwise look identical to an unscoped peer over
+        the same table). Merging it away would drop the step from ``plan.steps``, past the cache-hit
+        structural guard, and let a later request inherit the peer's unscoped rows. Two steps over
+        the SAME customizer still merge — the survivor stays customizer-bearing, so the guard
+        re-checks it. (Identity is per-build only; it is never part of the cross-request cache key.)
 
         Each predicate's key is computed against ITS OWN placeholder binds (not the whole
         step registry) so a placeholder in one predicate never leaks its source tag into
@@ -546,9 +560,13 @@ class PgCustomizable(Step):
         ``predicate_key`` call takes the unchanged value-included literal path.
         """
         if self._signature_cache is None:
-            self._signature_cache = tuple(
-                predicate_key(p, self._placeholder_binds_for(p))
-                for p in self.where_predicates
+            customizer = self.resource.select_customizer
+            self._signature_cache = (
+                id(customizer) if customizer is not None else None,
+                *(
+                    predicate_key(p, self._placeholder_binds_for(p))
+                    for p in self.where_predicates
+                ),
             )
         return self._signature_cache
 

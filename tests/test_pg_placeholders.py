@@ -319,9 +319,12 @@ def test_mixed_literal_and_placeholder_keys_per_predicate():
     # the placeholder predicate is value-agnostic (source tag, no runtime value); the literal
     # predicate is value-included — proving each predicate keyed independently in the signature.
     a_sig = a.customization_signature()
-    assert a_sig[0] == "status = <<ph:var:status>>|ph=['var:status']"
-    assert a_sig[1] == "title = 'alpha'"
-    assert "published" not in a_sig[0]  # the placeholder value never enters its key
+    # a_sig[0] is the leading customizer identity (None here — no resource customizer); the
+    # per-predicate keys follow.
+    assert a_sig[0] is None
+    assert a_sig[1] == "status = <<ph:var:status>>|ph=['var:status']"
+    assert a_sig[2] == "title = 'alpha'"
+    assert "published" not in a_sig[1]  # the placeholder value never enters its key
 
     plan = Plan()
     plan.add_step(a)
@@ -367,7 +370,8 @@ def test_combined_placeholder_and_literal_in_one_predicate_keeps_literal_value()
     remap = plan.deduplicate()
     assert remap[a.id] is not remap[b.id]
     # the literal value is in the key (value-discriminated); the placeholder value is NOT.
-    a_key = a.customization_signature()[0]
+    # ([0] is the leading customizer identity, None here; the predicate key follows.)
+    a_key = a.customization_signature()[1]
     assert "'alpha'" in a_key
     assert "<<ph:var:status>>" in a_key
     assert "published" not in a_key

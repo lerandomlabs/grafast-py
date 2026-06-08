@@ -327,10 +327,11 @@ def test_filter_vs_no_filter_do_not_dedup():
 
 
 def test_filter_signature_is_the_compiled_predicate_key():
-    """The customization signature is the compiled condition's value-included key."""
+    """The customization signature is the leading customizer identity (None — no resource
+    customizer here) then the compiled condition's value-included key."""
     cond = And([Compare("status", "eq", "published"), Compare("deleted_at", "is_null", True)])
     step = make_step(cond)
-    assert step.customization_signature() == (predicate_key(compile_condition(cond)),)
+    assert step.customization_signature() == (None, predicate_key(compile_condition(cond)))
 
 
 def test_connection_where_tree_participates_in_key():

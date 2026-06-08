@@ -1232,3 +1232,74 @@ async def test_structure_branching_customizer_on_inlined_relation_does_not_leak(
     # the two requests collide on the cache key (a hit), yet the user stays isolated: the
     # customizer-bearing child is not folded, so the structural guard re-planned for the user.
     assert cache.hits == 1
+
+
+def build_same_table_two_resource_schema(scoped_customizer):
+    """Two resources over the SAME widgets table (same columns) — one plain, one customizer-scoped.
+
+    Selected as two root fields in one operation. When the scoped customizer returns [] for the
+    planning request, the scoped select looks IDENTICAL to the plain one (same table, columns,
+    empty customization signature), so dedup could merge the scoped step into the plain peer.
+    """
+    from grafast_py.schema import make_grafast_schema
+
+    cols = ["id", "owner_id", "title", "status", "deleted_at"]
+    registry = PgRegistry()
+    plain = PgResource("widgets_plain", "grafast_demo", "widgets", cols, registry=registry)
+    scoped = PgResource(
+        "widgets_scoped", "grafast_demo", "widgets", cols, registry=registry,
+        select_customizer=scoped_customizer,
+    )
+    return make_grafast_schema(
+        "type Query { plain: [W!]! scoped: [W!]! }\ntype W { id: Int! status: String! }",
+        {
+            "Query": {
+                "plain": lambda p, a, i: PgSelectAllStep(plain, order_by=["id"]).for_parent(p),
+                "scoped": lambda p, a, i: PgSelectAllStep(scoped, order_by=["id"]).for_parent(p),
+            },
+            "W": {
+                "id": lambda p, a, i: access(p, ("id",)),
+                "status": lambda p, a, i: access(p, ("status",)),
+            },
+        },
+    )
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_dedup_merging_customizer_step_into_uncustomized_peer_does_not_leak(seeded):
+    """A scoped customizer step must not dedup-merge into an uncustomized same-table peer and leak.
+
+    Request A (admin) -> the scoped customizer returns [] -> the scoped select looks identical to
+    the plain select and could merge into it; if cached, request B (user) would read the plain
+    (unfiltered) result for the scoped field. The scoped step must stay distinct/visible to the
+    cache-hit structural guard so the user gets only their scoped rows.
+    """
+
+    def scope(ctx, sources):
+        if ctx.get("role") == "admin":
+            return []
+        return [column("status") == sources.placeholder("status")]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_same_table_two_resource_schema(scope)
+    query = "{ plain { id } scoped { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        admin = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "status": "draft"}
+    ):
+        user = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert admin.errors is None and user.errors is None, (admin.errors, user.errors)
+    # admin: both fields see all 6 widgets. user: plain still all 6, but scoped MUST be only [2,5].
+    assert sorted(w["id"] for w in admin.data["scoped"]) == [1, 2, 3, 4, 5, 6]
+    assert sorted(w["id"] for w in user.data["plain"]) == [1, 2, 3, 4, 5, 6]
+    assert sorted(w["id"] for w in user.data["scoped"]) == [2, 5]

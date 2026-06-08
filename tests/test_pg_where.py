@@ -401,8 +401,10 @@ def test_customizer_derived_predicate_participates_in_key():
     assert scoped.peer_key != plain.peer_key
     assert scoped.dedup_params() != plain.dedup_params()
     assert dedup_key(scoped) != dedup_key(plain)
-    # the customizer predicate's content key is present in the signature.
+    # the signature LEADS with the customizer identity (so a customizer step never merges with an
+    # unscoped peer — even when the customizer returns no predicates), then the predicate content key.
     assert scoped.customization_signature() == (
+        id(scope),
         predicate_key(column("status") == "scoped"),
     )
 
