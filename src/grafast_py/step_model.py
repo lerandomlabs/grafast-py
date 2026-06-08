@@ -49,6 +49,17 @@ class Step:
     # this False so two distinct writes are never collapsed into one.
     dedupable: bool = True
 
+    # whether the cross-parent hoist pass may LIFT this step to a shallower layer (run it once
+    # over a batch instead of once-per-child-bucket). Requires the step to be a DETERMINISTIC,
+    # entry-INDEPENDENT function of its inputs: firing once and fanning the result to every child
+    # must equal firing per child. True for the pure builtins (constant / access / load / node /
+    # each — same inputs => same output). False ONLY for steps running ARBITRARY HOST CODE whose
+    # purity the engine cannot verify (``LambdaStep``): an impure host ``fn`` (counter / uuid /
+    # timestamp) on a request-constant input would otherwise be hoisted to fire once and fan one
+    # value to every child, silently diverging from its per-entry behaviour. (We lack upstream's
+    # unary-value model that would make this a no-op; until then, leave such steps in the child.)
+    hoistable: bool = True
+
     # whether `run_steps` passes the per-bucket-invocation BucketExtra (request context +
     # per-parent paths) as a third execute() argument. False for every pure value/load step
     # (a step's column is a function of its dependency columns alone); the resolver-adapter

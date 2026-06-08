@@ -147,6 +147,12 @@ class LambdaStep(Step):
     """
 
     is_sync_and_safe = False
+    # NOT hoistable: ``fn`` is arbitrary host code whose purity the engine cannot verify. Hoisting
+    # a request-constant lambda would fire ``fn`` once and fan one value to every child — wrong for
+    # an impure ``fn`` (counter / uuid / now). Dedup already assumes ``fn`` is deterministic (it
+    # merges by ``fn`` identity), but hoisting affects even a SINGLE-use lambda under a list, so it
+    # stays in the child layer (fired per entry) regardless of the hoist default.
+    hoistable = False
 
     def __init__(self, dep: Step, fn: Callable[[Any], Any]) -> None:
         super().__init__()

@@ -961,6 +961,12 @@ def _is_hoistable(
 
     if not step.dedupable:
         return False
+    # a step running arbitrary host code whose purity the engine cannot verify (LambdaStep) is not
+    # hoistable: firing once + fanning the value to every child diverges from its per-entry
+    # behaviour for an impure fn. dedupable alone is too loose a gate (it assumes determinism a
+    # host lambda may not honour); `hoistable` is the deterministic-function-of-inputs guarantee.
+    if not step.hoistable:
+        return False
     if isinstance(step, (RootStep, ItemStep)):
         return False
     for dep in step.dependencies:

@@ -31,7 +31,7 @@ from graphql.execution.collect_fields import collect_fields
 from grafast_py import GrafastExecutionContext
 from grafast_py.completion import find_object_completer
 from grafast_py.config import GrafastConfig
-from grafast_py.core_steps import RootStep, access, constant, load_one
+from grafast_py.core_steps import RootStep, access, constant, lambda_step, load_one
 from grafast_py.dag import order_steps
 from grafast_py.entry import grafast_execute
 from grafast_py.plan import plan_operation
@@ -566,3 +566,55 @@ def test_build_hoist_parent_store_fails_loud_when_bridge_missing():
     # the no-hoist case stays a quiet None (the byte-identical default path).
     plain = SimpleNamespace(layer=SimpleNamespace(hoisted_out_ids=frozenset()))
     assert build_hoist_parent_store(plain, None, [0, 1]) is None
+
+
+def test_impure_lambda_is_not_hoisted_so_fires_per_entry():
+    """A LambdaStep (arbitrary host fn) is NOT hoistable — an impure fn fires per entry, hoist ON == OFF.
+
+    Hoisting fires a request-constant step once and fans its value to every child; for a PURE step
+    that is byte-identical, but for an IMPURE host lambda (a counter here) it would diverge. So a
+    LambdaStep stays in the child layer (fired per entry) regardless of the hoist default — the
+    eligibility gate (`Step.hoistable=False` on LambdaStep) keeps default-on safe for arbitrary host
+    code, while LOADS still hoist (the tests above). Without the gate, hoist ON would wrongly fan one
+    value: `[[1, 1], [1, 1]]` with the lambda fired once.
+    """
+    orgs = [{"id": 10}, {"id": 20}]
+    people = [{"id": 1}, {"id": 2}]
+
+    def run(hoist):
+        counter = {"n": 0}
+
+        def bump(_):
+            counter["n"] += 1
+            return counter["n"]
+
+        def plan_orgs(p, a, i):
+            return constant(orgs)
+
+        def plan_people(p, a, i):
+            return load_one(constant("p"), lambda keys: [people for _ in keys])
+
+        def plan_tag(p, a, i):
+            return lambda_step(constant("k"), bump)  # impure, request-constant input
+
+        schema = make_grafast_schema(
+            TWO_LEVEL_SDL,
+            {
+                "Query": {"orgs": plan_orgs},
+                "Org": {"id": leaf("id"), "people": plan_people},
+                "Person": {"id": leaf("id"), "tag": plan_tag},
+            },
+        )
+        result = grafast_execute(
+            schema, "{ orgs { id people { id tag } } }", config=GrafastConfig(hoist=hoist)
+        )
+        assert result.errors is None
+        tags = [[pp["tag"] for pp in o["people"]] for o in result.data["orgs"]]
+        return tags, counter["n"]
+
+    off_tags, off_n = run(False)
+    on_tags, on_n = run(True)
+
+    # the impure lambda fires PER ENTRY (4 people) in BOTH — never hoisted to fire once.
+    assert off_tags == [[1, 2], [3, 4]] and off_n == 4
+    assert on_tags == off_tags and on_n == off_n
