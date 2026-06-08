@@ -528,11 +528,13 @@ def complete_stream_field(context, field_plan, outcome, live_idx, state, bridge)
         i = live_idx[k]
         # hoist channel for the streamed items: every one of THIS parent's list items
         # (head completed inline + tail drained by the producer) descends into the child layer
-        # owned by parent bucket row `bridge.value_owner[k]`, so each must seed the columns
-        # hoisted OUT of that layer. Carry a per-parent seed — a 1-element `value_owner` the head
-        # expands ×len and each tail item uses as-is. None when nothing was hoisted (byte-identical).
+        # carrying THIS parent's hoisted values (completion value k). Carry a per-parent seed — a
+        # 1-element column per hoisted step the head expands ×len and each tail item uses as-is.
+        # None when nothing was hoisted (byte-identical).
         item_bridge = (
-            bridge._replace(value_owner=[bridge.value_owner[k]]) if bridge is not None else None
+            HoistBridge(columns={hid: [col[k]] for hid, col in bridge.columns.items()})
+            if bridge is not None
+            else None
         )
         result = complete_one_stream_value(
             context, field_plan, list_completer, value, outcome.paths[k],
@@ -557,8 +559,8 @@ def complete_one_stream_value(
 ):
     """Complete ONE parent's @stream'd list value (sync → None / async → coroutine).
 
-    `item_bridge` is the per-parent hoist seed (a 1-element ``value_owner``) threaded down to
-    the head + tail item completion so streamed child objects seed their hoisted-out columns.
+    `item_bridge` is the per-parent hoist seed (1-element columns) threaded down to the head +
+    tail item completion so streamed child objects seed their hoisted-out columns.
     """
     stream = field_plan.stream
     if isinstance(stream, _compat.StreamError):
@@ -737,8 +739,8 @@ def info_of(producer):
 def complete_stream_head(context, field_plan, item_completer, head_raw, path, info, item_bridge=None):
     """Complete the head items (items[:initialCount]) through the list item completer.
 
-    `item_bridge` is the per-parent hoist seed (a 1-element ``value_owner``); since every head
-    item shares the same parent-bucket owner, expand it to one entry per head item so the child
+    `item_bridge` is the per-parent hoist seed (1-element columns); since every head item shares
+    the same parent's hoisted values, expand each column to one entry per head item so the child
     object completer projects the hoisted column for each.
     """
     if not head_raw:
@@ -746,7 +748,7 @@ def complete_stream_head(context, field_plan, item_completer, head_raw, path, in
     item_paths = [path.add_key(idx, None) for idx in range(len(head_raw))]
     item_infos = [info] * len(head_raw)
     head_bridge = (
-        item_bridge._replace(value_owner=item_bridge.value_owner * len(head_raw))
+        HoistBridge(columns={hid: col * len(head_raw) for hid, col in item_bridge.columns.items()})
         if item_bridge is not None
         else None
     )
@@ -788,18 +790,22 @@ def find_list_completer(completer):
 def hoist_bridge_for_field(field_plan, step_columns, live_idx):
     """Build the :class:`HoistBridge` for a field that descends into a hoist-affected child.
 
-    Returns a bridge carrying this bucket's store (`step_columns`, where any step hoisted out
-    of the child layer was produced) and `live_idx` as the per-outcome-value parent-bucket-owner
-    map, but ONLY when the field's leaf object child plan actually has hoisted-out steps. When no
-    step was hoisted out of the child (the default / hoist-off path), returns `None` so
-    completion never threads a bridge and is byte-identical.
+    Projects each column the child's layer HOISTED OUT (produced once in THIS bucket's store,
+    `step_columns`) from parent-bucket granularity to the field's COMPLETION-VALUE granularity via
+    `live_idx` (the per-outcome-value parent-bucket position: outcome value k belongs to parent
+    bucket row `live_idx[k]`), so the bridge's columns are parallel to the field's completed values
+    and reshape in lockstep with them through completion. Built ONLY when the field's leaf object
+    child plan actually has hoisted-out steps; otherwise (the default / hoist-off path) returns
+    `None`, so completion never threads a bridge and is byte-identical.
     """
     child = find_object_completer(field_plan.completer)
     if child is None or child.child_plan is None:
         return None
-    if not child.child_plan.layer.hoisted_out_ids:
+    hoisted_out = child.child_plan.layer.hoisted_out_ids
+    if not hoisted_out:
         return None
-    return HoistBridge(parent_store=step_columns, value_owner=live_idx)
+    columns = {hid: [step_columns[hid][p] for p in live_idx] for hid in hoisted_out}
+    return HoistBridge(columns=columns)
 
 
 def run_effect_steps(context, plan: ObjectPlan, parents: List[Any]):
