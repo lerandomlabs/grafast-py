@@ -202,12 +202,13 @@ That O(depth) batching property holds across the full feature set:
   **not** plan-cacheable under `cache_plans`); `customizer(context, sources)` uses
   `sources.placeholder(key)` to emit a value-less placeholder read from `context[key]` per
   request at execute, so the plan stays value-independent and **cacheable** (structure fixed at
-  plan time, value supplied per request — the convergence to upstream `selectAuth`). A cacheable
-  customizer must vary only its *values* across requests, never its predicate *structure*:
-  branching the returned predicates on context (e.g. `return [admin_scope] if ctx["role"] ==
-  "admin" else [user_scope]`) is **not** cache-safe — a cache hit reuses the first request's
-  structure for a later request with a different role. Use the 1-arg `customizer(context)` form
-  (non-cacheable, re-planned per request) when the predicate *shape* depends on the request.
+  plan time, value supplied per request — the convergence to upstream `selectAuth`). A customizer
+  that varies only its *values* across requests (the common tenant case) is shared from the cache
+  and re-binds per request. A customizer that varies its predicate *structure* by context (e.g.
+  `return [] if ctx["role"] == "admin" else [scope]`) is still **correct** — a structural-
+  divergence guard re-resolves the customizer on a cache hit and re-plans whenever the shape
+  differs from the cached one, so a request can never inherit another request's customizer-decided
+  structure — it just doesn't share one cached plan across the differing shapes.
 - **Per-parent paging** — `first` / `offset` slice **each parent's** rows in SQL via a
   `row_number()` window partitioned by the match column (never a bucket-wide `LIMIT`).
 - **Keyset Relay connections** — forward (`first`/`after`) **and** reverse

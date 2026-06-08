@@ -653,6 +653,17 @@ def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
         # a stale `id(schema)` collision (a freed schema's id reused by this one) — treat as a
         # miss so we never serve a plan built against a different schema.
         return None
+    # structural-divergence guard: a resource select_customizer whose predicate SHAPE depends on
+    # the request (it branches its STRUCTURE on context — e.g. no filter for an admin vs a scoped
+    # filter for a user) would otherwise let this HIT reuse the FIRST request's structure. Re-resolve
+    # each customizer-bearing step against THIS request; a STRUCTURAL change forces a re-plan (a
+    # miss). A value-only change is NOT a divergence — the placeholder re-binds per request, so a
+    # well-behaved value-varying customizer still hits. Duck-typed: core takes no pg import (the
+    # method lives on the pg step; a non-pg step never carries it).
+    for step in cached.plan.steps:
+        matches = getattr(step, "customizer_structure_matches", None)
+        if matches is not None and not matches():
+            return None
     # the SHARED triple is read-only at execute (no per-request value lives on it); each request
     # carries its OWN source map, so no copy is needed (the deepcopy-free hit path).
     context._grafast_source_values = values_by_source(context.variable_values, operation)

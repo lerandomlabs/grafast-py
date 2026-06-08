@@ -485,6 +485,34 @@ class PgCustomizable(Step):
             for p in self.where_predicates[: self._customizer_predicate_count]
         )
 
+    def customizer_structure_matches(self) -> bool:
+        """Whether the resource customizer yields the SAME predicate STRUCTURE for the CURRENT
+        request as this (cached) step holds — the cache-HIT structural-divergence guard.
+
+        Re-resolves the resource ``select_customizer`` against THIS request's context and compares
+        the VALUE-AGNOSTIC keys of its predicates (placeholder sources sentinelled, fresh bind
+        names erased; a plain literal's value still included) to the cached step's customizer
+        predicates. A value-only change — a placeholder bound to a different per-request value —
+        keeps the SAME key, so a well-behaved value-varying customizer still hits. A STRUCTURAL
+        change — different columns / predicate count, e.g. a customizer that returns no filter for
+        an admin and a scoped filter for a user — yields a DIFFERENT key, so the caller treats the
+        hit as a miss and re-plans rather than letting this request inherit another request's
+        customizer-decided structure. A step with no resource customizer trivially matches.
+        """
+        customizer = self.resource.select_customizer
+        if customizer is None:
+            return True
+        fresh, _ = resolve_customizer_predicates(
+            customizer,
+            current_pg_request().context,
+            self.resource.select_customizer_arity,
+        )
+        fresh_keys = tuple(
+            predicate_key(p, placeholder_binds_in(p) or None) for p in fresh
+        )
+        cached_keys = self.customization_signature()[: self._customizer_predicate_count]
+        return fresh_keys == cached_keys
+
     def where_tree(self, condition: "Condition") -> None:
         """Compile a structured filter :class:`Condition` and AND it onto the batched WHERE.
 
@@ -636,13 +664,16 @@ def resolve_customizer_predicates(
       request at execute, so the plan stays value-INDEPENDENT (structure at plan time, value per
       request — the convergence to upstream ``selectAuth``).
 
-    A 2-arg customizer that wants caching MUST be a PURE function of (context KEYS, schema)
-    varying only VALUES — never predicate STRUCTURE — across requests of the same resource;
-    structural branching on context is unsupported under ``cache_plans`` (use the 1-arg,
-    non-cacheable form). Every predicate is validated as a Core expression (never a raw string,
-    fully bound, no reserved bind name) and AND-combined onto EVERY batched select for the
-    resource. Returns ``(predicates, bakes_literal)`` where ``bakes_literal`` is True if ANY
-    predicate carries a non-placeholder (plan-time literal) bind — the cache safety-floor signal.
+    A 2-arg customizer that varies only its VALUES across requests of a resource (the common
+    tenant case) shares one cached plan and re-binds per request. One that varies its predicate
+    STRUCTURE by context (e.g. no filter for an admin vs a scoped filter for a user) stays correct:
+    the cache-hit structural-divergence guard (:meth:`PgCustomizable.customizer_structure_matches`)
+    re-resolves it per request and re-plans on a shape change, so a request never inherits another
+    request's structure — it just does not share a cached plan across the differing shapes. Every
+    predicate is validated as a Core expression (never a raw string, fully bound, no reserved bind
+    name) and AND-combined onto EVERY batched select for the resource. Returns ``(predicates,
+    bakes_literal)`` where ``bakes_literal`` is True if ANY predicate carries a non-placeholder
+    (plan-time literal) bind — the cache safety-floor signal for value baking.
     """
     if customizer is None:
         return [], False

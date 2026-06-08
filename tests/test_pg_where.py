@@ -634,3 +634,32 @@ def test_inline_clone_preserves_bakes_literal_flag():
     assert step.customizer_bakes_literal is True
     assert clone.customizer_bakes_literal is True
     assert clone._customizer_predicate_count == step._customizer_predicate_count
+
+
+def test_customizer_structure_matches_detects_shape_change_not_value_change():
+    """The cache-hit structural-divergence guard: same SHAPE (different value) matches; a different
+    SHAPE does not — so a value-varying customizer hits the cache while a structure-varying one is
+    forced to re-plan rather than inherit another request's structure.
+    """
+
+    def scope(ctx, sources):
+        if ctx.get("role") == "admin":
+            return []  # admin: a different predicate SHAPE (no filter)
+        return [column("status") == sources.placeholder("status")]
+
+    widgets = make_widgets(select_customizer=scope)
+    # build the cached step under a USER context (the scoped-filter shape).
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "status": "published"}
+    ):
+        step = PgSelectStep(widgets, constant(None), "owner_id", order_by=["id"])
+        # SAME shape, even built under this very request -> matches.
+        assert step.customizer_structure_matches() is True
+    # a DIFFERENT user VALUE keeps the SAME shape -> still matches (the placeholder re-binds).
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "status": "draft"}
+    ):
+        assert step.customizer_structure_matches() is True
+    # an ADMIN context yields a DIFFERENT shape ([]) -> does NOT match -> the guard re-plans.
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        assert step.customizer_structure_matches() is False

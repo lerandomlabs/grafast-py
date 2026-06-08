@@ -1090,3 +1090,49 @@ async def test_placeholder_select_customizer_cacheable_no_leak(seeded):
     assert sorted(w["id"] for w in b.data["widgets"]) == [2, 5]
     assert {w["status"] for w in a.data["widgets"]} == {"published"}
     assert {w["status"] for w in b.data["widgets"]} == {"draft"}
+
+
+@pytest.mark.pg
+@pytest.mark.asyncio
+@pytest.mark.cache_off
+async def test_structure_branching_customizer_does_not_leak_across_contexts(seeded):
+    """A customizer that BRANCHES its predicate STRUCTURE on context must not leak across requests.
+
+    An admin context yields NO filter (all rows); a user context yields a scoped filter. Both
+    branches are value-independent (no baked literal), so the literal safety floor does NOT trip.
+    Without a structural-divergence guard, request A (admin) caches the UNFILTERED plan and request
+    B (user, SAME document) hits it and sees ALL rows — a privilege-escalation leak. The guard
+    re-resolves the customizer per request and re-plans when the STRUCTURE differs, so the user
+    gets only their scoped rows.
+    """
+
+    def scope(ctx, sources):
+        if ctx.get("role") == "admin":
+            return []  # admin sees everything (no filter)
+        return [column("status") == sources.placeholder("status", type_=String)]
+
+    cache = PlanCache()
+    config = GrafastConfig(cache_plans=True, plan_cache=cache)
+
+    class _Ctx(GrafastExecutionContext):
+        grafast_config = config
+
+    schema = build_customizer_widgets_schema(scope)
+    query = "{ widgets { id status } }"
+
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        admin = await graphql(schema, query, execution_context_class=_Ctx)
+    with pg_request_context(
+        SQLAlchemyExecutor(get_engine()), context={"role": "user", "status": "draft"}
+    ):
+        user = await graphql(schema, query, execution_context_class=_Ctx)
+
+    assert admin.errors is None and user.errors is None
+    # the two requests share a cache KEY (same document/config), so the user's lookup matches the
+    # admin's entry — exactly the collision that leaked before the guard.
+    assert cache.hits == 1
+    # ...yet the user still sees ONLY their scoped (draft) rows, never admin's full set: the
+    # structural-divergence guard rejected the shape mismatch and re-planned.
+    assert sorted(w["id"] for w in admin.data["widgets"]) == [1, 2, 3, 4, 5, 6]
+    assert sorted(w["id"] for w in user.data["widgets"]) == [2, 5]
+    assert {w["status"] for w in user.data["widgets"]} == {"draft"}
