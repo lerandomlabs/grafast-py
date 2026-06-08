@@ -23,7 +23,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import RelationshipProperty
 
 from ..config import log
-from .resource import PgColumn, PgRegistry, PgResource
+from .resource import PgColumn, PgRegistry, PgResource, SelectCustomizer
 
 
 def resource_from_model(
@@ -34,6 +34,7 @@ def resource_from_model(
     schema: Optional[str] = None,
     columns: Optional[Sequence[str]] = None,
     primary_key: Optional[str] = None,
+    select_customizer: Optional[SelectCustomizer] = None,
 ) -> PgResource:
     """Build one :class:`PgResource` from a mapped declarative ``model``.
 
@@ -42,6 +43,11 @@ def resource_from_model(
     over the derived values. Raises ``ValueError`` if ``model`` is not a mapped
     declarative model, or has a composite/absent primary key and no ``primary_key``
     override.
+
+    ``select_customizer`` is forwarded to :class:`PgResource` so its arity (1-arg
+    ``context`` vs 2-arg ``context, sources``) is detected at construction — the read
+    path dispatches on that, so a customizer assigned post-construction (with no arity
+    computed) would mis-dispatch. Pass it here, not as an after-the-fact attribute.
     """
     table = getattr(model, "__table__", None)
     if table is None:
@@ -71,6 +77,7 @@ def resource_from_model(
         resource_columns,
         primary_key=resource_pk,
         registry=registry,
+        select_customizer=select_customizer,
     )
 
 

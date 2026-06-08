@@ -157,6 +157,33 @@ def test_composite_pk_raises_without_override():
     assert resource.columns == ["org_id", "item_id", "name"]
 
 
+def test_select_customizer_is_forwarded_with_arity():
+    """``resource_from_model`` forwards ``select_customizer`` so its arity is detected.
+
+    The read path dispatches on ``select_customizer_arity`` (1-arg ``context`` vs 2-arg
+    ``context, sources``), which :class:`PgResource` computes only for a constructor-passed
+    customizer. Forwarding it through the bridge gets the arity computed like a hand-built
+    resource; without it, a post-construction attribute assignment leaves arity ``None`` and
+    the read path mis-dispatches the customizer.
+    """
+
+    def one_arg(context):
+        return []
+
+    def two_arg(context, sources):
+        return []
+
+    res1 = resource_from_model(CompositePK, primary_key="org_id", select_customizer=one_arg)
+    assert res1.select_customizer is one_arg
+    assert res1.select_customizer_arity == 1
+
+    res2 = resource_from_model(CompositePK, primary_key="org_id", select_customizer=two_arg)
+    assert res2.select_customizer_arity == 2
+
+    # the default stays None (no customizer), unchanged from before.
+    assert resource_from_model(CompositePK, primary_key="org_id").select_customizer_arity is None
+
+
 def test_many_to_many_relation_skipped_by_default_and_strict_raises():
     """A many-to-many relation is dropped by default; strict turns the skip into a raise."""
     registry = resources_from_models([Article, Tag])
