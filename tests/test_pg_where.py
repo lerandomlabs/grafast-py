@@ -552,6 +552,25 @@ def test_same_line_distinct_transforms_do_not_collapse():
     assert key(p1) != key(p2)
 
 
+def test_keyword_only_default_transforms_do_not_collapse():
+    """Two transforms differing only in a keyword-only DEFAULT must not collapse.
+
+    Same bytecode, constants, and positional defaults, but different ``__kwdefaults__``
+    ({'n': 1} vs {'n': 2}) — folding keyword-only defaults into the key keeps them distinct.
+    """
+
+    def key(predicate):
+        return predicate_key(predicate, placeholder_binds_in(predicate) or None)
+
+    p1 = column("k") == pg_placeholder(
+        "ctx:k", type_=String, transform=lambda v, *, n=1: v + n
+    )
+    p2 = column("k") == pg_placeholder(
+        "ctx:k", type_=String, transform=lambda v, *, n=2: v + n
+    )
+    assert key(p1) != key(p2)
+
+
 def test_callable_instance_transform_distinguishes_state():
     """A callable INSTANCE transform (no ``__code__``) is keyed by its type + ``__dict__`` state,
     so two instances of one class with DIFFERENT state stay distinct while the SAME state merges.

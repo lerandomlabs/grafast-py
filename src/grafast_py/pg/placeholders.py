@@ -233,17 +233,22 @@ def transform_key(fn: Callable[[Any], Any]) -> str:
       (``lambda v: v + 1`` vs ``lambda v: v + 2``) must not collapse, else same-source placeholders
       would dedup/cache as if identical and apply the wrong transform to one of them.
 
-    So for a Python callable we key on its EXECUTABLE CONTENT: bytecode + constants + defaults +
-    the closure cell values — equivalent transforms merge, different ones differ (incl. closures
-    over different values; a transform closing over per-request state then forces a safe re-plan
-    rather than reusing the first request's captured value). A callable with no ``__code__`` keys
-    by its own qualified name (a builtin/method descriptor like ``str.upper``) or, for a callable
-    INSTANCE, by its type plus ``__dict__`` state (so ``AddN(1)`` and ``AddN(2)`` differ).
+    So for a Python callable we key on its EXECUTABLE CONTENT: bytecode + constants + defaults
+    (positional AND keyword-only) + the closure cell values — together the COMPLETE set of what
+    parameterizes a function's behaviour given its call. Equivalent transforms merge, different
+    ones differ (incl. closures over different values; a transform closing over per-request state
+    then forces a safe re-plan rather than reusing the first request's captured value). A callable
+    with no ``__code__`` keys by its own qualified name (a builtin/method descriptor like
+    ``str.upper``) or, for a callable INSTANCE, by its type plus ``__dict__`` state (so ``AddN(1)``
+    and ``AddN(2)`` differ).
     """
     code = getattr(fn, "__code__", None)
     if code is not None:
         closure = tuple(repr(cell.cell_contents) for cell in (fn.__closure__ or ()))
-        return f"code:{code.co_code!r}:{code.co_consts!r}:{fn.__defaults__!r}:{closure!r}"
+        return (
+            f"code:{code.co_code!r}:{code.co_consts!r}:"
+            f"{fn.__defaults__!r}:{fn.__kwdefaults__!r}:{closure!r}"
+        )
     qualname = getattr(fn, "__qualname__", None)
     if qualname is not None:
         return f"named:{getattr(fn, '__module__', '')}.{qualname}"
