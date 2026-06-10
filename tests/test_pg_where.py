@@ -37,9 +37,10 @@ from sqlalchemy import String, bindparam, column
 from grafast_py.core_steps import constant
 from grafast_py.dag import Plan
 from grafast_py.pg.connection import PgConnectionStep
-from grafast_py.pg.customize import predicate_key
+from grafast_py.pg.customize import placeholder_binds_in, predicate_key
 from grafast_py.pg.engine import count_sql, dispose_engine, get_engine
 from grafast_py.pg.executor import SQLAlchemyExecutor, pg_request_context
+from grafast_py.pg.placeholders import pg_placeholder
 from grafast_py.pg.resource import PgRegistry, PgResource
 from grafast_py.pg.steps import PgSelectAllStep, PgSelectStep
 from examples.seed import setup_demo_schema, setup_widgets_table
@@ -440,6 +441,46 @@ def test_predicate_key_falls_back_for_unrenderable_literal():
     # key is hashable/tuple-composable for dedup_params().
     assert predicate_key(blob == b"\xff\xfe\x00") == k1
     assert isinstance(hash((k1, k2)), int)
+
+
+def test_same_source_different_transform_placeholders_do_not_dedup():
+    """Two ``ctx:`` placeholders over the SAME source but DIFFERENT ``transform=`` callables
+    must NOT share a dedup key.
+
+    They bind different values at render (``v`` vs ``v + 100``), so merging them would scope
+    one field with the OTHER field's value — a cross-scope leak. Both sentinel to the identical
+    ``<<ph:ctx:owner_id>>`` token, so only the transform identity in the key keeps them apart.
+    Regression for the transform-identity dedup gap (the ``transform=`` half of the ctx:
+    placeholder was absent from the dedup key, so distinct transforms merged).
+    """
+
+    def key(predicate):
+        return predicate_key(predicate, placeholder_binds_in(predicate) or None)
+
+    plain = column("owner_id") == pg_placeholder("ctx:owner_id", type_=String)
+    plus_a = column("owner_id") == pg_placeholder(
+        "ctx:owner_id", type_=String, transform=lambda v: v
+    )
+    plus_b = column("owner_id") == pg_placeholder(
+        "ctx:owner_id", type_=String, transform=lambda v: v + 100
+    )
+    # the Codex case: two DISTINCT transforms over the same source never converge
+    assert key(plus_a) != key(plus_b)
+    # a transform vs no transform stays distinct too
+    assert key(plain) != key(plus_a)
+
+    # but the SAME transform object over the same source DOES still converge, so legit dedup
+    # (two fields sharing one scoping fn fold into one statement) is preserved.
+    def shared(v):
+        return v + 100
+
+    one = column("owner_id") == pg_placeholder(
+        "ctx:owner_id", type_=String, transform=shared
+    )
+    two = column("owner_id") == pg_placeholder(
+        "ctx:owner_id", type_=String, transform=shared
+    )
+    assert key(one) == key(two)
 
 
 def test_connection_predicate_participates_in_key():

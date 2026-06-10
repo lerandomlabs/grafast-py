@@ -322,7 +322,8 @@ def test_mixed_literal_and_placeholder_keys_per_predicate():
     # a_sig[0] is the leading customizer identity (None here — no resource customizer); the
     # per-predicate keys follow.
     assert a_sig[0] is None
-    assert a_sig[1] == "status = <<ph:var:status>>|ph=['var:status']"
+    # the |ph= suffix is the sorted (source-tag, transform-identity) tags; no transform -> None.
+    assert a_sig[1] == "status = <<ph:var:status>>|ph=(('var:status', None),)"
     assert a_sig[2] == "title = 'alpha'"
     assert "published" not in a_sig[1]  # the placeholder value never enters its key
 
