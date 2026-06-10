@@ -655,14 +655,15 @@ def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
         return None
     # structural-divergence guard: a resource select_customizer whose predicate SHAPE depends on
     # the request (it branches its STRUCTURE on context — e.g. no filter for an admin vs a scoped
-    # filter for a user) would otherwise let this HIT reuse the FIRST request's structure. Re-resolve
-    # each customizer-bearing step against THIS request; a STRUCTURAL change forces a re-plan (a
-    # miss). A value-only change is NOT a divergence — the placeholder re-binds per request, so a
-    # well-behaved value-varying customizer still hits. Duck-typed: core takes no pg import (the
-    # method lives on the pg step; a non-pg step never carries it).
-    for step in cached.plan.steps:
-        matches = getattr(step, "customizer_structure_matches", None)
-        if matches is not None and not matches():
+    # filter for a user) would otherwise let this HIT reuse the FIRST request's structure. Validate
+    # the STORE-time structure snapshot (captured over ALL customizer-bearing steps, not just the
+    # survivors) against THIS request; a STRUCTURAL change forces a re-plan (a miss). A value-only
+    # change is NOT a divergence — the placeholder re-binds per request, so a well-behaved
+    # value-varying customizer still hits. The snapshot closes the escape where a customizer step
+    # merged/inlined out of plan.steps between store and hit (it would vanish from the surviving-step
+    # walk). Duck-typed: each snapshot exposes still_matches(); core takes no pg import.
+    for structure in cached.customizer_structures:
+        if not structure.still_matches():
             return None
     # the SHARED triple is read-only at execute (no per-request value lives on it); each request
     # carries its OWN source map, so no copy is needed (the deepcopy-free hit path).
@@ -692,8 +693,34 @@ def store_cached_plan(
             root_step=root_step,
             plan=plan,
             schema=context.schema,
+            # belt-and-suspenders: freeze every customizer-bearing step's structure NOW, so the
+            # on-hit guard validates a stored snapshot rather than re-deriving it from the surviving
+            # plan.steps — a customizer step that later merges/inlines out of plan.steps still gets
+            # re-checked. Duck-typed (capture_customizer_structure lives on the pg step; a non-pg
+            # step never carries it), so core takes no pg/sqlalchemy import.
+            customizer_structures=capture_customizer_structures(plan),
         ),
     )
+
+
+def capture_customizer_structures(plan) -> tuple:
+    """The store-time structure snapshot of every customizer-bearing step in ``plan``.
+
+    Each pg select/connection step exposes ``capture_customizer_structure`` (duck-typed: a non-pg
+    step never carries it), returning a portable shape snapshot or ``None`` when it has no resource
+    customizer. The non-``None`` snapshots are stored on the ``CachedPlan`` and re-validated on every
+    hit, so a customizer step that optimization removed from ``plan.steps`` cannot escape the
+    structural-divergence guard. Returns an empty tuple for an operation with no customizer.
+    """
+    captures = []
+    for step in plan.steps:
+        capture = getattr(step, "capture_customizer_structure", None)
+        if capture is None:
+            continue
+        structure = capture()
+        if structure is not None:
+            captures.append(structure)
+    return tuple(captures)
 
 
 def _process_cache():

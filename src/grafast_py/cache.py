@@ -99,12 +99,24 @@ class CachedPlan(NamedTuple):
     garbage-collected, so a freed schema's old ``id`` could alias a new schema; the ``is``
     re-check turns such a stale-``id`` collision into a miss (the holder also pins the schema,
     which is fine — schemas are long-lived).
+
+    ``customizer_structures`` is a STORE-time snapshot of every customizer-bearing step's
+    value-agnostic predicate shape — the belt-and-suspenders for the cache-hit structural-
+    divergence guard. The on-hit guard otherwise re-derives the shape from the SURVIVING
+    ``plan.steps``, so a customizer-bearing step that dedup-merged / inlined / tree-shook out of
+    ``plan.steps`` between store and hit would escape it and let a later differing-context request
+    inherit the planning request's customizer-decided structure. Snapshotting the shape here makes
+    the guard independent of which steps survived optimization. The entries are duck-typed (each
+    exposes a zero-arg ``still_matches()`` re-resolving its resource customizer against the current
+    request), so the sqlalchemy-free core stores + iterates them without importing the pg stack.
+    Empty for an operation with no customizer-bearing step (the common case).
     """
 
     object_plan: Any
     root_step: Any
     plan: Any
     schema: Any = None
+    customizer_structures: Tuple[Any, ...] = ()
 
 
 # the plan-affecting GrafastConfig fields folded into the cache key: a plan built under one

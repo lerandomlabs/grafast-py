@@ -37,7 +37,18 @@ source-tagged bind (see :mod:`grafast_py.pg.placeholders`).
 """
 
 import collections.abc
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from sqlalchemy import literal_column
 from sqlalchemy.dialects import postgresql
@@ -310,6 +321,41 @@ def predicate_bakes_literal(predicate: ColumnElement) -> bool:
     return False
 
 
+class CapturedCustomizerStructure(NamedTuple):
+    """A store-time snapshot of one customizer-bearing step's value-agnostic predicate shape.
+
+    The belt-and-suspenders counterpart to the on-hit ``customizer_structure_matches`` walk over
+    the surviving ``plan.steps``: a customizer-bearing step that dedup-merges / inlines / tree-shakes
+    out of ``plan.steps`` between STORE and HIT would escape that walk and let a later differing-
+    context request inherit the planning request's customizer-decided structure. Capturing the
+    shape here, onto the cached plan, makes the guard independent of which steps survived
+    optimization. ``resource`` re-resolves the ``select_customizer`` against the CURRENT request;
+    ``cached_keys`` are the value-agnostic predicate keys the planning request produced.
+    """
+
+    resource: Any
+    cached_keys: Tuple[str, ...]
+
+    def still_matches(self) -> bool:
+        """Whether the resource customizer yields the SAME shape for the CURRENT request.
+
+        Re-resolves the ``select_customizer`` against this request's context and compares the
+        value-agnostic predicate keys to the captured ones — a value-only change keeps the same key
+        (a well-behaved value-varying customizer still hits), a STRUCTURAL change (different columns
+        / predicate count) diverges and forces the caller to re-plan. Mirrors
+        :meth:`PgCustomizable.customizer_structure_matches`, but from the frozen snapshot.
+        """
+        fresh, _ = resolve_customizer_predicates(
+            self.resource.select_customizer,
+            current_pg_request().context,
+            self.resource.select_customizer_arity,
+        )
+        fresh_keys = tuple(
+            predicate_key(p, placeholder_binds_in(p) or None) for p in fresh
+        )
+        return fresh_keys == self.cached_keys
+
+
 class PgCustomizable(Step):
     """Shared customization state for a batched pg select / connection step.
 
@@ -323,10 +369,12 @@ class PgCustomizable(Step):
     this base owns only what is identical across them.
     """
 
-    # True when the resource customizer baked a plan-time LITERAL into the WHERE (so the plan
-    # carries a possibly-per-request value and must not be cached — the cache safety floor reads
-    # this duck-typed). Set on EVERY instance by init_customization, so its absence on a
-    # PgCustomizable would signal a missed init rather than silently defaulting to cacheable.
+    # True when ANY predicate (the resource customizer OR a raw .where()) baked a plan-time
+    # LITERAL into the WHERE (so the plan carries a possibly-per-request value and must not be
+    # cached — the cache safety floor reads this duck-typed). Seeded by init_customization from the
+    # customizer predicates and kept current by add_where for every per-plan .where(), so a literal
+    # baked ANYWHERE trips it. Set on EVERY instance, so its absence on a PgCustomizable would
+    # signal a missed init rather than silently defaulting to cacheable.
     customizer_bakes_literal: bool = False
     # how many of the leading where_predicates came from the resource customizer (the rest are
     # per-plan .where()s); has_literal_customization inspects only these.
@@ -401,9 +449,19 @@ class PgCustomizable(Step):
         ``pg_placeholder``) into ``placeholder_binds`` so :func:`predicate_key` takes the
         value-agnostic key path for this predicate. A predicate with only ordinary literal
         binds adds nothing to the registry, so its key stays the byte-identical literal key.
+
+        A raw ``.where()`` predicate that bakes a plan-time LITERAL (a non-placeholder bind)
+        also trips ``customizer_bakes_literal``: such a value may be the per-request context a
+        host hand-baked (``== info.context["tenant"]``), which the cache key does not see, so a
+        plan carrying it must not be shared across requests. The cacheability floor reads exactly
+        this flag, so a literal-baking ``.where()`` ANYWHERE in the WHERE list — not just the
+        leading customizer prefix — forces the plan non-cacheable (the leak's safety floor). A
+        placeholder-only or static predicate leaves the flag untouched and stays cacheable.
         """
         self.where_predicates.append(check_predicate(predicate))
         self._register_placeholder_binds(predicate)
+        if predicate_bakes_literal(predicate):
+            self.customizer_bakes_literal = True
         self._signature_cache = None
 
     def _register_placeholder_binds(self, predicate: ColumnElement) -> None:
@@ -477,16 +535,16 @@ class PgCustomizable(Step):
         self._signature_cache = None
 
     def has_literal_customization(self) -> bool:
-        """Whether the RESOURCE customizer contributed a plan-time literal (so it can't be cached).
+        """Whether ANY predicate bakes a plan-time literal (so the plan can't be cached).
 
-        Inspects only the leading customizer-origin predicates (not per-plan ``.where()``s):
-        True if any carries a non-placeholder bind. Equivalent to the ``customizer_bakes_literal``
-        flag set at seed time; exposed for tests and as the readable discriminator.
+        Scans the WHOLE WHERE list — the resource-customizer prefix AND every per-plan
+        ``.where()`` — and returns True if any carries a non-placeholder bind. A raw ``.where()``
+        can hand-bake the per-request context just as a 1-arg ``select_customizer`` can, and the
+        cache key sees neither, so a baked literal ANYWHERE forces the plan non-cacheable.
+        Equivalent to the ``customizer_bakes_literal`` flag (which ``add_where`` and the seed both
+        keep in sync); exposed for tests and as the readable discriminator.
         """
-        return any(
-            predicate_bakes_literal(p)
-            for p in self.where_predicates[: self._customizer_predicate_count]
-        )
+        return any(predicate_bakes_literal(p) for p in self.where_predicates)
 
     def customizer_structure_matches(self) -> bool:
         """Whether the resource customizer yields the SAME predicate STRUCTURE for the CURRENT
@@ -516,14 +574,38 @@ class PgCustomizable(Step):
         fresh_keys = tuple(
             predicate_key(p, placeholder_binds_in(p) or None) for p in fresh
         )
-        # the cached customizer-origin predicates (the leading ones) keyed the SAME value-agnostic
-        # way, computed directly from where_predicates (not customization_signature, whose leading
-        # element is the customizer identity, not a predicate key).
-        cached_keys = tuple(
+        return fresh_keys == self.cached_customizer_keys()
+
+    def cached_customizer_keys(self) -> Tuple[str, ...]:
+        """The value-agnostic keys of THIS step's resource-customizer predicates (the leading ones).
+
+        Computed directly from ``where_predicates`` (not ``customization_signature``, whose leading
+        element is the customizer identity, not a predicate key). The per-plan ``.where()``s that
+        follow the customizer prefix are excluded — the structural guard only compares the resource
+        customizer's shape. Used by BOTH the on-hit guard and the stored-structure snapshot, so the
+        two agree byte-for-byte.
+        """
+        return tuple(
             predicate_key(p, placeholder_binds_in(p) or None)
             for p in self.where_predicates[: self._customizer_predicate_count]
         )
-        return fresh_keys == cached_keys
+
+    def capture_customizer_structure(self) -> Optional["CapturedCustomizerStructure"]:
+        """A portable snapshot of this step's customizer structure (or None if uncustomized).
+
+        Captures the resource (to re-resolve its ``select_customizer`` against a later request) and
+        the cached value-agnostic predicate keys, so the cache-hit structural-divergence guard can
+        run from a STORED snapshot rather than re-deriving it from the surviving ``plan.steps``. That
+        closes the escape where a customizer-bearing step is tree-shaken/inlined out of
+        ``plan.steps`` between store and hit: the snapshot is frozen at store time and validated
+        regardless of which steps survived. A step with no resource customizer returns ``None`` (it
+        contributes no structural constraint).
+        """
+        if self.resource.select_customizer is None:
+            return None
+        return CapturedCustomizerStructure(
+            resource=self.resource, cached_keys=self.cached_customizer_keys()
+        )
 
     def where_tree(self, condition: "Condition") -> None:
         """Compile a structured filter :class:`Condition` and AND it onto the batched WHERE.
@@ -734,6 +816,7 @@ __all__ = [
     "structural_placeholder_predicate_key",
     "structural_predicate_key",
     "predicate_bakes_literal",
+    "CapturedCustomizerStructure",
     "ContextSources",
     "PgCustomizable",
     "PgSelectQueryBuilder",

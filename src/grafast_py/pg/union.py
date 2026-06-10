@@ -59,7 +59,12 @@ from sqlalchemy.sql.elements import BindParameter
 from ..core_steps import access
 from ..step_model import Step
 from .connection import connection_needs_total
-from .customize import check_predicate, placeholder_binds_in, predicate_key
+from .customize import (
+    check_predicate,
+    placeholder_binds_in,
+    predicate_bakes_literal,
+    predicate_key,
+)
 from .cursor import decode_keyset_cursor, effective_nulls, encode_keyset_cursor, keyset_where
 from .executor import current_pg_request
 from .ordering import OrderTerm, normalize_order
@@ -171,6 +176,14 @@ class PgUnionAllStep(Step):
     is_sync_and_safe = False
     # NEVER unary: builds + executes a UNION-ALL over the whole bucket (its own batching).
     _is_unary = False
+    # Duck-typed cache safety floor, the same flag a PgCustomizable carries (the union is NOT a
+    # PgCustomizable — it subclasses Step directly — so it cannot inherit it). True when ANY
+    # member where= bakes a plan-time LITERAL: a host that hand-baked the per-request context into
+    # a member predicate (the cache key sees neither) makes the plan value-specific, so the
+    # cacheability floor (plan.py, which reads this duck-typed flag on every step) must refuse to
+    # cache it. Set at construction by scanning the member predicates; a pure-placeholder member
+    # where= leaves it False (its value re-binds per request from source_values).
+    customizer_bakes_literal: bool = False
     # needs the per-request source-tag -> value map (BucketExtra.source_values) to resolve its
     # page-size / cursor / per-member WHERE placeholders into the compiled statement's params at
     # render time (and to digest-validate a variable cursor per request).
@@ -193,6 +206,15 @@ class PgUnionAllStep(Step):
         if not members:
             raise ValueError("a pgUnionAll needs at least one member")
         self.members: Tuple[PgUnionMember, ...] = tuple(members)
+        # cache safety floor: a member where= that bakes a plan-time literal (a host hand-baking
+        # the per-request context, which the cache key never sees) makes the union value-specific.
+        # The union is not a PgCustomizable, so it computes the duck-typed flag the floor reads by
+        # scanning every member predicate; a pure-placeholder member where= leaves it False.
+        self.customizer_bakes_literal = any(
+            predicate_bakes_literal(predicate)
+            for member in self.members
+            for predicate in member.where
+        )
         # the columns present in EVERY member, projected by name in each branch — the
         # selectable shape the order/cursor columns and every interface field read from.
         # Each member additionally NULL-pads the union-wide member-specific columns so the
