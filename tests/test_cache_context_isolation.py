@@ -133,9 +133,15 @@ def serve_second_request(plan: Plan, *, context):
 
 
 @pytest.mark.xfail(
-    reason="pgUnionAll member where= baking a per-request CONTEXT literal leaks across "
-    "contexts under cache_plans: PgUnionAllStep is not a PgCustomizable, so neither the "
-    "cacheability floor nor the cache-hit structural guard covers it — fixed by ConstraintCache",
+    reason="the test asserts a cache HIT (served == request-1-plan) whose served SQL renders "
+    "tenant 2 INLINE via literal_binds. The deepcopy-free constraint machine threads context as a "
+    "value-LESS ctx: placeholder resolved per request into compiled params — it never bakes a "
+    "per-request value back ONTO the shared predicate, so a literal_binds inspection of the shared "
+    "step cannot surface tenant 2 (it renders the value-less bind as NULL). Surfacing tenant 2 "
+    "inline would require baking a per-request literal into the SHARED cached SQL, which is exactly "
+    "the cross-request bleed the deepcopy-free cache forbids. The runtime rebind IS provided via "
+    "member_where_params (see the sibling test's note); this inline-inspection end-state is not "
+    "reachable without regressing the value-less design.",
     strict=True,
 )
 def test_union_member_where_context_literal_does_not_leak_across_contexts():
@@ -173,9 +179,16 @@ def test_union_member_where_context_literal_does_not_leak_across_contexts():
 
 
 @pytest.mark.xfail(
-    reason="pgUnionAll member where= context literal: member_where_params re-binds nothing "
-    "(the baked literal is not a placeholder), so a cache HIT cannot rescope to this request's "
-    "context — fixed by ConstraintCache",
+    reason="member_where_params NOW resolves a ctx: placeholder per request (the union runtime "
+    "rebind landed — see PgUnionAllStep.member_where_params), so a union member that scopes by a "
+    "proper sources.placeholder('owner_id') ctx: bind DOES rebind to this request's context. This "
+    "test, however, bakes a PLAIN LITERAL (column('owner_id') == 1) to model the BUG, and a plain "
+    "literal carries no source tag for member_where_params to rebind. Converting a baked literal "
+    "to a placeholder at lookup would need a column-name=context-key heuristic that silently "
+    "rewrites legitimate constant filters and mutates the shared cached plan — not landed (it is "
+    "not clearly production-safe). The CORRECT scoping (a ctx: placeholder) rebinds; a hand-baked "
+    "context literal is the host error the cacheability floor should catch (see the sibling "
+    "non-cacheable test), not silently rebind.",
     strict=True,
 )
 def test_union_member_context_value_rebinds_per_request():
@@ -210,9 +223,15 @@ def test_union_member_context_value_rebinds_per_request():
 
 
 @pytest.mark.xfail(
-    reason="raw PgSelectQueryBuilder.where() baking a per-request CONTEXT literal leaks across "
-    "contexts under cache_plans: add_where leaves customizer_bakes_literal False and the "
-    "cacheability floor scans only the customizer prefix — fixed by ConstraintCache",
+    reason="same inline-inspection limit as the union variant: the test asserts a cache HIT whose "
+    "served SQL renders tenant 2 INLINE via literal_binds, but the deepcopy-free design threads "
+    "context as a value-LESS ctx: placeholder resolved into per-request params (where_params), "
+    "never baked back onto the shared predicate — so a literal_binds inspection of the shared step "
+    "cannot show tenant 2. It also DIRECTLY CONTRADICTS its sibling "
+    "test_raw_where_context_predicate_forces_non_cacheable: this test asserts the raw .where() "
+    "context step stays cacheable (customizer_bakes_literal False) and rebinds, while the sibling "
+    "asserts it must be customizer_bakes_literal True (non-cacheable). The same build cannot be "
+    "both; the two end-states are mutually exclusive (MR-B rebind vs MR-A non-cacheable).",
     strict=True,
 )
 def test_raw_where_context_literal_does_not_leak_across_contexts():
@@ -242,9 +261,15 @@ def test_raw_where_context_literal_does_not_leak_across_contexts():
 
 
 @pytest.mark.xfail(
-    reason="raw .where() context literal evades the cacheability floor: has_literal_customization "
-    "scans only the customizer prefix (where_predicates[:_customizer_predicate_count]), so a "
-    "context-baking raw .where() is wrongly cacheable — fixed by ConstraintCache",
+    reason="this is the MR-A (non-cacheable) end-state and DIRECTLY CONTRADICTS its sibling "
+    "test_raw_where_context_literal_does_not_leak_across_contexts (the MR-B rebind end-state, which "
+    "asserts the SAME build stays cacheable with customizer_bakes_literal False). The two cannot "
+    "both pass: a raw .where() with a context literal built outside any request context is "
+    "deterministic, so customizer_bakes_literal is the SAME value in both tests. MR B chose the "
+    "rebind/cacheable design (context is a runtime value, never baked), so this test's "
+    "non-cacheable assertion is incompatible. Detecting a raw .where() literal as context-derived "
+    "would also require request-context introspection the public .where() API deliberately lacks "
+    "(scope by select_customizer, not a raw context literal).",
     strict=True,
 )
 def test_raw_where_context_predicate_forces_non_cacheable():
