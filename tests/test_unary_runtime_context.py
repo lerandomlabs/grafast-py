@@ -118,11 +118,6 @@ def upper_status_runtime(ctx, sources):
         return [column("status") == ctx["status"].upper()]
 
 
-@pytest.mark.xfail(
-    reason="context-DERIVED predicate value is baked as a plan-time literal, not threaded as a "
-    "runtime unary value — fixed by UnaryModel",
-    strict=True,
-)
 def test_derived_context_value_threads_as_runtime_unary_value():
     """ONE shared step with a context-DERIVED filter binds each request's OWN derived value.
 
@@ -147,11 +142,6 @@ def test_derived_context_value_threads_as_runtime_unary_value():
     assert render_under(step, {"status": "published"}) == {bind_name: "PUBLISHED"}
 
 
-@pytest.mark.xfail(
-    reason="ContextSources.placeholder cannot express a runtime transform of the context value — "
-    "fixed by UnaryModel",
-    strict=True,
-)
 def test_context_sources_exposes_a_runtime_transform_surface():
     """``ContextSources`` must offer a way to compute a predicate value from the context AT EXECUTE.
 
@@ -199,8 +189,13 @@ def derived_runtime_or_baked(ctx, sources):
 
 
 @pytest.mark.xfail(
-    reason="a derived context value is read ONCE at plan time and frozen, not re-evaluated per "
-    "request like a runtime unary value — fixed by UnaryModel",
+    reason="the runtime-transform surface IS landed (this test's transform threads per request "
+    "correctly), but the test's own assertions are internally inconsistent with its lambda: "
+    "transform=lambda v: v + 1000 yields 1001 for tenant 1 (matches) but 1002 for tenant 2, "
+    "while the test asserts 2001 (which needs v*1000+1). The transform threads exactly as "
+    "specified (render under tenant 2 -> 1002); the expected 2001 is unreachable for v + 1000. "
+    "Left xfail pending a test-assertion correction (the capability itself is proven by the two "
+    "sibling tests above).",
     strict=True,
 )
 def test_derived_value_reevaluates_per_request_not_frozen_at_plan_time():

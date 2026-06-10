@@ -37,7 +37,18 @@ source-tagged bind (see :mod:`grafast_py.pg.placeholders`).
 """
 
 import collections.abc
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from sqlalchemy import literal_column
 from sqlalchemy.dialects import postgresql
@@ -50,7 +61,7 @@ from ..step_model import Step
 from .conditions import Condition, compile_condition
 from .executor import current_pg_request
 from .ordering import OrderTerm
-from .placeholders import pg_placeholder, placeholder_source
+from .placeholders import pg_placeholder, placeholder_source, placeholder_transform
 
 # The bind names the batched skeleton itself owns; a host predicate may not reuse them
 # (it would shadow the skeleton's own value at execute time).
@@ -279,7 +290,13 @@ class ContextSources:
     serving the first request's baked literal.
     """
 
-    def placeholder(self, key: str, *, type_: Optional[Any] = None) -> BindParameter:
+    def placeholder(
+        self,
+        key: str,
+        *,
+        type_: Optional[Any] = None,
+        transform: Optional[Callable[[Any], Any]] = None,
+    ) -> BindParameter:
         """A value-LESS placeholder whose value is ``context[key]``, read per request at execute.
 
         ``key`` names the per-request context entry to bind, read at execute from
@@ -287,11 +304,59 @@ class ContextSources:
         ``getattr(context, key)``); ``type_`` is the column's SQLAlchemy type, so the injected
         value is cast correctly. No value is taken here — the plan stays value-independent and the
         value rides the compiled statement's params per request, resolved by the ``ctx:<key>``
-        source tag. A derived/transformed scoping value (not a bare context entry) is not
-        expressible this way; expose it under its own context key, or use the 1-arg form (which
-        inlines a literal and is non-cacheable).
+        source tag.
+
+        ``transform`` is an optional PURE callable applied to the resolved context value AT
+        RENDER time (``transform(context[key])``), so a context-DERIVED scoping value
+        (``status.upper()``, ``tenant + 1000``) rides a value-AGNOSTIC bind whose value is
+        computed PER REQUEST — the predicate STRUCTURE is fixed once at plan time while the
+        DERIVED value is computed per request, the grafast-py analogue of upstream
+        ``lambda($context, fn)`` feeding a predicate. The bind stays value-LESS (the plan stays
+        cacheable), so a cache HIT re-computes each request's OWN derived value rather than
+        serving the first request's baked literal. Without ``transform`` the bare context value
+        is bound unchanged.
         """
-        return pg_placeholder(f"ctx:{key}", type_=type_)
+        return pg_placeholder(f"ctx:{key}", type_=type_, transform=transform)
+
+
+class CustomizerConstraint(NamedTuple):
+    """A recorded structural CONSTRAINT a cached plan validates against the per-request context.
+
+    The grafast-py analogue of an upstream context :class:`Constraint` (built from a plan-time
+    capture, re-checked on a cache hit): it pins the VALUE-AGNOSTIC predicate-shape a resource
+    ``select_customizer`` resolved to for the BUILDING request. On a HIT, :meth:`matches`
+    re-invokes the SAME customizer against THIS request's context and compares the fresh
+    predicate-shape keys to the captured ones — so a STRUCTURAL divergence (different columns /
+    predicate count: an admin's no-filter vs a user's scoped filter) is a guaranteed cache MISS,
+    while a value-only change (a placeholder bound to a different per-request value, same shape)
+    still hits. Captured from ALL customizer-bearing steps at store time — including any that
+    merged or shook out of ``plan.steps`` — so the validation is INDEPENDENT of optimization.
+
+    ``customizer`` is the resource ``select_customizer`` callable (re-invoked per hit); ``arity``
+    is its 1-arg / 2-arg form; ``keys`` are the captured value-agnostic predicate keys.
+    """
+
+    customizer: Callable[..., Sequence[Any]]
+    arity: int
+    keys: Tuple[str, ...]
+
+    def matches(self) -> bool:
+        """Whether re-resolving the customizer under THIS request yields the captured shape.
+
+        Re-invokes the (pure) customizer against ``current_pg_request().context`` — read here,
+        not passed in, so the core cache lookup stays pg/sqlalchemy-free (it calls this duck-typed
+        like the surviving-step guard) — and compares the fresh value-agnostic predicate keys to
+        the captured ``keys``. Equal -> the structure is unchanged (a value-only difference rides
+        the placeholders, so the cache HIT is correct); different -> a structural divergence, so
+        the caller treats the hit as a MISS and re-plans.
+        """
+        fresh, _ = resolve_customizer_predicates(
+            self.customizer, current_pg_request().context, self.arity
+        )
+        fresh_keys = tuple(
+            predicate_key(p, placeholder_binds_in(p) or None) for p in fresh
+        )
+        return fresh_keys == self.keys
 
 
 def predicate_bakes_literal(predicate: ColumnElement) -> bool:
@@ -361,6 +426,11 @@ class PgCustomizable(Step):
         # byte-identical value-included literal key. Seed it from any predicates passed in
         # (a resource customizer could itself build a placeholder, though that is unusual).
         self.placeholder_binds: Dict[str, str] = {}
+        # parallel registry of bind NAME -> render-time transform (a pure callable), for the
+        # placeholders built with ``transform=`` (a context-DERIVED scoping value). EMPTY for a
+        # bare placeholder, so where_params binds the resolved value unchanged; populated
+        # alongside placeholder_binds so the render seam can apply the transform per request.
+        self.placeholder_transforms: Dict[str, Callable[[Any], Any]] = {}
         for predicate in self.where_predicates:
             self._register_placeholder_binds(predicate)
         # the customization_signature tuple is content-derived and read by BOTH peer_key
@@ -412,9 +482,17 @@ class PgCustomizable(Step):
         Registers those of the predicate's binds carrying a placeholder source tag (a
         ``pg_placeholder``); ordinary literal binds carry none and are skipped, so the
         registry holds ONLY placeholder binds. A bind name is unique per ``pg_placeholder``
-        call, so no two placeholders collide in the registry.
+        call, so no two placeholders collide in the registry. A bind built with ``transform=``
+        also records its render-time transform in ``placeholder_transforms`` so the render seam
+        can apply it (``transform(context[key])``) per request.
         """
         self.placeholder_binds.update(placeholder_binds_in(predicate))
+        for bind in visitors.iterate(predicate):
+            if not isinstance(bind, BindParameter):
+                continue
+            transform = placeholder_transform(bind)
+            if transform is not None:
+                self.placeholder_transforms[bind.key] = transform
 
     def where_params(self, source_values: Mapping[str, Any]) -> Dict[str, Any]:
         """The execute-time params for this step's WHERE placeholder binds (name -> value).
@@ -450,9 +528,14 @@ class PgCustomizable(Step):
             if source.startswith("ctx:"):
                 key = source[len("ctx:") :]
                 if isinstance(context, collections.abc.Mapping):
-                    params[name] = context[key]
+                    value = context[key]
                 else:
-                    params[name] = getattr(context, key)
+                    value = getattr(context, key)
+                # a context-DERIVED placeholder (built with transform=) computes its value PER
+                # REQUEST from the resolved context value, so one shared plan serves every context
+                # — the value-agnostic runtime bind, never a plan-time-baked derived literal.
+                transform = self.placeholder_transforms.get(name)
+                params[name] = transform(value) if transform is not None else value
             else:
                 params[name] = source_values.get(source)
         return params
@@ -472,6 +555,7 @@ class PgCustomizable(Step):
         """
         self.where_predicates = list(other.where_predicates)
         self.placeholder_binds = dict(other.placeholder_binds)
+        self.placeholder_transforms = dict(other.placeholder_transforms)
         self.customizer_bakes_literal = other.customizer_bakes_literal
         self._customizer_predicate_count = other._customizer_predicate_count
         self._signature_cache = None
@@ -524,6 +608,29 @@ class PgCustomizable(Step):
             for p in self.where_predicates[: self._customizer_predicate_count]
         )
         return fresh_keys == cached_keys
+
+    def customizer_constraint(self) -> Optional["CustomizerConstraint"]:
+        """The optimization-INDEPENDENT structural-divergence CONSTRAINT for this step, or None.
+
+        The grafast-py analogue of an upstream context :class:`Constraint`: a record of the
+        value-agnostic predicate-shape this step's resource ``select_customizer`` resolved to
+        for the BUILDING request, captured so a cache-HIT can re-validate the SAME customizer
+        against THIS request — INDEPENDENT of whether the step survived dedup/tree-shake. The
+        on-hit surviving-step walk (:meth:`customizer_structure_matches`) misses a customizer
+        step that merged or shook out of ``plan.steps``; capturing this constraint at STORE time
+        (over the pre-optimization step set) and re-validating the whole list on hit closes that
+        escape. Returns ``None`` for a step with no resource customizer (nothing to diverge on).
+        """
+        customizer = self.resource.select_customizer
+        if customizer is None:
+            return None
+        cached_keys = tuple(
+            predicate_key(p, placeholder_binds_in(p) or None)
+            for p in self.where_predicates[: self._customizer_predicate_count]
+        )
+        return CustomizerConstraint(
+            customizer, self.resource.select_customizer_arity, cached_keys
+        )
 
     def where_tree(self, condition: "Condition") -> None:
         """Compile a structured filter :class:`Condition` and AND it onto the batched WHERE.
@@ -735,6 +842,7 @@ __all__ = [
     "structural_predicate_key",
     "predicate_bakes_literal",
     "ContextSources",
+    "CustomizerConstraint",
     "PgCustomizable",
     "PgSelectQueryBuilder",
     "resolve_customizer_predicates",

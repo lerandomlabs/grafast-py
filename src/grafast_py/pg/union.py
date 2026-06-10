@@ -38,6 +38,7 @@ ride :func:`grafast_py.pg.customize.predicate_key` exactly like a select's custo
 two unions whose branches differ only by a filter VALUE never merge.
 """
 
+import collections.abc
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -67,6 +68,7 @@ from .placeholders import (
     Placeholder,
     placeholder_source,
     placeholder_source_tag,
+    placeholder_transform,
     resolve_placeholder,
 )
 from .resource import PgResource
@@ -430,19 +432,46 @@ class PgUnionAllStep(Step):
         (not ``PgCustomizable``), so it gathers its own placeholder params: each member's
         per-branch ``where`` predicate may carry value-LESS ``pg_placeholder`` binds, whose
         runtime value is supplied per request in the compiled statement's ``params`` (keyed by
-        the bind name, resolved by its source tag against ``source_values``) rather than baked
-        on the SHARED bind. A union with only literal member predicates returns ``{}``. The same
-        bind names appear in BOTH the page leg and the count leg (the union rebuilds the same
-        member predicates each render), so these params serve both.
+        the bind name, resolved by its source tag) rather than baked on the SHARED bind. A union
+        with only literal member predicates returns ``{}``. The same bind names appear in BOTH
+        the page leg and the count leg (the union rebuilds the same member predicates each
+        render), so these params serve both.
+
+        Each placeholder bind resolves by its stable SOURCE tag, exactly like
+        :meth:`PgCustomizable.where_params`:
+
+        * a ``var:`` source (a GraphQL ``$variable``) resolves from ``source_values``;
+        * a ``ctx:`` source (a request-context scoping value — the union analogue of a resource
+          ``select_customizer``) resolves from THIS request's context, read FRESH per request, so
+          a cache HIT over the SHARED union binds THIS request's context value rather than the one
+          the plan was built with. A context-DERIVED placeholder (built with ``transform=``)
+          computes ``transform(context[key])`` per request. ``current_pg_request()`` is touched
+          only when a ``ctx:`` bind is actually present (so var:-only unions and no-request unit
+          tests are unchanged).
         """
         params: Dict[str, Any] = {}
+        context = _UNSET
         for member in self.members:
             for predicate in member.where:
                 for bind in visitors.iterate(predicate):
                     if not isinstance(bind, BindParameter):
                         continue
                     source = placeholder_source(bind)
-                    if source is not None:
+                    if source is None:
+                        continue
+                    if source.startswith("ctx:"):
+                        if context is _UNSET:
+                            context = current_pg_request().context
+                        key = source[len("ctx:") :]
+                        if isinstance(context, collections.abc.Mapping):
+                            value = context[key]
+                        else:
+                            value = getattr(context, key)
+                        transform = placeholder_transform(bind)
+                        params[bind.key] = (
+                            transform(value) if transform is not None else value
+                        )
+                    else:
                         params[bind.key] = source_values.get(source)
         return params
 

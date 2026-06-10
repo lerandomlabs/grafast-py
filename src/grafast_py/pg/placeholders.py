@@ -37,7 +37,7 @@ and which are ordinary literals (value-included).
 """
 
 import itertools
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from sqlalchemy import bindparam
 from sqlalchemy.sql.elements import BindParameter
@@ -131,6 +131,15 @@ def placeholder_source_tag(value: Any) -> Optional[str]:
 # annotation) so it survives the predicate as the host hands it over, before any compile.
 PLACEHOLDER_SOURCE_ATTR = "_grafast_placeholder_source"
 
+# A side attribute carrying a placeholder's optional RUNTIME TRANSFORM — a pure callable
+# applied to the resolved source value AT RENDER time (``transform(context[key])``), so a
+# context-DERIVED scoping value (``status.upper()``, ``tenant + 1000``) rides a value-AGNOSTIC
+# bind whose value is computed PER REQUEST rather than baked as a plan-time literal. The bind
+# stays value-LESS (its STRUCTURE is fixed at plan time, like a bare ``ctx:`` placeholder); the
+# transform is the grafast-py analogue of upstream ``lambda($context, fn)`` feeding a predicate.
+# Absent on a bare placeholder (the resolved value passes through unchanged).
+PLACEHOLDER_TRANSFORM_ATTR = "_grafast_placeholder_transform"
+
 # Per-process counter giving every placeholder bindparam a UNIQUE bind NAME, so two
 # placeholders in one statement (or two predicates sharing a source) never collide on the
 # compiled `%(name)s` param. The name is execution-only plumbing; the dedup key uses the
@@ -139,7 +148,13 @@ PLACEHOLDER_SOURCE_ATTR = "_grafast_placeholder_source"
 _placeholder_counter = itertools.count()
 
 
-def pg_placeholder(source: str, value: Any = None, *, type_: Optional[Any] = None) -> BindParameter:
+def pg_placeholder(
+    source: str,
+    value: Any = None,
+    *,
+    type_: Optional[Any] = None,
+    transform: Optional[Callable[[Any], Any]] = None,
+) -> BindParameter:
     """Build a source-tagged, value-LESS placeholder bindparam for a WHERE predicate.
 
     ``source`` is the STABLE source tag the dedup key discriminates by — for a
@@ -155,6 +170,14 @@ def pg_placeholder(source: str, value: Any = None, *, type_: Optional[Any] = Non
     SQLAlchemy type for the column (the host owns the column type; the engine never guesses
     it), forwarded to ``bindparam`` so the injected value is adapted/cast correctly.
 
+    ``transform`` is an optional PURE callable applied to the resolved source value AT RENDER
+    time (``transform(context[key])``): a context-DERIVED scoping value (``status.upper()``,
+    ``tenant + 1000``) thus rides a value-AGNOSTIC bind whose value is computed PER REQUEST,
+    never baked as a plan-time literal. The bind stays value-LESS — its STRUCTURE is fixed at
+    plan time exactly like a bare placeholder — and the transform is the grafast-py analogue of
+    upstream ``lambda($context, fn)`` feeding a predicate. It runs in the render seam
+    (``where_params`` / ``member_where_params``), so it must stay pure (no I/O, no side effects).
+
     The bind is built with ``required=False`` so :func:`grafast_py.pg.customize.check_predicate`
     accepts it (a value-less ``required=True`` bind would be rejected as "unbound"); the value
     rides ``params`` at execute, never the bind. The returned bind has a UNIQUE name (so two
@@ -168,6 +191,8 @@ def pg_placeholder(source: str, value: Any = None, *, type_: Optional[Any] = Non
     name = f"grafast_ph_{next(_placeholder_counter)}"
     bind = bindparam(name, type_=type_, required=False)
     setattr(bind, PLACEHOLDER_SOURCE_ATTR, source)
+    if transform is not None:
+        setattr(bind, PLACEHOLDER_TRANSFORM_ATTR, transform)
     return bind
 
 
@@ -182,10 +207,24 @@ def placeholder_source(bind: BindParameter) -> Optional[str]:
     return getattr(bind, PLACEHOLDER_SOURCE_ATTR, None)
 
 
+def placeholder_transform(bind: BindParameter) -> Optional[Callable[[Any], Any]]:
+    """Return the render-time transform of a placeholder bindparam, or ``None``.
+
+    A placeholder built with ``transform=`` carries a pure callable on
+    :data:`PLACEHOLDER_TRANSFORM_ATTR`; the render seam applies it to the resolved source
+    value (``transform(context[key])``) so a context-DERIVED value is computed per request. A
+    bare placeholder (or an ordinary literal bind) carries none, so the resolved value passes
+    through unchanged.
+    """
+    return getattr(bind, PLACEHOLDER_TRANSFORM_ATTR, None)
+
+
 __all__ = [
     "PLACEHOLDER_SOURCE_ATTR",
+    "PLACEHOLDER_TRANSFORM_ATTR",
     "pg_placeholder",
     "placeholder_source",
+    "placeholder_transform",
     "Placeholder",
     "resolve_placeholder",
     "placeholder_source_tag",
