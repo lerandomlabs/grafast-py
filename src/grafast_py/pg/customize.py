@@ -61,7 +61,12 @@ from ..step_model import Step
 from .conditions import Condition, compile_condition
 from .executor import current_pg_request
 from .ordering import OrderTerm
-from .placeholders import pg_placeholder, placeholder_source, placeholder_transform
+from .placeholders import (
+    pg_placeholder,
+    placeholder_source,
+    placeholder_transform,
+    transform_key,
+)
 
 # The bind names the batched skeleton itself owns; a host predicate may not reuse them
 # (it would shadow the skeleton's own value at execute time).
@@ -228,12 +233,14 @@ def sentinel_placeholders(predicate: ColumnElement) -> ColumnElement:
     :func:`placeholder_predicate_key`).
 
     A placeholder built with ``transform=`` renders ``transform(value)`` at execute, so the
-    transform is part of its IDENTITY: the token is suffixed with the transform identity
-    (``<<ph:<source>|t=<id>>>``). This positions the transform WITH its source, so the same
-    source at two columns with DIFFERENT transforms (or the same two SWAPPED across columns)
-    yields DISTINCT tokens and never dedup-merges. ``id`` is closure-safe (two lambdas closing
-    over different values are distinct objects) and the dedup key is WITHIN-plan only — never the
-    cross-request cache fingerprint (see :mod:`grafast_py.cache`) — so process-local id is sound.
+    transform is part of its IDENTITY: the token is suffixed with a cache-STABLE transform key
+    (``<<ph:<source>|t=<key>>>``, see :func:`grafast_py.pg.placeholders.transform_key`). This
+    positions the transform WITH its source — the same source at two columns with DIFFERENT
+    transforms (or the same two SWAPPED across columns) yields DISTINCT tokens and never
+    dedup-merges. The key is code-object based (not ``id``): a 2-arg ``select_customizer`` is
+    re-invoked to revalidate its constraints on every cache-hit, minting a fresh transform object,
+    so an id-based token would never match the stored key and would silently disable plan caching
+    for any customizer using a transform.
     """
 
     def replace(element: Any) -> Optional[ColumnElement]:
@@ -244,7 +251,7 @@ def sentinel_placeholders(predicate: ColumnElement) -> ColumnElement:
                 token = (
                     f"<<ph:{source}>>"
                     if transform is None
-                    else f"<<ph:{source}|t={id(transform)}>>"
+                    else f"<<ph:{source}|t={transform_key(transform)}>>"
                 )
                 return literal_column(token)
         return None

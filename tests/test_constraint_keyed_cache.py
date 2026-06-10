@@ -172,6 +172,34 @@ def test_constraint_structural_divergence_is_a_miss():
         assert constraints_match((constraint,)) is False
 
 
+def transform_customizer(ctx, sources):
+    """A value-only customizer scoping by a DERIVED (``transform=``) context value."""
+    return [
+        column("owner_id")
+        == sources.placeholder("owner_id", type_=String, transform=lambda v: v + 100)
+    ]
+
+
+def test_constraint_with_transform_customizer_still_matches_on_reinvocation():
+    """A customizer using a ``transform=`` placeholder must still MATCH on a cache-hit re-validation.
+
+    ``matches()`` re-invokes the customizer, minting a FRESH transform lambda each time. The dedup
+    key must be cache-STABLE (code-object based, not ``id``) so the recomputed key equals the
+    stored one — otherwise every request using a transform customizer is a false MISS and
+    ``cache_plans`` silently degrades to a re-plan. Regression for the id()-instability cache
+    degradation (this is the exact ``CustomizerConstraint.matches()`` path that re-resolves the
+    customizer on a hit).
+    """
+    predicates, _ = resolve_customizer_predicates(transform_customizer, {"owner_id": 1}, 2)
+    keys = tuple(
+        predicate_key(p, placeholder_binds_in(p) or None) for p in predicates
+    )
+    constraint = CustomizerConstraint(transform_customizer, 2, keys)
+    with pg_request_context(_Exec(), context={"owner_id": 9}):
+        assert constraint.matches() is True
+        assert constraints_match((constraint,)) is True
+
+
 def test_empty_constraint_list_matches_trivially():
     """A plan with no context-scoping customizer carries no constraints and always matches."""
     assert constraints_match(()) is True

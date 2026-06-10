@@ -219,12 +219,33 @@ def placeholder_transform(bind: BindParameter) -> Optional[Callable[[Any], Any]]
     return getattr(bind, PLACEHOLDER_TRANSFORM_ATTR, None)
 
 
+def transform_key(fn: Callable[[Any], Any]) -> str:
+    """A cache-STABLE identity for a placeholder transform callable (for the dedup/sentinel key).
+
+    ``id(fn)`` is NOT usable here: a 2-arg ``select_customizer`` is re-invoked on every cache-hit
+    to revalidate its constraints, minting a FRESH function object each time, so an id-based key
+    would never match the stored key and would silently disable plan caching for any customizer
+    using a ``transform=``. The code object, by contrast, is created once at def-time and SHARED
+    across invocations, so it is stable. The closure cell values are folded in so two lambdas at
+    the SAME source line capturing DIFFERENT values still differ (and a transform that closes over
+    per-request state correctly fails to match across requests, forcing a safe re-plan rather than
+    reusing the first request's captured value). A builtin/C callable with no ``__code__``
+    (``str.upper``) keys by its qualified name.
+    """
+    code = getattr(fn, "__code__", None)
+    if code is None:
+        return f"{getattr(fn, '__module__', '')}.{getattr(fn, '__qualname__', repr(fn))}"
+    closure = tuple(repr(cell.cell_contents) for cell in (fn.__closure__ or ()))
+    return f"{code.co_filename}:{code.co_firstlineno}:{code.co_name}:{closure!r}"
+
+
 __all__ = [
     "PLACEHOLDER_SOURCE_ATTR",
     "PLACEHOLDER_TRANSFORM_ATTR",
     "pg_placeholder",
     "placeholder_source",
     "placeholder_transform",
+    "transform_key",
     "Placeholder",
     "resolve_placeholder",
     "placeholder_source_tag",

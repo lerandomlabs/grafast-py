@@ -513,6 +513,27 @@ def test_same_source_swapped_transforms_do_not_dedup():
     assert key(p_ab) != key(p_ba)
 
 
+def test_transform_placeholder_key_is_stable_across_reinvocation():
+    """A ``select_customizer`` is re-invoked on every cache-hit to revalidate its constraints,
+    minting a FRESH transform object each time; the dedup key must be STABLE (code-object based,
+    not ``id``) so the recomputed key matches the stored one — otherwise ``cache_plans`` silently
+    degrades to a re-plan for every request using a transform customizer.
+
+    Two predicates built by re-invoking the same factory (same lambda source) must produce the
+    IDENTICAL key. Regression for the id()-instability cache degradation.
+    """
+
+    def make():  # one factory, re-invoked -> a fresh lambda object sharing the same code object
+        return column("k") == pg_placeholder(
+            "ctx:k", type_=String, transform=lambda v: v + 100
+        )
+
+    def key(predicate):
+        return predicate_key(predicate, placeholder_binds_in(predicate) or None)
+
+    assert key(make()) == key(make())
+
+
 def test_connection_predicate_participates_in_key():
     """Customization folds into the connection step's dedup key too."""
     a = PgConnectionStep(
