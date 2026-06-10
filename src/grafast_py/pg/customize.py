@@ -737,8 +737,10 @@ class PgSelectQueryBuilder:
         across requests of the same document — both are safe under ``cache_plans``. Do NOT inline
         the per-request CONTEXT into a ``.where()`` (e.g. ``== info.context["tenant"]``): the cache
         key does not see the context, so a later request of the same document would reuse this
-        request's baked value. Scope by request context with the resource ``select_customizer``
-        (which IS cache-safe — see :func:`resolve_customizer_predicates`), never a raw ``.where()``.
+        request's baked value — a cross-tenant leak. Scope by request context with a value-LESS
+        ``pg_placeholder("ctx:<key>")`` (resolved per request at execute — see
+        :mod:`grafast_py.pg.placeholders`) or the resource ``select_customizer`` (which IS
+        cache-safe — see :func:`resolve_customizer_predicates`), never a hand-baked context literal.
         """
         self._step.add_where(check_predicate(predicate))
         return self

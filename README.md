@@ -573,6 +573,43 @@ Two opt-in flags (both default **OFF**) let a host reuse a plan across requests:
   `GrafastConfig(plan_cache=PlanCache(max_entries=...))`), so an adversarial stream of unique
   documents cannot grow it without bound.
 
+### ⚠️ Cache-safety: never bake a per-request value (the one contract you must honour)
+
+`cache_plans` keys a plan by **document text** (plus schema / operation / variable-arg fingerprint) —
+**not** by your request context. So any *per-request* value — a tenant id, a user id, an RLS scope
+read from `info.context` — that you **bake as a literal** into the SQL is frozen into the *shared*
+cached plan, and the next request for the same document (a **different tenant**) is served that first
+request's value. That is a **cross-tenant data leak**. The rule is one line:
+
+**Scope by a placeholder, never by a baked context literal.**
+
+```python
+from grafast_py.pg import pg_placeholder
+
+# ❌ LEAKS under cache_plans: the literal 42 is frozen into the shared plan
+step.builder().where(column("tenant_id") == info.context["tenant_id"])
+
+# ✅ SAFE + cacheable: value-LESS, re-bound to THIS request's context[...] at execute (fails LOUD
+#    if the key is missing — never a silent `col = NULL` that would widen the scope)
+step.builder().where(column("tenant_id") == pg_placeholder("ctx:tenant_id"))
+```
+
+Two paths are **auto-protected** for you: a resource `customizer(context)` that bakes a literal, and
+an inlined `$variable`, are both detected and forced **non-cacheable** (that plan just re-plans every
+request). But a raw `.builder().where(...)` predicate and a `pgUnionAll` member `where=` are **not**
+inspected — and that is deliberate. By the time the engine sees `column == 42`, the value has already
+evaluated in Python, so a per-request `context["tenant_id"]` is **indistinguishable** from a safe
+constant like `status == "published"`; auto-rejecting *every* literal would force you to wrap harmless
+constants in placeholders too. So on those two paths the contract is **yours to honour**.
+
+> The proper fix — *tracking* context reads at the source so the engine can tell a context value from
+> a constant automatically (the way upstream Grafast's tracked-value steps do), and so keep constants
+> cacheable while catching context-bakes for free — is a planned follow-up. Until then: use the
+> placeholder.
+
+This only bites under `cache_plans=True`; with caching off, every request re-plans and a baked literal
+is correct (just not reused).
+
 With both flags off (the default) `plan_operation` never reads or writes the cache and
 `FieldArgs.is_variable` is always `False`, so every host falls back to literal inlining and the
 executed plan is **byte-identical** to a build without these features at all.
