@@ -568,17 +568,16 @@ def test_build_hoist_parent_store_fails_loud_when_bridge_missing():
     assert build_hoist_parent_store(plain, None, [0, 1]) is None
 
 
-def test_lambda_is_not_hoisted_for_async_safety():
-    """A LambdaStep is NEVER hoisted, so a constant-fed lambda fires PER ENTRY whether or not
-    hoist is on (``off_n == on_n == 4``), data byte-identical.
+def test_sync_lambda_over_constant_is_run_once():
+    """A SYNC ``lambda_step`` over a request-constant input is computed ONCE and shared, so ``fn``
+    fires exactly once for the whole request (``off_n == on_n == 1``), data byte-identical.
 
-    A lambda is async-capable (``fn`` may be a coroutine function), so its column can hold raw
-    per-entry awaitables; hoisting runs it once in a shallower bucket and the hoist bridge would fan
-    that single coroutine to many child rows — aliasing a single-await awaitable (the @stream path
-    then raises "cannot reuse already awaited coroutine"). The engine cannot statically prove a
-    given ``fn`` is sync, so a lambda is conservatively not hoisted. It keeps the PURITY contract
-    (dedup, the resolver escape hatch); the hoist / run-once OPTIMIZATION is reserved for
-    provably-SYNC steps (filter / access / constant). The call counter is a test instrument only.
+    A sync lambda's value is a CONCRETE result, so it satisfies both share-contracts (pure by
+    contract + sync by inspection): the engine runs it once and copies the result to every row —
+    via the executor run-once (so it holds even with hoist OFF) and/or hoisting. An ASYNC lambda
+    does NOT get this (its result is a per-row coroutine that cannot be shared — see
+    tests/test_unary_model_gaps.py::test_unary_async_lambda_runs_per_entry_not_broadcast and the
+    @stream regression). The call counter is a test instrument only; ``fn``'s return is constant.
     """
     orgs = [{"id": 10}, {"id": 20}]
     people = [{"id": 1}, {"id": 2}]
@@ -620,7 +619,6 @@ def test_lambda_is_not_hoisted_for_async_safety():
     # data byte-identical (pure fn), hoist ON == OFF.
     assert off_tags == [[100, 100], [100, 100]]
     assert on_tags == off_tags
-    # the lambda is NOT hoisted: it fires PER ENTRY (four people) whether hoist is on or off.
-    # (Contrast a SYNC filter, which IS hoisted — see test_pure_filter_over_constant in
-    # tests/test_unary_model_gaps.py.)
-    assert off_n == 4 and on_n == 4
+    # the SYNC lambda is run ONCE for the whole request (concrete value, shared) — whether or not
+    # hoist is on (the executor run-once already collapses it). With the old barrier both were 4.
+    assert off_n == 1 and on_n == 1

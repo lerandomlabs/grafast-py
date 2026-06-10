@@ -18,6 +18,7 @@ two steps with the same class, the same dependency winner ids, the same
 to one, so a value loaded/accessed twice is loaded/accessed once.
 """
 
+import asyncio
 import base64
 import inspect
 import json
@@ -141,34 +142,40 @@ class LambdaStep(Step):
 
     One dependency: the input step (use :func:`list_step` to feed several inputs as a
     tuple). ``execute`` runs ``fn`` over the dependency's whole column in one pass.
-    If ``fn`` is an async function the per-entry results are coroutines; the planner
-    treats lambdas as not sync-and-safe so the executor awaits them. Dedup is by
-    ``fn`` identity (a captured closure is unique, so only the same object merges).
+    If ``fn`` is an async function the per-entry results are coroutines; the executor awaits
+    them. Dedup is by ``fn`` identity (a captured closure is unique, so only the same object
+    merges).
 
-    PURITY CONTRACT: ``fn`` MUST be a deterministic function of its input — the standard
-    Grafast assumption that makes dedup, hoisting, and unary run-once safe. The engine may
-    therefore dedup the step, lift it to a shallower layer, or run it ONCE over a
-    request-constant input and fan the single result to every child. An IMPURE ``fn`` (a
-    counter / uuid / clock / write) is OUT of contract; for genuinely impure or
-    side-effecting per-entry work use a plain resolver field (a :class:`ResolveStep`, which
-    is ``dedupable=False`` and never hoisted or run once) instead of a plan lambda.
+    TWO CONTRACTS govern whether this step may be SHARE-optimized (hoisted, or run once and the
+    result fanned to every row — both compute the value once and hand a COPY to each row):
+
+    * PURITY (semantics): ``fn`` MUST be a deterministic function of its input, so the one shared
+      result equals what per-row would have produced. An IMPURE ``fn`` (counter / uuid / clock /
+      write) is OUT of contract — for impure or side-effecting work use a plain resolver field
+      (a :class:`ResolveStep`, ``dedupable=False``, never shared), not a plan lambda.
+    * SYNC (mechanics): the shared value must be a CONCRETE result, not a coroutine — a coroutine is
+      single-await, so one cannot be copied across rows (the @stream path, completing rows
+      separately, would re-await it and raise "cannot reuse already awaited coroutine"). So the step
+      INSPECTS ``fn`` at construction: a SYNC ``fn`` is hoistable + run-once-able; an ASYNC ``fn`` is
+      neither (it runs per entry, each row getting its own coroutine). For async I/O prefer a LOAD
+      step (:func:`load_one` / :func:`load_many`) — it BATCHES the I/O across all rows (the whole
+      point of the engine) AND is share-safe (its column is resolved to concrete values before any
+      fan-out). An async lambda forgoes both batching and the share-optimization, so it is rarely
+      what you want.
     """
-
-    is_sync_and_safe = False
-    # NOT hoistable: a lambda is async-capable (``fn`` may be a coroutine function), so its column
-    # can hold raw per-entry awaitables. Hoisting runs the step ONCE in a shallower bucket and the
-    # hoist bridge FANS that single column to many child rows — fanning one coroutine to N rows
-    # aliases a single-await awaitable (the @stream path, completing rows separately, then raises
-    # "cannot reuse already awaited coroutine"). The engine cannot statically prove a given ``fn``
-    # is sync (``iscoroutinefunction`` misses a sync fn that returns a coroutine), so a lambda is
-    # conservatively never hoisted. (The run-once sibling of the ``is_sync_and_safe`` gate in
-    # ``_bucket_unariness``: lambdas keep the PURITY contract — dedup, the resolver escape hatch —
-    # but the hoist/run-once OPTIMIZATION applies only to provably-sync steps, e.g. filter/access.)
-    hoistable = False
 
     def __init__(self, dep: Step, fn: Callable[[Any], Any]) -> None:
         super().__init__()
         self.fn = fn
+        # share-eligibility decided per ``fn`` (see the class docstring's TWO CONTRACTS): a SYNC fn
+        # yields a concrete value safe to compute once and copy to every row; an ASYNC fn yields a
+        # per-row coroutine (single-await) that cannot be shared, so it is neither hoisted nor run
+        # once. ``asyncio.iscoroutinefunction`` also unwraps ``functools.partial``; the rare blind
+        # spot (a sync fn that RETURNS a coroutine) is caught LOUDLY by the share-point guards in
+        # ``run_steps`` / ``hoist_bridge_for_field`` rather than silently aliasing a coroutine.
+        sync = not asyncio.iscoroutinefunction(fn)
+        self.is_sync_and_safe = sync
+        self.hoistable = sync
         self.add_dependency(dep)
 
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:

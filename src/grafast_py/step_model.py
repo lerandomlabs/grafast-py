@@ -56,9 +56,10 @@ class Step:
     # transforms (constant / access / list / object / first / last / reverse / filter) and the
     # column-resolving batch steps (load / node / each, whose coroutine-of-column run_steps resolves
     # before any fan-out). (Hoisting is SEPARATE from ``_is_unary`` run-once: a load is hoistable but
-    # not unary.) It is the explicit OPT-OUT, set False by a plain resolver (``ResolveStep`` — impure
-    # / side-effecting) AND ``LambdaStep`` (async-capable: its column may hold raw per-entry
-    # coroutines that fan-out would alias across rows — see core_steps).
+    # not unary.) It is the OPT-OUT for un-shareable steps, set False by a plain resolver
+    # (``ResolveStep`` — impure / side-effecting) and, PER INSTANCE, by an ASYNC ``LambdaStep``: a
+    # SYNC lambda stays hoistable, an ASYNC lambda's column holds per-entry coroutines that fan-out
+    # would alias across rows, so ``LambdaStep`` inspects ``fn`` and sets this in ``__init__``.
     hoistable: bool = True
 
     # whether `run_steps` passes the per-bucket-invocation BucketExtra (request context +
@@ -85,11 +86,14 @@ class Step:
     # it once and broadcast entry 0 to every position, with no loud failure.
     _is_unary: bool = True
 
-    # whether this step's ``execute`` is guaranteed SYNC — its column holds concrete values, never a
-    # per-entry awaitable. The concrete steps set this explicitly; the base default is conservative
-    # (False) so a step is run-once-broadcast (`_bucket_unariness`) only when PROVEN sync — otherwise
-    # broadcasting could alias one coroutine across parents (single-await). Run-once is the only
-    # consumer; correctness never depends on a False here, only the run-once optimization does.
+    # whether this step's ``execute`` is guaranteed SYNC — its column holds CONCRETE values, never a
+    # per-entry awaitable. This is the MECHANICS half of share-eligibility (the other half is PURITY):
+    # a value can only be COPIED across rows — broadcast (run-once) or fanned (hoist) — if it is
+    # concrete, because a coroutine is single-await and cannot be shared. The concrete steps set this
+    # on the class; ``LambdaStep`` sets it PER INSTANCE by inspecting ``fn`` (sync vs async). Base
+    # default conservative (False) so a step is shared only when PROVEN sync. Consumed by the run-once
+    # gate (`_bucket_unariness`) and backstopped by the SHARE-POINT GUARDS (in run_steps / the hoist
+    # bridge) that fail LOUDLY if a value being shared is nonetheless awaitable.
     is_sync_and_safe: bool = False
 
     def __init__(self) -> None:
@@ -244,7 +248,7 @@ def run_steps(
                 extra,
             )
         span.__exit__(None, None, None)
-        _store(results, step, count, out, unary)
+        _store(results, step, count, out, unary, is_awaitable)
 
     return results
 
@@ -301,7 +305,7 @@ async def _run_steps_async(
         pending_span.__exit__(None, None, None)
         raise
     pending_span.__exit__(None, None, None)
-    _store(results, pending_step, count, out, pending_unary)
+    _store(results, pending_step, count, out, pending_unary, is_awaitable)
 
     for step in ordered_steps[index + 1 :]:
         unary = unary_here[step.id]
@@ -315,7 +319,7 @@ async def _run_steps_async(
             )
             if is_awaitable(out):
                 out = await out
-        _store(results, step, count, out, unary)
+        _store(results, step, count, out, unary, is_awaitable)
 
     return results
 
@@ -332,7 +336,8 @@ def _gather_cols(results: dict, step: Step, unary: bool) -> List[List[Any]]:
 
 
 def _store(
-    results: dict, step: Step, count: int, out: List[Any], unary: bool = False
+    results: dict, step: Step, count: int, out: List[Any], unary: bool = False,
+    is_awaitable=None,
 ) -> None:
     """Record a step's output column, broadcasting a unary step's single value to `count`.
 
@@ -345,6 +350,17 @@ def _store(
             raise AssertionError(
                 f"unary step {type(step).__name__}#{step.id} returned {len(out)} values"
                 f" (a unary step runs once and must return exactly 1)"
+            )
+        # SHARE-POINT GUARD: the broadcast COPIES this one value to every row, so it must be a
+        # concrete result — a coroutine is single-await and cannot be shared (the @stream path would
+        # re-await it -> "cannot reuse already awaited coroutine"). A run-once step is sync-eligible
+        # by construction; an awaitable here means it lied about sync-ness (the LambdaStep detection
+        # blind spot: a sync fn that RETURNS a coroutine). Fail loudly rather than alias it.
+        if is_awaitable is not None and is_awaitable(out[0]):
+            raise AssertionError(
+                f"run-once step {type(step).__name__}#{step.id} produced an awaitable; a broadcast"
+                f" value must be concrete (an async fn must not be run-once — for async I/O use a"
+                f" load step, which batches AND resolves its column before any fan-out)"
             )
         # broadcast the single value to the bucket: `out * count` stores `count` REFERENCES to the
         # one computed value (not clones) — safe because bucket values are read-only downstream, and

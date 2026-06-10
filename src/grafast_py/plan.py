@@ -963,9 +963,10 @@ def _is_hoistable(
         return False
     # `hoistable` is the OPT-OUT from lifting: pure SYNC transforms (constant / access / filter /
     # ...) and the column-resolving batch steps (load / node / each) may be lifted to fire once and
-    # fan the result. It is set False by a plain resolver (``ResolveStep`` — impure) and by
-    # ``LambdaStep`` (async-capable: its column may hold raw per-entry coroutines that fan-out would
-    # alias across rows). (See `Step.hoistable` / the purity contract.)
+    # fan the result. It is False on a plain resolver (``ResolveStep`` — impure) and on an ASYNC
+    # ``LambdaStep`` instance (set per-fn in its __init__: an async lambda's column holds per-entry
+    # coroutines that fan-out would alias across rows; a sync lambda stays hoistable). See
+    # `Step.hoistable` / `LambdaStep` for the two share-contracts (purity + sync).
     if not step.hoistable:
         return False
     if isinstance(step, (RootStep, ItemStep)):

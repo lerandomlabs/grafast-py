@@ -2,12 +2,12 @@
 
 Under the Grafast PURITY CONTRACT, a plan transform (``lambda_step`` / ``filter_step``) is a
 deterministic function of its input, so over a request-CONSTANT input it is value-constant
-(``_is_unary``); over a per-entry input it narrows to batch. The hoist / run-once OPTIMIZATION,
-however, applies only to provably-SYNC steps (``is_sync_and_safe``) — a ``filter_step`` is sync,
-so it is hoisted and run once; a ``lambda_step`` is async-capable (``fn`` may be a coroutine
-function), so it is NEVER hoisted or run once (fanning one coroutine across rows would alias a
-single-await awaitable, which the @stream path would then double-await). A lambda therefore keeps
-the purity contract (dedup, the resolver escape hatch) but runs per entry.
+(``_is_unary``); over a per-entry input it narrows to batch. SHARE-optimization (hoist / run-once,
+which compute the value once and copy it to every row) needs BOTH purity AND a CONCRETE value —
+a coroutine is single-await and cannot be copied. ``filter_step`` is sync, so it is optimized; a
+``lambda_step`` is decided PER INSTANCE — ``LambdaStep`` inspects ``fn`` and a SYNC lambda is
+optimized while an ASYNC one runs per entry (its result is a per-row coroutine). For async I/O use
+a LOAD step, which batches AND is share-safe. Impure work uses a plain resolver (the escape hatch).
 
 The flags are the explicit IMPURE / side-effecting OPT-OUT: a plain resolver (``ResolveStep``)
 sets ``dedupable=False`` / ``hoistable=False`` / ``_is_unary=False`` so an impure per-entry
@@ -61,47 +61,63 @@ def leaf(key):
     return plan
 
 
-def test_pure_plan_transforms_unary_flag_and_optimization_eligibility():
-    """A lambda / filter over a constant is value-constant (``_is_unary``); only the provably-SYNC
-    filter is eligible for the hoist / run-once optimization. A lambda is async-capable, so it is
-    never hoisted/run-once (fanning one coroutine across rows would alias a single-await awaitable)
-    — it keeps the purity contract (dedup) but not the optimization."""
-    lam_const = lambda_step(constant(5), lambda v: v + 1)
-    filt_const = filter_step(constant([1, 2, 3]), lambda x: x > 1)
-    # both are value-constant over a constant input (the unary flag — the purity contract)
-    assert lam_const._is_unary is True
-    assert filt_const._is_unary is True
-    # but only the SYNC filter is optimization-eligible; the async-capable lambda is not hoistable
-    assert filt_const.hoistable is True
-    assert lam_const.hoistable is False
+def test_share_eligibility_is_per_fn_sync_ness():
+    """Share-eligibility (hoist / run-once) needs BOTH purity AND sync-ness, and ``LambdaStep``
+    decides sync-ness PER INSTANCE by inspecting ``fn``.
+
+    A value can only be shared (computed once, copied to every row) if it is a CONCRETE result —
+    a coroutine is single-await and cannot be copied. So a SYNC ``lambda_step`` is value-constant
+    AND share-eligible (``is_sync_and_safe`` + ``hoistable``); an ASYNC ``lambda_step`` is still
+    value-constant (the unary flag — the purity half) but NOT share-eligible (it would alias a
+    coroutine across rows). A sync ``filter_step`` is also share-eligible.
+    """
+    sync_lam = lambda_step(constant(5), lambda v: v + 1)
+    async_lam = lambda_step(constant(5), _an_async_fn)
+    filt = filter_step(constant([1, 2, 3]), lambda x: x > 1)
+
+    # all are value-constant over a constant input (the unary flag — the purity half)
+    assert sync_lam._is_unary is True
+    assert async_lam._is_unary is True
+    assert filt._is_unary is True
+
+    # but only the SYNC ones are share-eligible (concrete value); the async lambda is not
+    assert sync_lam.is_sync_and_safe is True and sync_lam.hoistable is True
+    assert async_lam.is_sync_and_safe is False and async_lam.hoistable is False
+    assert filt.is_sync_and_safe is True and filt.hoistable is True
 
     # unariness NARROWS over a per-entry (non-unary) input — the value differs per entry.
     root = RootStep()  # a batch source (its column IS the bucket of parents)
     assert lambda_step(root, lambda v: v)._is_unary is False
 
 
+async def _an_async_fn(v):
+    return v
+
+
 def test_step_classification_pure_sync_pure_async_and_the_impure_escape_hatch():
     """Three host-code categories, by their merge / hoist / unary flags:
 
-    * pure + SYNC (``FilterStep``): dedupable + hoistable + _is_unary — fully optimizable.
-    * pure + ASYNC-capable (``LambdaStep``): dedupable + _is_unary (the purity contract) but NOT
-      hoistable — it may emit raw per-entry coroutines, so it is never hoisted/run-once (fan-out
-      would alias a single-await awaitable).
+    * pure + SYNC (a sync ``lambda_step`` / ``FilterStep``): dedupable + hoistable + _is_unary —
+      fully share-optimizable.
+    * pure + ASYNC (an async ``lambda_step``): dedupable + _is_unary (the purity half) but NOT
+      hoistable / is_sync_and_safe — its result is a per-row coroutine that cannot be shared, so it
+      runs per entry (decided PER INSTANCE).
     * impure / side-effecting (``ResolveStep``, a plain resolver): the escape hatch — never merged,
       hoisted, or run once.
     """
-    # the impure escape hatch is fully barriered
+    # the impure escape hatch is fully barriered (class-level — every resolver is the same)
     assert ResolveStep.dedupable is False
     assert ResolveStep.hoistable is False
     assert ResolveStep._is_unary is False
-    # a pure SYNC transform is fully optimizable
+    # a pure SYNC transform is fully share-optimizable
     assert FilterStep.dedupable is True
     assert FilterStep.hoistable is True and FilterStep._is_unary is True
-    # a pure ASYNC-capable transform keeps the purity contract (dedup + unary flag) but is not
-    # hoisted/run-once (it may emit per-entry awaitables that fan-out would alias)
+    # a lambda is dedupable + value-constant by contract, but share-eligibility is PER INSTANCE:
     assert LambdaStep.dedupable is True
-    assert LambdaStep._is_unary is True
-    assert LambdaStep.hoistable is False
+    sync_lam = lambda_step(constant(0), lambda v: v)
+    async_lam = lambda_step(constant(0), _an_async_fn)
+    assert sync_lam.is_sync_and_safe is True and sync_lam.hoistable is True
+    assert async_lam.is_sync_and_safe is False and async_lam.hoistable is False
 
 
 def test_pure_filter_over_constant_is_byte_identical_when_optimized():

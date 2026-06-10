@@ -33,7 +33,9 @@ from graphql.type import (
 
 from grafast_py import _compat
 from grafast_py.config import GrafastConfig
+from grafast_py.core_steps import constant, lambda_step
 from grafast_py.entry import experimental_execute_incrementally
+from grafast_py.schema import make_grafast_schema
 
 pytestmark = pytest.mark.skipif(
     not _compat.supports_incremental(),
@@ -551,3 +553,56 @@ def test_if_false_and_no_directive_return_plain_execution_result():
         {"hero": HERO},
     )
     assert type(deferred) is ExperimentalIncrementalExecutionResults
+
+
+def test_async_lambda_field_on_streamed_items_does_not_alias_coroutines():
+    """An async ``lambda_step`` field on ``@stream``'d items, over multiple parents, must not crash.
+
+    Regression for the cross-parent coroutine-alias bug (Codex P1/P2). A constant-fed async lambda
+    is value-constant, so the share-optimizations (hoist / run-once) WOULD compute it once and copy
+    the result to every item — but the result is a single-await coroutine, and the ``@stream`` path
+    completes items SEPARATELY, so a shared coroutine gets re-awaited and raises "cannot reuse
+    already awaited coroutine". The fix: ``LambdaStep`` inspects ``fn`` and an ASYNC lambda is NOT
+    shared (neither hoisted nor run once), so each item gets its OWN coroutine. (Confirmed to crash
+    before the fix by un-gating ``LambdaStep.hoistable``; here it must complete cleanly.)
+    """
+
+    async def async_tag(_):
+        await asyncio.sleep(0)
+        return 7
+
+    schema = make_grafast_schema(
+        "type Query { items: [Item!]! }\ntype Item { tag: Int! }",
+        {
+            "Query": {"items": lambda p, a, i: constant([{}, {}, {}])},  # 3 parents
+            "Item": {"tag": lambda p, a, i: lambda_step(constant("k"), async_tag)},  # ASYNC fn
+        },
+    )
+
+    async def go():
+        result = experimental_execute_incrementally(
+            schema, "{ items @stream(initialCount: 1) { tag } }", {}
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+        payloads = [result.initial_result.formatted]
+        async for patch in result.subsequent_results:
+            payloads.append(patch.formatted)
+        return payloads
+
+    payloads = asyncio.run(go())
+
+    # no streamed item carries a "cannot reuse already awaited coroutine" error
+    errors = [
+        e
+        for p in payloads
+        for c in (p.get("completed") or [])
+        for e in (c.get("errors") or [])
+    ]
+    assert errors == [], errors
+    # every item (initial[:1] + the two streamed) resolved tag=7 — distinct coroutines, not aliased
+    items = list(payloads[0]["data"]["items"])
+    for p in payloads:
+        for inc in p.get("incremental", []) or []:
+            items.extend(inc.get("items", []))
+    assert items == [{"tag": 7}, {"tag": 7}, {"tag": 7}]

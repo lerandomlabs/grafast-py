@@ -20,6 +20,7 @@ completion is awaitable the whole object-plan execution becomes a coroutine, but
 the resulting `data`/`errors` are identical to the synchronous path.
 """
 
+import inspect
 from typing import Any, AsyncIterable, Dict, List, NamedTuple, Optional
 
 from graphql.error import GraphQLError, located_error
@@ -805,6 +806,19 @@ def hoist_bridge_for_field(field_plan, step_columns, live_idx):
     if not hoisted_out:
         return None
     columns = {hid: [step_columns[hid][p] for p in live_idx] for hid in hoisted_out}
+    # SHARE-POINT GUARD: a hoisted column is FANNED to many child rows, so it must be concrete — a
+    # coroutine is single-await and cannot be copied (the @stream path, completing rows separately,
+    # would re-await it -> "cannot reuse already awaited coroutine"). A hoisted step is sync-eligible
+    # by construction AND request-constant (its column is uniform, so col[0] represents it); an
+    # awaitable here means a step lied about sync-ness (the LambdaStep detection blind spot: a sync
+    # fn that returns a coroutine). Fail loudly rather than alias one coroutine across rows.
+    for hid, col in columns.items():
+        if col and inspect.isawaitable(col[0]):
+            raise AssertionError(
+                f"hoisted step #{hid} produced an awaitable; a hoisted value is fanned across rows"
+                f" and must be concrete (an async fn must not be hoistable — for async I/O use a"
+                f" load step, which batches AND resolves its column before any fan-out)"
+            )
     return HoistBridge(columns=columns)
 
 
