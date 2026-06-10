@@ -155,6 +155,16 @@ class LambdaStep(Step):
     """
 
     is_sync_and_safe = False
+    # NOT hoistable: a lambda is async-capable (``fn`` may be a coroutine function), so its column
+    # can hold raw per-entry awaitables. Hoisting runs the step ONCE in a shallower bucket and the
+    # hoist bridge FANS that single column to many child rows — fanning one coroutine to N rows
+    # aliases a single-await awaitable (the @stream path, completing rows separately, then raises
+    # "cannot reuse already awaited coroutine"). The engine cannot statically prove a given ``fn``
+    # is sync (``iscoroutinefunction`` misses a sync fn that returns a coroutine), so a lambda is
+    # conservatively never hoisted. (The run-once sibling of the ``is_sync_and_safe`` gate in
+    # ``_bucket_unariness``: lambdas keep the PURITY contract — dedup, the resolver escape hatch —
+    # but the hoist/run-once OPTIMIZATION applies only to provably-sync steps, e.g. filter/access.)
+    hoistable = False
 
     def __init__(self, dep: Step, fn: Callable[[Any], Any]) -> None:
         super().__init__()

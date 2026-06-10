@@ -1,12 +1,13 @@
 """UNARY-MODEL + purity-contract invariants (Option B: plan lambdas are assumed pure).
 
 Under the Grafast PURITY CONTRACT, a plan transform (``lambda_step`` / ``filter_step``) is a
-deterministic function of its input. So — like upstream Grafast's unary-value model — such a
-step over a request-CONSTANT input is ``_is_unary`` and ``hoistable`` (liftable to a shallower
-layer, run once and fanned); over a per-entry input it narrows to batch. The executor's
-run-once-broadcast additionally requires the step be provably SYNC (``is_sync_and_safe``) so it
-never aliases a per-entry awaitable across parents — an async ``lambda_step`` over a constant
-therefore runs per entry (distinct coroutines) and gets its run-once from HOISTING instead.
+deterministic function of its input, so over a request-CONSTANT input it is value-constant
+(``_is_unary``); over a per-entry input it narrows to batch. The hoist / run-once OPTIMIZATION,
+however, applies only to provably-SYNC steps (``is_sync_and_safe``) — a ``filter_step`` is sync,
+so it is hoisted and run once; a ``lambda_step`` is async-capable (``fn`` may be a coroutine
+function), so it is NEVER hoisted or run once (fanning one coroutine across rows would alias a
+single-await awaitable, which the @stream path would then double-await). A lambda therefore keeps
+the purity contract (dedup, the resolver escape hatch) but runs per entry.
 
 The flags are the explicit IMPURE / side-effecting OPT-OUT: a plain resolver (``ResolveStep``)
 sets ``dedupable=False`` / ``hoistable=False`` / ``_is_unary=False`` so an impure per-entry
@@ -60,36 +61,47 @@ def leaf(key):
     return plan
 
 
-def test_pure_plan_transforms_are_unary_and_hoistable_over_a_constant():
-    """A lambda / filter over a request-constant input is unary + hoistable (the purity default)."""
+def test_pure_plan_transforms_unary_flag_and_optimization_eligibility():
+    """A lambda / filter over a constant is value-constant (``_is_unary``); only the provably-SYNC
+    filter is eligible for the hoist / run-once optimization. A lambda is async-capable, so it is
+    never hoisted/run-once (fanning one coroutine across rows would alias a single-await awaitable)
+    — it keeps the purity contract (dedup) but not the optimization."""
     lam_const = lambda_step(constant(5), lambda v: v + 1)
     filt_const = filter_step(constant([1, 2, 3]), lambda x: x > 1)
-    # pure-by-default: no barrier, so both are run-once-capable AND liftable.
-    assert lam_const._is_unary is True and lam_const.hoistable is True
-    assert filt_const._is_unary is True and filt_const.hoistable is True
+    # both are value-constant over a constant input (the unary flag — the purity contract)
+    assert lam_const._is_unary is True
+    assert filt_const._is_unary is True
+    # but only the SYNC filter is optimization-eligible; the async-capable lambda is not hoistable
+    assert filt_const.hoistable is True
+    assert lam_const.hoistable is False
 
-    # but unariness NARROWS over a per-entry (non-unary) input — the value differs per entry, so
-    # the engine treats it as batch (narrowed at the add_dependency chokepoint).
+    # unariness NARROWS over a per-entry (non-unary) input — the value differs per entry.
     root = RootStep()  # a batch source (its column IS the bucket of parents)
-    lam_per_entry = lambda_step(root, lambda v: v)
-    assert lam_per_entry._is_unary is False
+    assert lambda_step(root, lambda v: v)._is_unary is False
 
 
-def test_resolver_is_the_impure_escape_hatch():
-    """Plan lambdas are PURE-by-default; the impure / side-effecting path is a plain resolver.
+def test_step_classification_pure_sync_pure_async_and_the_impure_escape_hatch():
+    """Three host-code categories, by their merge / hoist / unary flags:
 
-    A ``ResolveStep`` (the adapter for a plain graphql-core resolver) is the single host-code path
-    the engine treats as possibly impure / side-effecting: never merged (``dedupable=False``),
-    never hoisted (``hoistable=False``) and never run once (``_is_unary=False``). Plan
-    lambdas/filters set none of these — they inherit the pure-by-default class flags.
+    * pure + SYNC (``FilterStep``): dedupable + hoistable + _is_unary — fully optimizable.
+    * pure + ASYNC-capable (``LambdaStep``): dedupable + _is_unary (the purity contract) but NOT
+      hoistable — it may emit raw per-entry coroutines, so it is never hoisted/run-once (fan-out
+      would alias a single-await awaitable).
+    * impure / side-effecting (``ResolveStep``, a plain resolver): the escape hatch — never merged,
+      hoisted, or run once.
     """
-    # the escape hatch is fully barriered
+    # the impure escape hatch is fully barriered
     assert ResolveStep.dedupable is False
     assert ResolveStep.hoistable is False
     assert ResolveStep._is_unary is False
-    # the pure plan transforms are NOT barriered (class defaults: hoistable=True, _is_unary=True)
-    assert LambdaStep.hoistable is True and LambdaStep._is_unary is True
+    # a pure SYNC transform is fully optimizable
+    assert FilterStep.dedupable is True
     assert FilterStep.hoistable is True and FilterStep._is_unary is True
+    # a pure ASYNC-capable transform keeps the purity contract (dedup + unary flag) but is not
+    # hoisted/run-once (it may emit per-entry awaitables that fan-out would alias)
+    assert LambdaStep.dedupable is True
+    assert LambdaStep._is_unary is True
+    assert LambdaStep.hoistable is False
 
 
 def test_pure_filter_over_constant_is_byte_identical_when_optimized():

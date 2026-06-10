@@ -51,13 +51,14 @@ class Step:
 
     # whether the cross-parent hoist pass may LIFT this step to a shallower layer (so it runs once
     # over a batch instead of once-per-child-bucket). Requires the step to be a DETERMINISTIC,
-    # entry-INDEPENDENT function of its inputs: firing once and fanning the result to every child
-    # must equal firing per child. Defaults True under the Grafast PURITY CONTRACT — plan steps
-    # (constant / access / load / node / each / lambda / filter) are assumed deterministic
-    # functions of their inputs, so they may be hoisted. (Hoisting is SEPARATE from ``_is_unary``
-    # run-once: a load is hoistable but not unary; a request-constant lambda is both.) It is the
-    # explicit OPT-OUT for genuinely impure / side-effecting host code: a plain resolver
-    # (``ResolveStep``) sets it False so an impure per-entry resolver is never lifted to fire once.
+    # entry-INDEPENDENT function of its inputs WHOSE COLUMN HOLDS CONCRETE VALUES: firing once and
+    # fanning the result to every child must equal firing per child. Defaults True for the pure sync
+    # transforms (constant / access / list / object / first / last / reverse / filter) and the
+    # column-resolving batch steps (load / node / each, whose coroutine-of-column run_steps resolves
+    # before any fan-out). (Hoisting is SEPARATE from ``_is_unary`` run-once: a load is hoistable but
+    # not unary.) It is the explicit OPT-OUT, set False by a plain resolver (``ResolveStep`` — impure
+    # / side-effecting) AND ``LambdaStep`` (async-capable: its column may hold raw per-entry
+    # coroutines that fan-out would alias across rows — see core_steps).
     hoistable: bool = True
 
     # whether `run_steps` passes the per-bucket-invocation BucketExtra (request context +

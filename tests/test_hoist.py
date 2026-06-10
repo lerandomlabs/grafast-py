@@ -568,17 +568,17 @@ def test_build_hoist_parent_store_fails_loud_when_bridge_missing():
     assert build_hoist_parent_store(plain, None, [0, 1]) is None
 
 
-def test_pure_lambda_over_constant_is_hoisted_to_fire_once():
-    """A PURE LambdaStep over a request-constant input is HOISTED to fire once (Option B).
+def test_lambda_is_not_hoisted_for_async_safety():
+    """A LambdaStep is NEVER hoisted, so a constant-fed lambda fires PER ENTRY whether or not
+    hoist is on (``off_n == on_n == 4``), data byte-identical.
 
-    Under the Grafast purity contract a lambda is a deterministic function of its input, so the
-    barrier from 76e9745 is gone: ``lambda_step(constant(...), fn)`` is hoistable, and under hoist
-    it is lifted to the root and fires ``fn`` ONCE for the whole request (``on_n == 1``) instead of
-    once-per-Person (``off_n == 4``), with data byte-identical (``fn`` is pure). The executor
-    run-once-broadcast path is reserved for provably-SYNC steps (a host lambda may be async, and
-    broadcasting a coroutine would alias one awaitable across parents), so a lambda gets its
-    run-once from HOISTING — which is per-entry-equivalent for a pure fn. The call counter is a
-    test instrument only; ``fn``'s RETURN value is constant (pure).
+    A lambda is async-capable (``fn`` may be a coroutine function), so its column can hold raw
+    per-entry awaitables; hoisting runs it once in a shallower bucket and the hoist bridge would fan
+    that single coroutine to many child rows — aliasing a single-await awaitable (the @stream path
+    then raises "cannot reuse already awaited coroutine"). The engine cannot statically prove a
+    given ``fn`` is sync, so a lambda is conservatively not hoisted. It keeps the PURITY contract
+    (dedup, the resolver escape hatch); the hoist / run-once OPTIMIZATION is reserved for
+    provably-SYNC steps (filter / access / constant). The call counter is a test instrument only.
     """
     orgs = [{"id": 10}, {"id": 20}]
     people = [{"id": 1}, {"id": 2}]
@@ -620,7 +620,7 @@ def test_pure_lambda_over_constant_is_hoisted_to_fire_once():
     # data byte-identical (pure fn), hoist ON == OFF.
     assert off_tags == [[100, 100], [100, 100]]
     assert on_tags == off_tags
-    # hoisting fires the pure constant-fed lambda EXACTLY ONCE (lifted to the root), vs the four
-    # per-entry calls without hoist. `== 4` / `== 1` are exact (not `< 4`, which would also pass
-    # if fn never ran). With the barrier (pre-Option-B) both were 4 — the lambda was never lifted.
-    assert off_n == 4 and on_n == 1
+    # the lambda is NOT hoisted: it fires PER ENTRY (four people) whether hoist is on or off.
+    # (Contrast a SYNC filter, which IS hoisted — see test_pure_filter_over_constant in
+    # tests/test_unary_model_gaps.py.)
+    assert off_n == 4 and on_n == 4

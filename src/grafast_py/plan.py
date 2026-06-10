@@ -961,10 +961,11 @@ def _is_hoistable(
 
     if not step.dedupable:
         return False
-    # `hoistable` is the explicit impure / side-effecting OPT-OUT: plan steps (including lambda /
-    # filter) are assumed PURE — deterministic functions of their inputs — so they may be lifted to
-    # fire once and fan the result to every child. A plain resolver (``ResolveStep``) sets it False
-    # so an impure per-entry resolver is never hoisted. (See `Step.hoistable` / the purity contract.)
+    # `hoistable` is the OPT-OUT from lifting: pure SYNC transforms (constant / access / filter /
+    # ...) and the column-resolving batch steps (load / node / each) may be lifted to fire once and
+    # fan the result. It is set False by a plain resolver (``ResolveStep`` — impure) and by
+    # ``LambdaStep`` (async-capable: its column may hold raw per-entry coroutines that fan-out would
+    # alias across rows). (See `Step.hoistable` / the purity contract.)
     if not step.hoistable:
         return False
     if isinstance(step, (RootStep, ItemStep)):
