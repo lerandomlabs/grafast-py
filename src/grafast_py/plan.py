@@ -562,6 +562,15 @@ def plan_operation(
         details_map=root_details_map,
     )
 
+    # capture the structural CONSTRAINTS over the PRE-optimization step set: a customizer-bearing
+    # step that dedup-merges or tree-shakes out of `plan.steps` during `finalize_plan` would
+    # otherwise escape the on-hit surviving-step walk (the leak class upstream closes with
+    # `contextConstraints`). Recording each customizer's value-agnostic predicate-shape signature
+    # HERE — before optimization removes the merged-away survivors — lets a cache HIT re-validate
+    # the WHOLE list against the requesting context, independent of which steps survived. Duck-typed
+    # so core takes no pg import: a non-pg step never carries `customizer_constraint`.
+    constraints = collect_customizer_constraints(plan)
+
     object_plan = finalize_plan(plan, object_plan)
 
     # a resource select_customizer that baked a plan-time LITERAL (the 1-arg legacy form, or a
@@ -591,7 +600,9 @@ def plan_operation(
     context._grafast_root_step = root_step
 
     if config.cache_plans and plan.cacheable:
-        store_cached_plan(context, operation, config, object_plan, root_step, plan)
+        store_cached_plan(
+            context, operation, config, object_plan, root_step, plan, constraints
+        )
 
     return object_plan
 
@@ -664,6 +675,13 @@ def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
         matches = getattr(step, "customizer_structure_matches", None)
         if matches is not None and not matches():
             return None
+    # the OPTIMIZATION-INDEPENDENT structural guard: re-validate the WHOLE captured constraint list
+    # against THIS request's context, so a customizer-bearing step that dedup-merged or tree-shook
+    # out of `plan.steps` (and so escaped the surviving-step walk above) is still checked. A
+    # divergence forces a re-plan (a miss) rather than serving this request another request's
+    # customizer-decided structure. Empty for a plan with no context-scoping customizer.
+    if cached.constraints and not constraints_match(cached.constraints):
+        return None
     # the SHARED triple is read-only at execute (no per-request value lives on it); each request
     # carries its OWN source map, so no copy is needed (the deepcopy-free hit path).
     context._grafast_source_values = values_by_source(context.variable_values, operation)
@@ -672,14 +690,58 @@ def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
     return cached.object_plan
 
 
+def collect_customizer_constraints(plan) -> tuple:
+    """Collect every customizer-bearing step's structural CONSTRAINT from a plan's step set.
+
+    Called over the PRE-optimization step set (before `finalize_plan` removes merged-away
+    survivors) so a customizer step that later dedup-merges or tree-shakes still contributes its
+    constraint — the optimization-independent guard. Duck-typed: a step advertises a constraint by
+    defining `customizer_constraint` (the pg select / connection steps do); a step that has the
+    method but no resource customizer returns `None` and is skipped, so the tuple holds only the
+    real context-scoping constraints. Core takes no pg import — it never sees the method on a
+    non-pg step.
+    """
+    constraints = []
+    for step in plan.steps:
+        getter = getattr(step, "customizer_constraint", None)
+        if getter is None:
+            continue
+        constraint = getter()
+        if constraint is not None:
+            constraints.append(constraint)
+    return tuple(constraints)
+
+
+def constraints_match(constraints) -> bool:
+    """Whether every captured customizer CONSTRAINT still resolves to its shape for this request.
+
+    The on-hit, optimization-independent structural-divergence guard (the grafast-py analogue of
+    upstream `matchesConstraints(contextConstraints, context)`): re-validates the WHOLE stored
+    constraint list, so a customizer whose step merged or shook out of `plan.steps` is still
+    checked. Each constraint reads the per-request context itself (so core stays pg-free, calling
+    this duck-typed like the surviving-step guard). A single structural divergence -> the hit is
+    treated as a MISS (re-plan). An empty list (a plan with no context-scoping customizer) matches
+    trivially.
+    """
+    return all(constraint.matches() for constraint in constraints)
+
+
 def store_cached_plan(
-    context, operation: OperationDefinitionNode, config, object_plan, root_step, plan
+    context,
+    operation: OperationDefinitionNode,
+    config,
+    object_plan,
+    root_step,
+    plan,
+    constraints: tuple = (),
 ):
     """Store a freshly-finalized, value-independent plan under its cache key.
 
     Called only on a MISS when `cache_plans` is on AND `plan.cacheable` (no variable value
     was inlined as a plan-time literal). A value-specific plan is never stored — reusing it
-    would serve a later request the earlier request's value.
+    would serve a later request the earlier request's value. `constraints` is the structural
+    guard list captured over the pre-optimization step set (see `collect_customizer_constraints`),
+    re-validated on every hit so a merged-away scoped step cannot escape the divergence check.
     """
     from .cache import CachedPlan, compute_cache_key
 
@@ -692,6 +754,7 @@ def store_cached_plan(
             root_step=root_step,
             plan=plan,
             schema=context.schema,
+            constraints=constraints,
         ),
     )
 

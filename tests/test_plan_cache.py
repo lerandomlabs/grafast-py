@@ -358,11 +358,11 @@ def test_cache_hit_returns_the_shared_plan_object(monkeypatch):
     stored = {}
     real_store = plan_module.store_cached_plan
 
-    def spy_store(context, operation, cfg, object_plan, root_step, plan):
+    def spy_store(context, operation, cfg, object_plan, root_step, plan, *args):
         stored["object_plan"] = object_plan
         stored["plan"] = plan
         stored["root_step"] = root_step
-        return real_store(context, operation, cfg, object_plan, root_step, plan)
+        return real_store(context, operation, cfg, object_plan, root_step, plan, *args)
 
     monkeypatch.setattr(plan_module, "store_cached_plan", spy_store)
 

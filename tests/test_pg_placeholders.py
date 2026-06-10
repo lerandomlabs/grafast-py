@@ -144,6 +144,20 @@ def test_add_where_literal_leaves_registry_empty():
     assert step.placeholder_binds == {}
 
 
+def test_var_placeholder_transform_is_applied_at_render():
+    """A ``var:`` placeholder built with ``transform=`` binds the TRANSFORMED variable value at
+    render — the render seam applies ``transform=`` for a var: source, not only ctx:.
+
+    Otherwise a transformed variable placeholder would bind the RAW variable value, and (now that
+    the dedup key discriminates by transform) a transformed vs untransformed bind would carry the
+    same value despite distinct keys. Regression for the var:-source transform render gap.
+    """
+    ph = pg_placeholder("var:status", "x", transform=str.upper)
+    step = make_step(column("status") == ph)
+    params = step.where_params({"var:status": "published"})
+    assert params == {ph.key: "PUBLISHED"}
+
+
 # ---------------------------------------------------- predicate_key: the four crux behaviours
 
 

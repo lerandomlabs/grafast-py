@@ -99,12 +99,26 @@ class CachedPlan(NamedTuple):
     garbage-collected, so a freed schema's old ``id`` could alias a new schema; the ``is``
     re-check turns such a stale-``id`` collision into a miss (the holder also pins the schema,
     which is fine — schemas are long-lived).
+
+    ``constraints`` is the optimization-INDEPENDENT structural-divergence guard (the grafast-py
+    analogue of upstream's ``contextConstraints`` validated in ``establishOperationPlan``). It is
+    the list of every context-resolved customizer's value-agnostic predicate-shape signature,
+    captured at STORE time from ALL customizer-bearing steps — INCLUDING any that dedup-merged or
+    tree-shook out of ``plan.steps`` after optimization. On a HIT the WHOLE list is re-validated
+    against THIS request's context (see :func:`grafast_py.plan.constraints_match`); a structural
+    change in ANY captured customizer forces a re-plan, so a merged-away scoped step can no longer
+    escape the surviving-step walk. Empty for a plan with no customizer-bearing steps (the common
+    case), so a non-scoped plan validates trivially. Each entry is
+    ``(resolver_callable, arity, signature_tuple)`` — the customizer identity + its resolved
+    value-agnostic predicate keys; the resolver is re-invoked per request to recompute the
+    signature for comparison.
     """
 
     object_plan: Any
     root_step: Any
     plan: Any
     schema: Any = None
+    constraints: Tuple[Any, ...] = ()
 
 
 # the plan-affecting GrafastConfig fields folded into the cache key: a plan built under one
