@@ -17,9 +17,8 @@ from typing import Any, List
 from grafast_py.core_steps import AccessStep, ConstantStep, RootStep
 from grafast_py.dag import (
     Plan,
-    _as_survivors,
-    _collapse_chain,
     _compose_remaps,
+    _resolve_merged,
     order_steps,
     order_steps_within,
 )
@@ -269,27 +268,33 @@ def test_tree_shake_does_not_renumber_ids():
 # ---------------------------------------------------------------------------
 
 
-def test_as_survivors_fills_unreplaced_ids_with_identity():
-    plan = Plan()
-    s0 = plan.add_step(ConstantStep(1))
-    s1 = plan.add_step(ConstantStep(2))
-    replacement = ConstantStep(99)
-    replacement.id = 7
-
-    survivors = _as_survivors(plan.steps, {s0.id: replacement})
-    assert survivors[s0.id] is replacement  # replaced id maps to its replacement
-    assert survivors[s1.id] is s1  # unreplaced id is its own survivor
-
-
-def test_collapse_chain_resolves_transitive_replacements():
+def test_resolve_merged_collapses_transitive_replacements():
     plan = Plan()
     a = plan.add_step(ConstantStep(1))  # id 0
     b = plan.add_step(ConstantStep(2))  # id 1
     c = plan.add_step(ConstantStep(3))  # id 2
-    # a -> b, b -> c : collapsing must give a -> c and b -> c directly.
-    collapsed = _collapse_chain(plan.steps, {a.id: b, b.id: c})
+    # a -> b, b -> c : collapsing must give a -> c and b -> c directly (only moved ids).
+    collapsed = _resolve_merged({a.id: b, b.id: c})
     assert collapsed[a.id] is c
     assert collapsed[b.id] is c
+    assert c.id not in collapsed  # an unmoved id is absent (matches the old _collapse_chain)
+
+
+def test_maintained_reverse_index_and_structural_removal():
+    """The reverse index tracks live dependents; an eradicated step leaves it immediately."""
+    plan = Plan()
+    base = plan.add_step(ConstantStep(1))
+    a1 = plan.add_step(AccessStep(base, ("x",)))
+    a2 = plan.add_step(AccessStep(base, ("y",)))
+    # the maintained index inverts the live DAG (base -> {a1, a2}); no on-demand rescan.
+    assert hasattr(plan, "_dependents_index")
+    assert sorted(s.id for s in plan.dependents_of(base)) == sorted([a1.id, a2.id])
+
+    # eradicating a1 into a2 moves its dependents and removes it from the live set + index
+    plan.eradicate(a1, a2)
+    plan._sweep_dead()
+    assert a1 not in plan.steps
+    assert a1.id not in plan._dependents_index
 
 
 def test_compose_remaps_chains_optimize_then_dedup():
