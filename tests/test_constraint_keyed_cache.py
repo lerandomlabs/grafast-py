@@ -98,6 +98,33 @@ def test_union_member_ctx_transform_computes_derived_value_per_request():
         assert list(union.member_where_params({}).values()) == [105]
 
 
+def test_union_member_var_transform_is_applied_at_render():
+    """A ``var:`` union member placeholder with ``transform=`` binds the TRANSFORMED variable
+    value at render — not only ``ctx:`` sources.
+
+    The union render seam (:meth:`PgUnionAllStep.member_where_params`) must apply ``transform=``
+    for a ``var:`` source too; otherwise a transformed variable placeholder binds the RAW variable
+    value, and (now that the dedup key discriminates by transform) a transformed vs untransformed
+    bind would carry the same value despite distinct keys. A var:-only union needs no request
+    context. Regression for the var:-source transform render gap.
+    """
+    member = PgUnionMember(
+        make_articles(), "Article",
+        where=[
+            column("status")
+            == pg_placeholder("var:status", "x", type_=String, transform=str.upper)
+        ],
+    )
+    union = PgUnionAllStep(
+        [member], shared_columns=["id", "owner_id", "created"],
+        order_by=["created"], first=3,
+    )
+
+    assert list(union.member_where_params({"var:status": "published"}).values()) == [
+        "PUBLISHED"
+    ]
+
+
 # ----------------------------------------------- optimization-independent constraint guard
 
 

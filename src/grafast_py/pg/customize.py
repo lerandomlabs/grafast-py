@@ -538,6 +538,9 @@ class PgCustomizable(Step):
           context key fails LOUD (``KeyError`` / ``AttributeError`` propagate), not a silent
           ``None`` that would render ``col = NULL`` and silently widen the scope.
 
+        A placeholder built with ``transform=`` applies it to the resolved value for EITHER source
+        (``transform(value)``), so a transformed var:/ctx: bind never binds the raw value.
+
         A literal-only step has an empty ``placeholder_binds`` registry, so this returns ``{}`` —
         a byte-identical no-op for the default cache-off path; ``current_pg_request()`` is touched
         only when a ``ctx:`` bind is actually present (so var:-only steps and no-request unit tests
@@ -558,13 +561,13 @@ class PgCustomizable(Step):
                     value = context[key]
                 else:
                     value = getattr(context, key)
-                # a context-DERIVED placeholder (built with transform=) computes its value PER
-                # REQUEST from the resolved context value, so one shared plan serves every context
-                # — the value-agnostic runtime bind, never a plan-time-baked derived literal.
-                transform = self.placeholder_transforms.get(name)
-                params[name] = transform(value) if transform is not None else value
             else:
-                params[name] = source_values.get(source)
+                value = source_values.get(source)
+            # a placeholder built with transform= computes its bound value PER REQUEST from the
+            # resolved source value (ctx: OR var:), never a plan-time-baked derived literal — and
+            # two binds that differ by transform (and so by dedup key) also bind by transform.
+            transform = self.placeholder_transforms.get(name)
+            params[name] = transform(value) if transform is not None else value
         return params
 
     def copy_customization_from(self, other: "PgCustomizable") -> None:

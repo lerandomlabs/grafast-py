@@ -444,10 +444,11 @@ class PgUnionAllStep(Step):
         * a ``ctx:`` source (a request-context scoping value — the union analogue of a resource
           ``select_customizer``) resolves from THIS request's context, read FRESH per request, so
           a cache HIT over the SHARED union binds THIS request's context value rather than the one
-          the plan was built with. A context-DERIVED placeholder (built with ``transform=``)
-          computes ``transform(context[key])`` per request. ``current_pg_request()`` is touched
-          only when a ``ctx:`` bind is actually present (so var:-only unions and no-request unit
-          tests are unchanged).
+          the plan was built with. ``current_pg_request()`` is touched only when a ``ctx:`` bind is
+          actually present (so var:-only unions and no-request unit tests are unchanged).
+
+        A placeholder built with ``transform=`` applies it to the resolved value for EITHER source
+        (``transform(value)``), so a transformed var:/ctx: bind never binds the raw value.
         """
         params: Dict[str, Any] = {}
         context = _UNSET
@@ -467,12 +468,15 @@ class PgUnionAllStep(Step):
                             value = context[key]
                         else:
                             value = getattr(context, key)
-                        transform = placeholder_transform(bind)
-                        params[bind.key] = (
-                            transform(value) if transform is not None else value
-                        )
                     else:
-                        params[bind.key] = source_values.get(source)
+                        value = source_values.get(source)
+                    # a placeholder built with transform= computes its bound value per request
+                    # from the resolved source value (ctx: OR var:), so two binds that differ by
+                    # transform (and so by dedup key) also bind by transform, never the raw value.
+                    transform = placeholder_transform(bind)
+                    params[bind.key] = (
+                        transform(value) if transform is not None else value
+                    )
         return params
 
     # ------------------------------------------------------------------ SQL build
