@@ -32,7 +32,7 @@ do not alter authors/posts/comments.
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import String, bindparam, column
+from sqlalchemy import String, and_, bindparam, column
 
 from grafast_py.core_steps import constant
 from grafast_py.dag import Plan
@@ -481,6 +481,36 @@ def test_same_source_different_transform_placeholders_do_not_dedup():
         "ctx:owner_id", type_=String, transform=shared
     )
     assert key(one) == key(two)
+
+
+def test_same_source_swapped_transforms_do_not_dedup():
+    """The SAME source at TWO columns with two transforms must not collide when the transforms
+    are SWAPPED across the columns.
+
+    ``x == ph(S, a) AND y == ph(S, b)`` and the a/b-swapped predicate bind different per-column
+    values, so they must get distinct keys. The transform rides the sentinel token POSITIONALLY
+    (not a sorted side-suffix, which would lose which transform sits at which column), so the two
+    predicates render distinct SQL. Regression for the positional transform-key gap.
+    """
+
+    def key(predicate):
+        return predicate_key(predicate, placeholder_binds_in(predicate) or None)
+
+    def a(v):
+        return v + 1
+
+    def b(v):
+        return v + 2
+
+    p_ab = and_(
+        column("x") == pg_placeholder("ctx:k", type_=String, transform=a),
+        column("y") == pg_placeholder("ctx:k", type_=String, transform=b),
+    )
+    p_ba = and_(
+        column("x") == pg_placeholder("ctx:k", type_=String, transform=b),
+        column("y") == pg_placeholder("ctx:k", type_=String, transform=a),
+    )
+    assert key(p_ab) != key(p_ba)
 
 
 def test_connection_predicate_participates_in_key():

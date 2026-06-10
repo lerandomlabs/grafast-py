@@ -164,31 +164,6 @@ def predicate_key(
         return structural_predicate_key(predicate)
 
 
-def placeholder_dedup_tags(
-    predicate: ColumnElement,
-) -> Tuple[Tuple[str, Optional[int]], ...]:
-    """Sorted ``(source-tag, transform-identity)`` tags for a predicate's placeholder binds.
-
-    The transform identity discriminates two SAME-source placeholders that carry DIFFERENT
-    ``transform=`` callables (e.g. ``ctx:owner_id`` with ``v`` vs ``v + 100``): they bind
-    different values at render and so MUST NOT dedup-merge, yet both sentinel to the identical
-    ``<<ph:source>>`` token and would otherwise produce an identical key. ``id`` is closure-safe
-    (two lambdas closing over different values are distinct objects) and this is a WITHIN-plan
-    dedup key only — never the cross-request cache fingerprint (see :mod:`grafast_py.cache`) — so
-    process-local identity is sound. A placeholder with no transform contributes ``None``.
-    """
-    tags: List[Tuple[str, Optional[int]]] = []
-    for bind in visitors.iterate(predicate):
-        if not isinstance(bind, BindParameter):
-            continue
-        source = placeholder_source(bind)
-        if source is None:
-            continue
-        transform = placeholder_transform(bind)
-        tags.append((source, None if transform is None else id(transform)))
-    return tuple(sorted(tags, key=lambda t: (t[0], -1 if t[1] is None else t[1])))
-
-
 def placeholder_predicate_key(predicate: ColumnElement) -> str:
     """The dedup key for a predicate that mixes placeholder and ordinary literal binds.
 
@@ -209,19 +184,27 @@ def placeholder_predicate_key(predicate: ColumnElement) -> str:
       'alpha'`` vs ``title = 'beta'`` differ, so two requests filtering by different co-located
       literals never wrongly merge — the cross-value-corruption guard).
 
-    A trailing sorted ``(source-tag, transform-identity)`` suffix is appended (see
-    :func:`placeholder_dedup_tags`) so the key is human-legible, a placeholder never collides
-    with a literal-only predicate of a coincidentally equal value, AND two same-source
-    placeholders carrying DIFFERENT ``transform=`` callables never dedup-merge (they bind
-    different values at render). The result is
-    ``(<source-positioned, literal-inlined SQL>)|ph=<sorted (source, transform) tags>``.
+    A trailing sorted source-tag suffix is appended so the key is human-legible and a
+    placeholder never collides with a literal-only predicate of a coincidentally equal value;
+    the transform identity rides the SENTINEL token positionally (see
+    :func:`sentinel_placeholders`), so two same-source placeholders with DIFFERENT ``transform=``
+    callables (even SWAPPED across columns) never dedup-merge. The result is
+    ``(<source-positioned, literal-inlined SQL>)|ph=<sorted source tags>``.
 
     An exotic co-located literal no dialect can render inline raises ``CompileError`` (as in the
     literal path); we fall back to :func:`structural_placeholder_predicate_key`, which keeps the
     same placeholder sentinels but reprs the remaining bound values instead of inlining them.
     """
     sentinelled = sentinel_placeholders(predicate)
-    tags = placeholder_dedup_tags(predicate)
+    sources = sorted(
+        source
+        for source in (
+            placeholder_source(bind)
+            for bind in visitors.iterate(predicate)
+            if isinstance(bind, BindParameter)
+        )
+        if source is not None
+    )
     try:
         agnostic_sql = str(
             sentinelled.compile(
@@ -230,8 +213,8 @@ def placeholder_predicate_key(predicate: ColumnElement) -> str:
             )
         )
     except CompileError:
-        return structural_placeholder_predicate_key(sentinelled, tags)
-    return f"{agnostic_sql}|ph={tags!r}"
+        return structural_placeholder_predicate_key(sentinelled, sources)
+    return f"{agnostic_sql}|ph={sources!r}"
 
 
 def sentinel_placeholders(predicate: ColumnElement) -> ColumnElement:
@@ -243,33 +226,47 @@ def sentinel_placeholders(predicate: ColumnElement) -> ColumnElement:
     literal binds are left intact so a subsequent ``literal_binds`` compile inlines THEIR
     values. Used to build the value-agnostic placeholder dedup key (see
     :func:`placeholder_predicate_key`).
+
+    A placeholder built with ``transform=`` renders ``transform(value)`` at execute, so the
+    transform is part of its IDENTITY: the token is suffixed with the transform identity
+    (``<<ph:<source>|t=<id>>>``). This positions the transform WITH its source, so the same
+    source at two columns with DIFFERENT transforms (or the same two SWAPPED across columns)
+    yields DISTINCT tokens and never dedup-merges. ``id`` is closure-safe (two lambdas closing
+    over different values are distinct objects) and the dedup key is WITHIN-plan only — never the
+    cross-request cache fingerprint (see :mod:`grafast_py.cache`) — so process-local id is sound.
     """
 
     def replace(element: Any) -> Optional[ColumnElement]:
         if isinstance(element, BindParameter):
             source = placeholder_source(element)
             if source is not None:
-                return literal_column(f"<<ph:{source}>>")
+                transform = placeholder_transform(element)
+                token = (
+                    f"<<ph:{source}>>"
+                    if transform is None
+                    else f"<<ph:{source}|t={id(transform)}>>"
+                )
+                return literal_column(token)
         return None
 
     return visitors.replacement_traverse(predicate, {}, replace)
 
 
 def structural_placeholder_predicate_key(
-    sentinelled: ColumnElement, tags: Sequence[Tuple[str, Optional[int]]]
+    sentinelled: ColumnElement, sources: Sequence[str]
 ) -> str:
     """A ``literal_binds``-free fallback for a placeholder predicate with an exotic literal.
 
-    The placeholder binds are already sentinelled out of ``sentinelled``, so the only binds
-    left are ordinary co-located literals. Compiles WITHOUT ``literal_binds`` (so an
-    unrenderable literal cannot raise) and appends a stable repr of those remaining bound
-    values, keeping a co-located literal value-discriminated while the placeholders stay keyed
-    by their ``(source, transform)`` tags. Mirrors :func:`structural_predicate_key` for the
-    placeholder path.
+    The placeholder binds are already sentinelled out of ``sentinelled`` (the sentinel token
+    carries each placeholder's source AND transform identity), so the only binds left are
+    ordinary co-located literals. Compiles WITHOUT ``literal_binds`` (so an unrenderable literal
+    cannot raise) and appends a stable repr of those remaining bound values, keeping a co-located
+    literal value-discriminated while the placeholders stay source-keyed. Mirrors
+    :func:`structural_predicate_key` for the placeholder path.
     """
     compiled = sentinelled.compile(dialect=postgresql.dialect())
     params = tuple(sorted((name, repr(value)) for name, value in compiled.params.items()))
-    return f"{compiled}|{params!r}|ph={tags!r}"
+    return f"{compiled}|{params!r}|ph={sources!r}"
 
 
 def structural_predicate_key(predicate: ColumnElement) -> str:
