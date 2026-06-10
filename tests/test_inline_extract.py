@@ -36,6 +36,9 @@ def never_awaitable(_value):
 class SourceStep(Step):
     """A 0-dependency source seeded with a fixed column of parent row dicts."""
 
+    # a per-entry batch source (like RootStep/ItemStep), so never unary.
+    _is_unary = False
+
     def __init__(self, column):
         super().__init__()
         self.column = column

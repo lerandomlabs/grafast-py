@@ -568,25 +568,25 @@ def test_build_hoist_parent_store_fails_loud_when_bridge_missing():
     assert build_hoist_parent_store(plain, None, [0, 1]) is None
 
 
-def test_impure_lambda_is_not_hoisted_so_fires_per_entry():
-    """A LambdaStep (arbitrary host fn) is NOT hoistable — an impure fn fires per entry, hoist ON == OFF.
+def test_pure_lambda_over_constant_is_run_once_not_per_entry():
+    """A PURE LambdaStep over a request-constant input is run ONCE, not per entry (Option B).
 
-    Hoisting fires a request-constant step once and fans its value to every child; for a PURE step
-    that is byte-identical, but for an IMPURE host lambda (a counter here) it would diverge. So a
-    LambdaStep stays in the child layer (fired per entry) regardless of the hoist default — the
-    eligibility gate (`Step.hoistable=False` on LambdaStep) keeps default-on safe for arbitrary host
-    code, while LOADS still hoist (the tests above). Without the gate, hoist ON would wrongly fan one
-    value: `[[1, 1], [1, 1]]` with the lambda fired once.
+    Under the Grafast purity contract a lambda is a deterministic function of its input, so a
+    ``lambda_step(constant(...), fn)`` is unary (and hoistable): the engine runs ``fn`` over a
+    single representative entry and fans the result, rather than once-per-Person. The data is
+    byte-identical to the naive per-entry layout (``fn`` is pure) and hoist ON == OFF; the number
+    of ``fn`` invocations drops to EXACTLY ONE (vs the four per-entry calls a barrier forced).
+    The call counter is a test instrument only — ``fn``'s RETURN value is constant (pure).
     """
     orgs = [{"id": 10}, {"id": 20}]
     people = [{"id": 1}, {"id": 2}]
 
     def run(hoist):
-        counter = {"n": 0}
+        calls = {"n": 0}
 
-        def bump(_):
-            counter["n"] += 1
-            return counter["n"]
+        def pure_tag(_):
+            calls["n"] += 1
+            return 100  # PURE: always 100, independent of call count / order
 
         def plan_orgs(p, a, i):
             return constant(orgs)
@@ -595,7 +595,7 @@ def test_impure_lambda_is_not_hoisted_so_fires_per_entry():
             return load_one(constant("p"), lambda keys: [people for _ in keys])
 
         def plan_tag(p, a, i):
-            return lambda_step(constant("k"), bump)  # impure, request-constant input
+            return lambda_step(constant("k"), pure_tag)  # pure, request-constant input
 
         schema = make_grafast_schema(
             TWO_LEVEL_SDL,
@@ -610,11 +610,16 @@ def test_impure_lambda_is_not_hoisted_so_fires_per_entry():
         )
         assert result.errors is None
         tags = [[pp["tag"] for pp in o["people"]] for o in result.data["orgs"]]
-        return tags, counter["n"]
+        return tags, calls["n"]
 
     off_tags, off_n = run(False)
     on_tags, on_n = run(True)
 
-    # the impure lambda fires PER ENTRY (4 people) in BOTH — never hoisted to fire once.
-    assert off_tags == [[1, 2], [3, 4]] and off_n == 4
-    assert on_tags == off_tags and on_n == off_n
+    # data byte-identical (pure fn), hoist ON == OFF.
+    assert off_tags == [[100, 100], [100, 100]]
+    assert on_tags == off_tags
+    # the run-once optimization fires: the pure constant-fed lambda is unary, so the engine runs
+    # ``fn`` EXACTLY ONCE for the whole request (vs the four per-entry calls the pre-Option-B
+    # barrier forced). Run-once is at the executor level, so the count is one whether hoist is
+    # on or off — `== 1` (not merely `< 4`, which would also pass if fn never ran at all).
+    assert off_n == 1 and on_n == 1

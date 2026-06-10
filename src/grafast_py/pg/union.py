@@ -169,6 +169,8 @@ class PgUnionAllStep(Step):
     """
 
     is_sync_and_safe = False
+    # NEVER unary: builds + executes a UNION-ALL over the whole bucket (its own batching).
+    _is_unary = False
     # needs the per-request source-tag -> value map (BucketExtra.source_values) to resolve its
     # page-size / cursor / per-member WHERE placeholders into the compiled statement's params at
     # render time (and to digest-validate a variable cursor per request).

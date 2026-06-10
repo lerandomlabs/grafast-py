@@ -49,15 +49,15 @@ class Step:
     # this False so two distinct writes are never collapsed into one.
     dedupable: bool = True
 
-    # whether the cross-parent hoist pass may LIFT this step to a shallower layer (run it once
+    # whether the cross-parent hoist pass may LIFT this step to a shallower layer (so it runs once
     # over a batch instead of once-per-child-bucket). Requires the step to be a DETERMINISTIC,
     # entry-INDEPENDENT function of its inputs: firing once and fanning the result to every child
-    # must equal firing per child. True for the pure builtins (constant / access / load / node /
-    # each — same inputs => same output). False ONLY for steps running ARBITRARY HOST CODE whose
-    # purity the engine cannot verify (``LambdaStep``): an impure host ``fn`` (counter / uuid /
-    # timestamp) on a request-constant input would otherwise be hoisted to fire once and fan one
-    # value to every child, silently diverging from its per-entry behaviour. (We lack upstream's
-    # unary-value model that would make this a no-op; until then, leave such steps in the child.)
+    # must equal firing per child. Defaults True under the Grafast PURITY CONTRACT — plan steps
+    # (constant / access / load / node / each / lambda / filter) are assumed deterministic
+    # functions of their inputs, so they may be hoisted. (Hoisting is SEPARATE from ``_is_unary``
+    # run-once: a load is hoistable but not unary; a request-constant lambda is both.) It is the
+    # explicit OPT-OUT for genuinely impure / side-effecting host code: a plain resolver
+    # (``ResolveStep``) sets it False so an impure per-entry resolver is never lifted to fire once.
     hoistable: bool = True
 
     # whether `run_steps` passes the per-bucket-invocation BucketExtra (request context +
@@ -67,14 +67,42 @@ class Step:
     # and per-parent paths, which are per-invocation and MUST NOT be stored on the shared step.
     wants_extra: bool = False
 
+    # whether this step's value is the SAME for every entry in its bucket — a request-constant
+    # (upstream's ``_isUnary``). Defaults True and is NARROWED to False the moment the step gains
+    # a non-unary dependency (`add_dependency`) or a rewire repoints it onto one (`Plan.eradicate`),
+    # so narrowing is monotone — it can only ever LOWER unariness, never raise it. Pure value /
+    # shape / transform steps (constant / access / list / object / first / last / reverse / lambda /
+    # filter) inherit the default and stay unary OVER unary inputs (the purity contract). The batch
+    # SOURCES and impure / I/O steps force it False as a class attribute: ``RootStep`` (its column
+    # IS the bucket of parents) and ``ItemStep`` (a per-entry exploded list element); and the steps
+    # whose run-once equivalence is not assumed — ``ResolveStep`` (an arbitrary host resolver),
+    # ``EachStep``, the batch load / node steps, and every pg step (each does its own batching / IO).
+    # A unary step is executed ONCE per bucket and its single value broadcast to all entries —
+    # byte-identical to the per-entry run, fewer invocations (see :func:`run_steps`). FOOTGUN: a
+    # NEW 0-dependency step whose column is genuinely PER-ENTRY (a batch source) MUST set
+    # ``_is_unary = False`` (like ``RootStep`` / ``ItemStep``); the default True would otherwise run
+    # it once and broadcast entry 0 to every position, with no loud failure.
+    _is_unary: bool = True
+
     def __init__(self) -> None:
         self.dependencies: List["Step"] = []
         self.id = -1
 
     def add_dependency(self, step: "Step") -> int:
-        """Wire a dependency on `step`; returns its integer dependency index."""
+        """Wire a dependency on `step`; returns its integer dependency index.
+
+        This is the construction-time edge chokepoint: it also NARROWS unariness — a step that
+        depends on a non-unary step is itself non-unary. Narrowing only ever sets False (monotone).
+        The per-instance `_is_unary` flag is ADVISORY, not authoritative: a later rewrite
+        (`Plan.eradicate`) can lower a dependent without propagating transitively, and the actual
+        run-once decision is recomputed per bucket (seed-aware) in :func:`run_steps`
+        (`_bucket_unariness`), which is conservative — it never marks a step unary unless every
+        dependency is effectively unary in that bucket.
+        """
         index = len(self.dependencies)
         self.dependencies.append(step)
+        if not step._is_unary:
+            self._is_unary = False
         return index
 
     @property
@@ -165,12 +193,32 @@ def run_steps(
     materialised. `is_awaitable` is the context's awaitable predicate.
     """
     results: dict[int, List[Any]] = dict(seed) if seed else {}
+    # effective per-bucket unariness: a SEEDED boundary column is per-entry (it IS the bucket of
+    # parents, e.g. a constant LIST exploded into a child object bucket), so a step is run ONCE
+    # only if it is unary-capable AND every dependency is effectively unary IN THIS BUCKET. This
+    # makes unariness bucket-relative — a globally-unary step seeded as a child boundary is
+    # correctly treated as batch there. Precomputed once over the topologically-ordered steps.
+    unary_here = _bucket_unariness(ordered_steps, set(results), count)
 
     for index, step in enumerate(ordered_steps):
-        cols = [results[dep.id] for dep in step.dependencies]
+        # a unary (request-constant) step runs ONCE over a single representative entry; its
+        # length-1 output is then broadcast to `count` at store time so the bucket store keeps
+        # its "every column length count" invariant and downstream completion is byte-identical.
+        unary = unary_here[step.id]
+        step_count = 1 if unary else count
+        cols = _gather_cols(results, step, unary)
         span = _span(on_step_batch, step, count)
         span.__enter__()
-        out = step.execute(count, cols, extra) if step.wants_extra else step.execute(count, cols)
+        try:
+            out = (
+                step.execute(step_count, cols, extra)
+                if step.wants_extra
+                else step.execute(step_count, cols)
+            )
+        except BaseException:
+            # a synchronous raise must still close the span (no leak across the error).
+            span.__exit__(None, None, None)
+            raise
         if is_awaitable(out):
             # the real work is in the await; keep the span open across it.
             return _run_steps_async(
@@ -181,14 +229,40 @@ def run_steps(
                 step,
                 out,
                 span,
+                unary,
+                unary_here,
                 is_awaitable,
                 on_step_batch,
                 extra,
             )
         span.__exit__(None, None, None)
-        _store(results, step, count, out)
+        _store(results, step, count, out, unary)
 
     return results
+
+
+def _bucket_unariness(
+    ordered_steps: List[Step], seeded: set, count: int
+) -> Dict[int, bool]:
+    """Effective unariness of each step IN THIS BUCKET (`step.id -> bool`).
+
+    A step is run-once only if it is unary-capable (`step._is_unary`) AND none of its
+    dependencies is a per-entry source in this bucket — i.e. every dependency is itself
+    effectively unary and not a SEEDED boundary (a seeded column IS the bucket of parents,
+    so anything reading it is per-entry). Conservative: any uncertainty falls to batch.
+    """
+    unary_here: Dict[int, bool] = {}
+    if count <= 0:
+        return {step.id: False for step in ordered_steps}
+    for step in ordered_steps:
+        eff = step._is_unary
+        if eff:
+            for dep in step.dependencies:
+                if dep.id in seeded or not unary_here.get(dep.id, False):
+                    eff = False
+                    break
+        unary_here[step.id] = eff
+    return unary_here
 
 
 def _span(on_step_batch, step, count):
@@ -200,27 +274,68 @@ def _span(on_step_batch, step, count):
 
 
 async def _run_steps_async(
-    count, ordered_steps, results, index, pending_step, pending, pending_span,
-    is_awaitable, on_step_batch=None, extra=None,
+    count, ordered_steps, results, index, pending_step, pending, pending_span, pending_unary,
+    unary_here, is_awaitable, on_step_batch=None, extra=None,
 ):
     """Finish a step run that hit an awaitable column, awaiting in dep order."""
-    out = await pending
+    try:
+        out = await pending
+    except BaseException:
+        # the span carried across the sync->async handoff must still close if the awaited step
+        # raises (mirrors the sync path) — otherwise the failure-time span leaks.
+        pending_span.__exit__(None, None, None)
+        raise
     pending_span.__exit__(None, None, None)
-    _store(results, pending_step, count, out)
+    _store(results, pending_step, count, out, pending_unary)
 
     for step in ordered_steps[index + 1 :]:
-        cols = [results[dep.id] for dep in step.dependencies]
+        unary = unary_here[step.id]
+        step_count = 1 if unary else count
+        cols = _gather_cols(results, step, unary)
         with _span(on_step_batch, step, count):
-            out = step.execute(count, cols, extra) if step.wants_extra else step.execute(count, cols)
+            out = (
+                step.execute(step_count, cols, extra)
+                if step.wants_extra
+                else step.execute(step_count, cols)
+            )
             if is_awaitable(out):
                 out = await out
-        _store(results, step, count, out)
+        _store(results, step, count, out, unary)
 
     return results
 
 
-def _store(results: dict, step: Step, count: int, out: List[Any]) -> None:
-    """Record a step's output column, asserting the hard length contract."""
+def _gather_cols(results: dict, step: Step, unary: bool) -> List[List[Any]]:
+    """Gather a step's dependency columns, sliced to one representative entry when unary.
+
+    A unary step's dependencies are all unary too (narrowing), so the first (broadcast) value
+    of each dependency column IS the representative value the single run needs.
+    """
+    if unary:
+        return [[results[dep.id][0]] for dep in step.dependencies]
+    return [results[dep.id] for dep in step.dependencies]
+
+
+def _store(
+    results: dict, step: Step, count: int, out: List[Any], unary: bool = False
+) -> None:
+    """Record a step's output column, broadcasting a unary step's single value to `count`.
+
+    A unary step is run once (`step_count == 1`) and must return exactly one value; that value
+    is broadcast to every bucket entry so the store keeps its length-`count` invariant. A batch
+    step's output is stored as-is under the hard length contract.
+    """
+    if unary:
+        if len(out) != 1:
+            raise AssertionError(
+                f"unary step {type(step).__name__}#{step.id} returned {len(out)} values"
+                f" (a unary step runs once and must return exactly 1)"
+            )
+        # broadcast the single value to the bucket: `out * count` stores `count` REFERENCES to the
+        # one computed value (not clones) — safe because bucket values are read-only downstream, and
+        # identical to what ``ConstantStep.execute`` ([data] * count) has always produced.
+        results[step.id] = out * count
+        return
     if len(out) != count:
         raise AssertionError(
             f"step {type(step).__name__}#{step.id} returned {len(out)} values"

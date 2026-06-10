@@ -48,6 +48,9 @@ def is_coro(value: Any) -> bool:
 class SourceStep(Step):
     """0-dependency source seeded with a fixed column (test scaffold)."""
 
+    # a per-entry batch source (like RootStep/ItemStep), so never unary.
+    _is_unary = False
+
     def __init__(self, column: List[Any]) -> None:
         super().__init__()
         self.column = column

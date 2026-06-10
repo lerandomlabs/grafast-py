@@ -961,10 +961,10 @@ def _is_hoistable(
 
     if not step.dedupable:
         return False
-    # a step running arbitrary host code whose purity the engine cannot verify (LambdaStep) is not
-    # hoistable: firing once + fanning the value to every child diverges from its per-entry
-    # behaviour for an impure fn. dedupable alone is too loose a gate (it assumes determinism a
-    # host lambda may not honour); `hoistable` is the deterministic-function-of-inputs guarantee.
+    # `hoistable` is the explicit impure / side-effecting OPT-OUT: plan steps (including lambda /
+    # filter) are assumed PURE — deterministic functions of their inputs — so they may be lifted to
+    # fire once and fan the result to every child. A plain resolver (``ResolveStep``) sets it False
+    # so an impure per-entry resolver is never hoisted. (See `Step.hoistable` / the purity contract.)
     if not step.hoistable:
         return False
     if isinstance(step, (RootStep, ItemStep)):

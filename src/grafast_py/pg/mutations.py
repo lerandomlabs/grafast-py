@@ -60,6 +60,8 @@ class PgWriteSingleStep(Step):
     # a mutation is a distinct side effect: two same-class writes over the same resource
     # in one operation must BOTH run, so they are never collapsed by the dedup pass.
     dedupable = False
+    # NEVER unary: a write executed for effect over the bucket, run at full count.
+    _is_unary = False
 
     def __init__(self, resource: PgResource, values: Mapping[str, ValueSource]) -> None:
         super().__init__()

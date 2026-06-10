@@ -144,15 +144,17 @@ class LambdaStep(Step):
     If ``fn`` is an async function the per-entry results are coroutines; the planner
     treats lambdas as not sync-and-safe so the executor awaits them. Dedup is by
     ``fn`` identity (a captured closure is unique, so only the same object merges).
+
+    PURITY CONTRACT: ``fn`` MUST be a deterministic function of its input — the standard
+    Grafast assumption that makes dedup, hoisting, and unary run-once safe. The engine may
+    therefore dedup the step, lift it to a shallower layer, or run it ONCE over a
+    request-constant input and fan the single result to every child. An IMPURE ``fn`` (a
+    counter / uuid / clock / write) is OUT of contract; for genuinely impure or
+    side-effecting per-entry work use a plain resolver field (a :class:`ResolveStep`, which
+    is ``dedupable=False`` and never hoisted or run once) instead of a plan lambda.
     """
 
     is_sync_and_safe = False
-    # NOT hoistable: ``fn`` is arbitrary host code whose purity the engine cannot verify. Hoisting
-    # a request-constant lambda would fire ``fn`` once and fan one value to every child — wrong for
-    # an impure ``fn`` (counter / uuid / now). Dedup already assumes ``fn`` is deterministic (it
-    # merges by ``fn`` identity), but hoisting affects even a SINGLE-use lambda under a list, so it
-    # stays in the child layer (fired per entry) regardless of the hoist default.
-    hoistable = False
 
     def __init__(self, dep: Step, fn: Callable[[Any], Any]) -> None:
         super().__init__()
@@ -260,6 +262,9 @@ class EachStep(Step):
     """
 
     is_sync_and_safe = False
+    # NEVER unary: it explodes per-parent lists and runs a sub-DAG over the flattened items —
+    # a per-entry transform, not a request-constant value.
+    _is_unary = False
 
     def __init__(self, list_step: Step, mapper: Callable[["ItemStep"], Step]) -> None:
         super().__init__()
@@ -322,6 +327,8 @@ class ItemStep(Step):
     """
 
     is_sync_and_safe = True
+    # NEVER unary: the flattened item column is genuinely per-entry (upstream __item parity).
+    _is_unary = False
 
     def __init__(self, items: List[Any]) -> None:
         super().__init__()
@@ -342,6 +349,9 @@ class RootStep(Step):
     """
 
     is_sync_and_safe = True
+    # NEVER unary: this step's seeded column IS the bucket of N parents (the batch source that
+    # taints every field reading ``$parent``), so it must run at full bucket count.
+    _is_unary = False
 
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
         raise AssertionError(
@@ -373,6 +383,11 @@ class LoadStep(Step):
     """
 
     is_sync_and_safe = False
+    # NOT routed through the executor run-once path: a load keeps the well-tested batch path (one
+    # ``load_fn`` call over the coalesced key column). This is INDEPENDENT of hoisting — a
+    # request-constant-keyed load is still hoistable (``hoistable=True``) and IS lifted to run once
+    # there; ``_is_unary=False`` only means the bucket executor never additionally collapses it.
+    _is_unary = False
 
     def __init__(self, spec: Step, load_fn: Callable[[List[Any]], Any]) -> None:
         super().__init__()
@@ -548,6 +563,8 @@ class NodeStep(Step):
     """
 
     is_sync_and_safe = False
+    # NEVER unary: a per-type batched dispatch over the id column (same rationale as LoadStep).
+    _is_unary = False
 
     def __init__(
         self, id_step: Step, loaders: Dict[str, Callable[[List[Any]], Any]]
@@ -703,6 +720,11 @@ class FilterStep(Step):
     as that entry's value (the completer locates it at the field's path), so one bad
     entry never poisons the whole bucket — mirroring :class:`LambdaStep`. Dedup is by
     predicate identity (a captured closure is unique), like :class:`LambdaStep`.
+
+    PURITY CONTRACT: like :class:`LambdaStep`, ``predicate`` MUST be pure (a deterministic
+    function of the item), so the step is hoistable and unary-capable — over a
+    request-constant list it may be run ONCE and the filtered result fanned to every child.
+    For impure / side-effecting filtering, filter in a plain resolver instead.
     """
 
     is_sync_and_safe = True
