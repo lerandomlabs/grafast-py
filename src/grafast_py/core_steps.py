@@ -137,6 +137,21 @@ class AccessStep(Step):
         return (self.path, repr(self.fallback))
 
 
+def _is_async_callable(fn: Any) -> bool:
+    """True if calling ``fn`` yields a coroutine (used to decide LambdaStep share-eligibility).
+
+    ``asyncio.iscoroutinefunction`` catches an ``async def`` and unwraps ``functools.partial`` of
+    one, but returns False for a callable OBJECT whose ``__call__`` is async (it inspects the
+    instance, not its bound ``__call__``), so we check ``__call__`` too. The residual blind spot —
+    a plain sync ``fn`` that conditionally RETURNS a coroutine — cannot be detected statically and
+    is caught LOUDLY by the share-point guards instead.
+    """
+    if asyncio.iscoroutinefunction(fn):
+        return True
+    call = getattr(fn, "__call__", None)
+    return call is not None and asyncio.iscoroutinefunction(call)
+
+
 class LambdaStep(Step):
     """Maps each bucket entry through a user callable ``fn``.
 
@@ -170,10 +185,11 @@ class LambdaStep(Step):
         # share-eligibility decided per ``fn`` (see the class docstring's TWO CONTRACTS): a SYNC fn
         # yields a concrete value safe to compute once and copy to every row; an ASYNC fn yields a
         # per-row coroutine (single-await) that cannot be shared, so it is neither hoisted nor run
-        # once. ``asyncio.iscoroutinefunction`` also unwraps ``functools.partial``; the rare blind
-        # spot (a sync fn that RETURNS a coroutine) is caught LOUDLY by the share-point guards in
-        # ``run_steps`` / ``hoist_bridge_for_field`` rather than silently aliasing a coroutine.
-        sync = not asyncio.iscoroutinefunction(fn)
+        # once. ``_is_async_callable`` catches an ``async def`` (and ``functools.partial`` of one)
+        # AND a callable OBJECT whose ``__call__`` is async. The residual blind spot — a sync fn that
+        # conditionally RETURNS a coroutine — is caught LOUDLY by the share-point guards (in
+        # ``run_steps`` / ``hoist_bridge_for_field``) rather than silently aliasing a coroutine.
+        sync = not _is_async_callable(fn)
         self.is_sync_and_safe = sync
         self.hoistable = sync
         self.add_dependency(dep)

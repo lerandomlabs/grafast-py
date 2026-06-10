@@ -192,3 +192,48 @@ async def test_unary_async_lambda_runs_per_entry_not_broadcast():
     assert result.data == {"items": [{"tag": 7}, {"tag": 7}, {"tag": 7}]}
     # per entry: 3 DISTINCT coroutines, not one broadcast (which would be 1 call + an aliased coro).
     assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_async_callable_object_is_detected_and_not_shared():
+    """A callable OBJECT whose ``__call__`` is async is detected (via ``__call__``) and runs per
+    entry — not share-optimized into one coroutine (which would trip the share-point guard).
+
+    Regression for the ``asyncio.iscoroutinefunction(instance) == False`` blind spot: the instance
+    is not itself a coroutine function (only its bound ``__call__`` is), so ``LambdaStep`` inspects
+    ``__call__`` too.
+    """
+
+    class AsyncTag:
+        def __init__(self):
+            self.calls = 0
+
+        async def __call__(self, _):
+            self.calls += 1
+            await asyncio.sleep(0)
+            return 7
+
+    class SyncTag:
+        def __call__(self, _):
+            return 9
+
+    # detected async via __call__ -> NOT share-eligible; a sync callable object stays eligible
+    assert lambda_step(constant("k"), AsyncTag()).is_sync_and_safe is False
+    assert lambda_step(constant("k"), AsyncTag()).hoistable is False
+    assert lambda_step(constant("k"), SyncTag()).is_sync_and_safe is True
+
+    # and it executes correctly over multiple parents (per entry, distinct coroutines, no crash)
+    tagger = AsyncTag()
+    schema = make_grafast_schema(
+        "type Query { items: [Item!]! }\ntype Item { tag: Int! }",
+        {
+            "Query": {"items": lambda p, a, i: constant([{}, {}, {}])},
+            "Item": {"tag": lambda p, a, i: lambda_step(constant("k"), tagger)},
+        },
+    )
+    result = await grafast_execute(
+        schema, "{ items { tag } }", config=GrafastConfig(hoist=True)
+    )
+    assert result.errors is None, result.errors
+    assert result.data == {"items": [{"tag": 7}, {"tag": 7}, {"tag": 7}]}
+    assert tagger.calls == 3  # per entry, not aliased into one shared coroutine
