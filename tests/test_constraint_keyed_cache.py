@@ -1,13 +1,10 @@
 """The CONSTRAINT-KEYED machine: the two production-safe pillars that DID land.
 
-The sibling :mod:`tests.test_cache_context_isolation` documents the cross-tenant leak via a
-*baked-literal* model and asserts a cache HIT whose served SQL surfaces the second request's
-value INLINE (via ``literal_binds``). That inline-inspection end-state is incompatible with the
-deepcopy-free design (context is threaded as a value-LESS placeholder resolved into per-request
-params, never baked back onto the shared predicate), and two of those tests mutually contradict
-on ``customizer_bakes_literal`` (rebind-cacheable vs non-cacheable). Those stay ``xfail``.
-
-This file pins the parts that ARE landed and production-safe:
+The sibling :mod:`tests.test_cache_context_isolation` proves the end-to-end cache-HIT path: a
+context-scoped step built with a value-LESS ``ctx:`` placeholder is served from request 1's cache
+to request 2 and re-binds to request 2's context via the render seam (``where_params`` /
+``member_where_params``), so it is cacheable AND correct across contexts. This file pins the two
+under-the-hood pillars that path relies on, exercised in isolation:
 
   * the union runtime ctx: rebind — :meth:`PgUnionAllStep.member_where_params` resolves a
     ``ctx:`` placeholder (and any ``transform=``) per request from the request context, so a

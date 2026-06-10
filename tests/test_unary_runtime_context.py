@@ -33,14 +33,15 @@ value can be either cacheable XOR correct-across-contexts, never both — it mus
 constructing request's literal (then a reuse over a different context is wrong / over-scoped) or
 be non-cacheable.
 
-These tests assert the DESIRED capability — one shared step, a context-DERIVED predicate value,
+These tests assert the now-LANDED capability — one shared step, a context-DERIVED predicate value,
 re-bound per request to each context's OWN value at execute (no DB needed: we assert on the
-shared step's rendered ``where_params`` / placeholder registry, the runtime render seam). They are
-``xfail(strict=True)`` so they are RED today and turn into a loud failure (forcing the marker off)
-once the UnaryModel runtime-context step lands.
+shared step's rendered ``where_params`` / placeholder registry, the runtime render seam). The
+``ContextSources.placeholder(transform=fn)`` surface threads a derived context value as a
+value-AGNOSTIC ``ctx:`` bind computed per request, so the predicate STRUCTURE is fixed at plan time
+while its VALUE (and any transform of it) is computed fresh per request — the grafast-py analogue
+of upstream's runtime unary-context dependency.
 """
 
-import pytest
 from sqlalchemy import String, column
 
 from grafast_py.core_steps import constant
@@ -188,23 +189,14 @@ def derived_runtime_or_baked(ctx, sources):
         return [column("owner_id") == ctx["tenant"] + 1000]
 
 
-@pytest.mark.xfail(
-    reason="the runtime-transform surface IS landed (this test's transform threads per request "
-    "correctly), but the test's own assertions are internally inconsistent with its lambda: "
-    "transform=lambda v: v + 1000 yields 1001 for tenant 1 (matches) but 1002 for tenant 2, "
-    "while the test asserts 2001 (which needs v*1000+1). The transform threads exactly as "
-    "specified (render under tenant 2 -> 1002); the expected 2001 is unreachable for v + 1000. "
-    "Left xfail pending a test-assertion correction (the capability itself is proven by the two "
-    "sibling tests above).",
-    strict=True,
-)
 def test_derived_value_reevaluates_per_request_not_frozen_at_plan_time():
     """The shared step recomputes the DERIVED value per request — it is not frozen to plan time.
 
-    Built under tenant=1 (derived owner_id 1001); rendered under tenant=2 it must yield 2001 and
-    under tenant=1 it must yield 1001 — the derived value re-evaluated per request off the ONE
-    shared step (run-once-per-request, not once-at-plan). Today it is baked to 1001 at construction
-    and the registry is empty, so neither render produces a per-request value (the gap).
+    Built under tenant=1 (derived owner_id 1001); rendered under tenant=2 it must yield 1002 and
+    under tenant=1 it must yield 1001 — the derived value (``transform=lambda v: v + 1000``)
+    re-evaluated per request off the ONE shared step (run-once-per-request, not once-at-plan). The
+    transform rides a value-AGNOSTIC bind, so the SAME shared step serves each context its OWN
+    derived value rather than the constructing request's frozen literal.
     """
     step = build_scoped_step(derived_runtime_or_baked, context={"tenant": 1})
 
@@ -212,5 +204,7 @@ def test_derived_value_reevaluates_per_request_not_frozen_at_plan_time():
     assert step.placeholder_binds, "the derived value must be a runtime bind, not a baked literal"
     (bind_name,) = list(step.placeholder_binds)
 
-    assert render_under(step, {"tenant": 2}) == {bind_name: 2001}
+    # transform=lambda v: v + 1000 -> tenant 2 yields 1002, tenant 1 yields 1001 (one shared step,
+    # the derived value computed per request from each request's OWN context).
+    assert render_under(step, {"tenant": 2}) == {bind_name: 1002}
     assert render_under(step, {"tenant": 1}) == {bind_name: 1001}
