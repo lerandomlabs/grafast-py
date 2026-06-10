@@ -237,3 +237,35 @@ async def test_async_callable_object_is_detected_and_not_shared():
     assert result.errors is None, result.errors
     assert result.data == {"items": [{"tag": 7}, {"tag": 7}, {"tag": 7}]}
     assert tagger.calls == 3  # per entry, not aliased into one shared coroutine
+
+
+def test_share_point_guard_uses_the_configured_is_awaitable():
+    """The share-point guards recognise a host's CUSTOM promise-like via the request's configured
+    ``is_awaitable`` (not ``inspect.isawaitable``), so a custom awaitable is never silently aliased
+    across rows.
+
+    A SYNC lambda returning a custom promise-like is detected sync (share-eligible), but when the
+    value would be shared (broadcast / hoist-fan) the guard recognises it via the configured
+    predicate and fails LOUDLY instead of copying one promise object to every row.
+    """
+
+    class FakePromise:  # a host promise type — NOT a coroutine (inspect.isawaitable is False)
+        pass
+
+    def custom_is_awaitable(v):
+        return isinstance(v, FakePromise)
+
+    schema = make_grafast_schema(
+        "type Query { items: [Item!]! }\ntype Item { tag: Int! }",
+        {
+            "Query": {"items": lambda p, a, i: constant([{}, {}, {}])},
+            "Item": {"tag": lambda p, a, i: lambda_step(constant("k"), lambda _: FakePromise())},
+        },
+    )
+    with pytest.raises(AssertionError):
+        grafast_execute(
+            schema,
+            "{ items { tag } }",
+            is_awaitable=custom_is_awaitable,
+            config=GrafastConfig(hoist=True),
+        )
