@@ -220,23 +220,38 @@ def placeholder_transform(bind: BindParameter) -> Optional[Callable[[Any], Any]]
 
 
 def transform_key(fn: Callable[[Any], Any]) -> str:
-    """A cache-STABLE identity for a placeholder transform callable (for the dedup/sentinel key).
+    """A cache-STABLE, content-DISTINGUISHING identity for a placeholder transform callable.
 
-    ``id(fn)`` is NOT usable here: a 2-arg ``select_customizer`` is re-invoked on every cache-hit
-    to revalidate its constraints, minting a FRESH function object each time, so an id-based key
-    would never match the stored key and would silently disable plan caching for any customizer
-    using a ``transform=``. The code object, by contrast, is created once at def-time and SHARED
-    across invocations, so it is stable. The closure cell values are folded in so two lambdas at
-    the SAME source line capturing DIFFERENT values still differ (and a transform that closes over
-    per-request state correctly fails to match across requests, forcing a safe re-plan rather than
-    reusing the first request's captured value). A builtin/C callable with no ``__code__``
-    (``str.upper``) keys by its qualified name.
+    Two requirements pull against ``id(fn)``:
+
+    * STABLE across re-invocation — a 2-arg ``select_customizer`` is re-invoked on every cache-hit
+      to revalidate its constraints, minting a FRESH function object each time. An id-based key
+      would never match the stored key and would silently disable plan caching for any customizer
+      using a ``transform=``. A code object is created once at def-time and SHARED across
+      invocations, so content drawn from it is stable.
+    * DISTINGUISHING by BEHAVIOUR, not source location — two distinct transforms on the SAME line
+      (``lambda v: v + 1`` vs ``lambda v: v + 2``) must not collapse, else same-source placeholders
+      would dedup/cache as if identical and apply the wrong transform to one of them.
+
+    So for a Python callable we key on its EXECUTABLE CONTENT: bytecode + constants + defaults +
+    the closure cell values — equivalent transforms merge, different ones differ (incl. closures
+    over different values; a transform closing over per-request state then forces a safe re-plan
+    rather than reusing the first request's captured value). A callable with no ``__code__`` keys
+    by its own qualified name (a builtin/method descriptor like ``str.upper``) or, for a callable
+    INSTANCE, by its type plus ``__dict__`` state (so ``AddN(1)`` and ``AddN(2)`` differ).
     """
     code = getattr(fn, "__code__", None)
-    if code is None:
-        return f"{getattr(fn, '__module__', '')}.{getattr(fn, '__qualname__', repr(fn))}"
-    closure = tuple(repr(cell.cell_contents) for cell in (fn.__closure__ or ()))
-    return f"{code.co_filename}:{code.co_firstlineno}:{code.co_name}:{closure!r}"
+    if code is not None:
+        closure = tuple(repr(cell.cell_contents) for cell in (fn.__closure__ or ()))
+        return f"code:{code.co_code!r}:{code.co_consts!r}:{fn.__defaults__!r}:{closure!r}"
+    qualname = getattr(fn, "__qualname__", None)
+    if qualname is not None:
+        return f"named:{getattr(fn, '__module__', '')}.{qualname}"
+    state = getattr(fn, "__dict__", {})
+    return (
+        f"obj:{type(fn).__module__}.{type(fn).__qualname__}:"
+        f"{tuple(sorted((k, repr(v)) for k, v in state.items()))!r}"
+    )
 
 
 __all__ = [

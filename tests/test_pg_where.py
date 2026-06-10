@@ -534,6 +534,46 @@ def test_transform_placeholder_key_is_stable_across_reinvocation():
     assert key(make()) == key(make())
 
 
+def test_same_line_distinct_transforms_do_not_collapse():
+    """Two DISTINCT transforms defined on the SAME source line (no closure) must not collide.
+
+    The transform key folds in bytecode + constants, not source location, so ``lambda v: v + 1``
+    and ``lambda v: v + 2`` written on ONE line stay distinct — otherwise same-source placeholders
+    would dedup as if identical and apply the wrong transform to one. Regression for a
+    location-only key collision.
+    """
+    t1, t2 = (lambda v: v + 1), (lambda v: v + 2)  # SAME line, same name, no closure
+
+    def key(predicate):
+        return predicate_key(predicate, placeholder_binds_in(predicate) or None)
+
+    p1 = column("k") == pg_placeholder("ctx:k", type_=String, transform=t1)
+    p2 = column("k") == pg_placeholder("ctx:k", type_=String, transform=t2)
+    assert key(p1) != key(p2)
+
+
+def test_callable_instance_transform_distinguishes_state():
+    """A callable INSTANCE transform (no ``__code__``) is keyed by its type + ``__dict__`` state,
+    so two instances of one class with DIFFERENT state stay distinct while the SAME state merges.
+    """
+
+    class AddN:
+        def __init__(self, n):
+            self.n = n
+
+        def __call__(self, v):
+            return v + self.n
+
+    def key(predicate):
+        return predicate_key(predicate, placeholder_binds_in(predicate) or None)
+
+    p1 = column("k") == pg_placeholder("ctx:k", type_=String, transform=AddN(1))
+    p2 = column("k") == pg_placeholder("ctx:k", type_=String, transform=AddN(2))
+    p3 = column("k") == pg_placeholder("ctx:k", type_=String, transform=AddN(1))
+    assert key(p1) != key(p2)  # different state -> distinct
+    assert key(p1) == key(p3)  # same state -> merge
+
+
 def test_connection_predicate_participates_in_key():
     """Customization folds into the connection step's dedup key too."""
     a = PgConnectionStep(
