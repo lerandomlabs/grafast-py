@@ -331,6 +331,9 @@ class PgCustomizable(Step):
     # how many of the leading where_predicates came from the resource customizer (the rest are
     # per-plan .where()s); has_literal_customization inspects only these.
     _customizer_predicate_count: int = 0
+    # NEVER unary: a pg select/connection builds + executes SQL over the whole bucket (its own
+    # batching), so it always runs at full bucket count — never routed through the run-once path.
+    _is_unary = False
 
     def init_customization(
         self,

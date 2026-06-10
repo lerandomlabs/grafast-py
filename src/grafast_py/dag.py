@@ -11,9 +11,17 @@ merges identical steps (same class, same dependency winner ids, same ``peer_key`
 and returns them in dependency order, assigning fresh ids if unset.
 """
 
-from typing import Dict, List, Sequence, Set
+from typing import Dict, List, Sequence, Set, Tuple
 
+from .config import log
 from .step_model import Step
+
+# Upstream ``OperationPlan.optimizeSteps`` bounds its fixpoint with ``MAX_OPTIMIZATION_LOOPS``
+# (10) and warns on overrun rather than spinning. grafast-py's ``optimize`` is a per-step
+# fixpoint that can need more iterations on deep inline chains, so the cap is set generously
+# above any real convergence depth; exceeding it means a step's ``optimize`` never settles
+# (a bug), and we warn + stop with the plan in its last consistent state rather than hang.
+MAX_OPTIMIZATION_LOOPS = 1000
 
 
 class Plan:
@@ -84,13 +92,20 @@ class Plan:
         # folded child (the child bucket's parent_step + the AccessSteps reading its rows).
         # Empty for the default identity optimize, so it is a no-op there.
         self._optimize_side_replacements: List[tuple[Step, Step]] = []
-        # ids of steps already REPLACED AWAY during the running optimize pass. A replaced
-        # step is structurally still in `self.steps` (it is trimmed only at tree_shake),
-        # but it is DEAD — no live consumer reads it — so `dependents_of` must not surface
-        # it to a dependent-absorbing optimizer, else the inliner would re-fold an already-
-        # folded child forever (a fixpoint that never settles). Populated by `optimize`,
-        # empty otherwise (so `dependents_of` is unfiltered for any non-optimize caller).
-        self._replaced_away: set[int] = set()
+        # the MAINTAINED reverse-edge index (upstream ``StepTracker``'s ``$step.dependents``):
+        # ``dependency step id -> list of (dependent step, dependency index)``. Kept in sync at
+        # registration (`_register`) and at every structural rewrite (`eradicate`), so
+        # `dependents_of` is an O(out-degree) lookup that is a pure function of the LIVE step
+        # set — never an on-demand rescan of `self.steps`, and never filtered by transient
+        # pass state. A step REPLACED/MERGED away is `eradicate`d: its reverse edges move to the
+        # survivor and it leaves this index immediately, so a dependent-absorbing optimizer (the
+        # LATERAL inliner) can never re-fold an already-folded child — structural removal, not a
+        # hidden "already replaced" filter, prevents the runaway.
+        self._dependents_index: Dict[int, List[Tuple[Step, int]]] = {}
+        # ids eradicated during the running pass, trimmed from `self.steps` once at pass end
+        # (the index is updated immediately; the `self.steps` list is filtered in one sweep to
+        # keep eradication O(1) amortised rather than O(n) per removal). Empty between passes.
+        self._dead_ids: Set[int] = set()
 
     def record_replacement(self, old: Step, new: Step) -> None:
         """Record a SIDE replacement (`old` -> `new`) for the running optimize pass.
@@ -114,8 +129,15 @@ class Plan:
         for dep in step.dependencies:
             self._register(dep)
         self._seen.add(id(step))
+        # id = current length: collision-free because, in the finalize flow, every `add_step`
+        # happens BEFORE the pass's single trailing `_sweep_dead` (which shrinks `self.steps`).
+        # A future pass that registered a step AFTER a sweep would need a monotonic counter.
         step.id = len(self.steps)
         self.steps.append(step)
+        # record this step's forward edges in the reverse index (deps are registered first,
+        # so each already carries an id). Keeps the index a faithful inverse of the live DAG.
+        for idx, dep in enumerate(step.dependencies):
+            self._dependents_index.setdefault(dep.id, []).append((step, idx))
 
     def topo_order(self) -> List[Step]:
         """Return all registered steps in dependency order."""
@@ -127,9 +149,10 @@ class Plan:
         Walks the steps deps-first (`order_steps`) so a step's dependencies are already
         in their optimized form when its own `optimize` runs, then iterates to a fixpoint
         because one rewrite can enable another (an absorbed dependent can leave its
-        dependency newly foldable). When `optimize` returns a replacement, the change is
-        recorded and every reference to the old step is rewired to the replacement via the
-        SAME survivor-chain machinery `deduplicate` uses (`_rewire_dependencies`/`_resolve`).
+        dependency newly foldable). When `optimize` returns a replacement, the old step is
+        `eradicate`d — its dependents repointed onto the replacement and the step removed
+        from the live set and reverse index — the SAME structural-removal primitive
+        `deduplicate` uses.
 
         A hook may ALSO record SIDE replacements via `record_replacement` (the LATERAL
         inliner folds child relation steps into the parent it returns, rewriting each
@@ -137,58 +160,108 @@ class Plan:
         hook runs, so the same rewire repoints every reference to a folded child.
 
         With the default identity `Step.optimize`, the loop runs exactly once, no
-        replacement is recorded, no rewire fires, and the returned remap is empty — a
+        replacement is recorded, nothing is eradicated, and the returned remap is empty — a
         provable no-op over the finalized plan.
+
+        The fixpoint is BOUNDED by `MAX_OPTIMIZATION_LOOPS` (upstream parity): a step whose
+        `optimize` never settles is a bug, so we warn and stop with the plan in its last
+        consistent state rather than spin forever.
         """
-        replaced: Dict[int, Step] = {}  # old id -> replacement step
+        merged: Dict[int, Step] = {}  # old id -> immediate replacement
         changed = True
+        loops = 0
         while changed:
             changed = False
+            loops += 1
+            if loops > MAX_OPTIMIZATION_LOOPS:
+                log.warning(
+                    "optimize did not converge; stopping at cap",
+                    cap=MAX_OPTIMIZATION_LOOPS,
+                    steps=len(self.steps),
+                )
+                break
             for step in order_steps(self.steps):
-                if replaced.get(step.id, step) is not step:
-                    continue  # already replaced away
+                if step.id in self._dead_ids:
+                    continue  # eradicated earlier this pass
                 new = step.optimize(self)
-                # drain SIDE replacements the hook recorded (the inliner's folded
-                # children) BEFORE handling its return value, so a parent that returns a
-                # replacement AND folds children rewires both in one pass.
+                # drain SIDE replacements the hook recorded (the inliner's folded children)
+                # BEFORE handling its return value, so a parent that returns a replacement
+                # AND folds children eradicates both in one pass. Each replacement is already
+                # registered by the inliner (record_replacement requires it).
                 if self._optimize_side_replacements:
                     for old_child, replacement in self._optimize_side_replacements:
-                        replaced[old_child.id] = replacement
-                        self._replaced_away.add(old_child.id)
+                        if replacement.id < 0:
+                            self.add_step(replacement)
+                        self.eradicate(old_child, replacement)
+                        merged[old_child.id] = replacement
                     self._optimize_side_replacements = []
                     changed = True
                 if new is step:
                     continue
-                replaced[step.id] = new
-                self._replaced_away.add(step.id)
                 if new.id < 0:  # a freshly built replacement not yet registered
                     self.add_step(new)
+                self.eradicate(step, new)
+                merged[step.id] = new
                 changed = True
-            if changed:
-                _rewire_dependencies(self.steps, _as_survivors(self.steps, replaced))
-        self._replaced_away = set()
-        return _collapse_chain(self.steps, replaced)
+        self._sweep_dead()
+        return _resolve_merged(merged)
 
     def dependents_of(self, step: Step) -> List[Step]:
         """Return every LIVE registered step that lists `step` among its dependencies.
 
-        The read accessor the inlining optimizer uses inside its `optimize` hook to find
-        (and absorb) the steps consuming its output. Computed by inverting
-        `step.dependencies` over `self.steps` on demand — no eager reverse-edge map is
-        maintained, since nothing else consumes one.
-
-        Steps already REPLACED AWAY during the running optimize pass (`_replaced_away`) are
-        excluded: such a step is dead (no live consumer reads it) but still structurally in
-        `self.steps` until tree_shake. Surfacing it would let a dependent-absorbing optimizer
-        re-fold an already-folded child forever. Outside an optimize pass `_replaced_away` is
-        empty, so the result is the full structural inversion.
+        Reads the maintained reverse-edge index (`_dependents_index`) — an O(out-degree)
+        lookup that is a pure function of the live step set, deduped by identity (a step
+        depending on `step` at several indices appears once). An `eradicate`d step is absent
+        from the index, so it is never surfaced; there is no transient-pass-state filter.
+        This is the read accessor the LATERAL inlining optimizer uses inside its `optimize`
+        hook to find (and absorb) the steps consuming its output.
         """
-        return [
-            s
-            for s in self.steps
-            if s.id not in self._replaced_away
-            and any(dep is step for dep in s.dependencies)
-        ]
+        out: List[Step] = []
+        seen: Set[int] = set()
+        for dependent, _idx in self._dependents_index.get(step.id, []):
+            if id(dependent) not in seen:
+                seen.add(id(dependent))
+                out.append(dependent)
+        return out
+
+    def eradicate(self, dead: Step, survivor: Step) -> None:
+        """Structurally remove `dead`, transferring its dependents to `survivor`.
+
+        The single rewrite primitive `deduplicate` and `optimize` share (upstream's
+        ``StepTracker.replaceStep`` + ``eradicate``): every step that depended on `dead` is
+        repointed to `survivor` (its `dependencies[idx]` and the reverse edge both move),
+        `dead`'s own forward edges leave its dependencies' reverse lists, and `dead` leaves the
+        index immediately. `dead` is marked for removal from `self.steps` (trimmed once at pass
+        end via `_sweep_dead`, keeping eradication O(1) amortised). After this, no live step
+        references `dead` and `dependents_of` can never surface it — so a dependent-absorbing
+        optimizer cannot re-fold an already-folded child.
+        """
+        if dead is survivor:
+            return
+        moved = self._dependents_index.pop(dead.id, [])
+        survivor_edges = self._dependents_index.setdefault(survivor.id, [])
+        for dependent, idx in moved:
+            dependent.dependencies[idx] = survivor
+            survivor_edges.append((dependent, idx))
+            # a rewire onto a non-unary survivor lowers the dependent (monotone narrowing —
+            # a merge/replace can only ever LOWER unariness, never raise it).
+            if not survivor._is_unary:
+                dependent._is_unary = False
+        for idx, dep in enumerate(dead.dependencies):
+            edges = self._dependents_index.get(dep.id)
+            if edges is not None:
+                self._dependents_index[dep.id] = [
+                    (s, i) for (s, i) in edges if not (s is dead and i == idx)
+                ]
+        self._dead_ids.add(dead.id)
+
+    def _sweep_dead(self) -> None:
+        """Trim eradicated steps from `self.steps` in one pass; clear the working set."""
+        if not self._dead_ids:
+            return
+        dead = self._dead_ids
+        self.steps = [s for s in self.steps if s.id not in dead]
+        self._dead_ids = set()
 
     def tree_shake(self, consumption_roots: List[Step]) -> List[Step]:
         """Drop steps unreachable from `consumption_roots` AND not side-effecting.
@@ -221,6 +294,13 @@ class Plan:
         side_effecting = [s for s in self.steps if not s.dedupable]
         keep = reachable | {s.id for s in order_steps(side_effecting)}
         self.steps = [s for s in self.steps if s.id in keep]
+        # prune the reverse index to the kept set (both dependency keys and dependent edges)
+        # so the maintained index stays a faithful inverse of the live DAG after the trim.
+        self._dependents_index = {
+            dep_id: [(s, i) for (s, i) in edges if s.id in keep]
+            for dep_id, edges in self._dependents_index.items()
+            if dep_id in keep
+        }
         return [s for s in side_effecting if s.id not in reachable]
 
     def deduplicate(self) -> Dict[int, Step]:
@@ -232,35 +312,40 @@ class Plan:
         every reference (other steps' ``dependencies`` and the returned remap) is
         rewired to it. Iterated to a fixpoint because merging deps can make their
         dependents newly identical.
-        """
-        survivors: Dict[int, Step] = {s.id: s for s in self.steps}
 
+        A merged step is `eradicate`d (its dependents repointed onto the winner, the step
+        removed from `self.steps` and the reverse index) rather than hidden in a survivors
+        map and trimmed later — so `dependents_of` reflects the merge immediately.
+        """
+        entry_steps = list(self.steps)  # snapshot for the full old-id -> final remap
+        merged: Dict[int, Step] = {}  # old id -> immediate winner
         changed = True
         while changed:
             changed = False
             by_key: Dict[tuple, Step] = {}
             for step in order_steps(self.steps):
-                if survivors.get(step.id) is not step:
-                    continue  # already merged away
+                if step.id in self._dead_ids:
+                    continue  # already merged away this pass
                 if not step.dedupable:
                     continue  # side-effecting (e.g. mutation): never merge with a peer
-                key = _structural_key(step, survivors)
+                key = _structural_key(step)
                 winner = by_key.get(key)
                 if winner is None:
                     by_key[key] = step
                     continue
-                # merge `step` into `winner`
+                # merge `step` into `winner`: notify, then eradicate (repoint its dependents)
                 step.deduplicated_with(winner)
-                survivors[step.id] = winner
+                self.eradicate(step, winner)
+                merged[step.id] = winner
                 changed = True
-
-            if changed:
-                _rewire_dependencies(self.steps, survivors)
-
-        # collapse transitive survivor chains so callers get a direct mapping
+        self._sweep_dead()
+        # the full old-id -> final remap over every step present at entry, chains collapsed
         remap: Dict[int, Step] = {}
-        for step in self.steps:
-            remap[step.id] = _resolve(survivors, step.id)
+        for step in entry_steps:
+            final = step
+            while final.id in merged and merged[final.id] is not final:
+                final = merged[final.id]
+            remap[step.id] = final
         return remap
 
 
@@ -327,52 +412,31 @@ def order_steps_within(targets: Sequence[Step], boundary_ids: Set[int]) -> List[
     return ordered
 
 
-def _structural_key(step: Step, survivors: Dict[int, Step]) -> tuple:
-    """A hashable key identifying a step's structural identity for dedup."""
-    dep_ids = tuple(_resolve(survivors, dep.id).id for dep in step.dependencies)
+def _structural_key(step: Step) -> tuple:
+    """A hashable key identifying a step's structural identity for dedup.
+
+    Reads the step's dependency ids DIRECTLY: `eradicate` repoints a merged step's
+    dependents onto the winner immediately, so every live step's `dependencies` already
+    point at the current survivors — no survivor-map resolution is needed.
+    """
+    dep_ids = tuple(dep.id for dep in step.dependencies)
     return (type(step), step.peer_key, dep_ids, step.dedup_params())
 
 
-def _rewire_dependencies(steps: List[Step], survivors: Dict[int, Step]) -> None:
-    """Point every step's dependency list at the current survivors."""
-    for step in steps:
-        if survivors.get(step.id) is not step:
-            continue
-        step.dependencies = [_resolve(survivors, dep.id) for dep in step.dependencies]
+def _resolve_merged(merged: Dict[int, Step]) -> Dict[int, Step]:
+    """Collapse transitive `old id -> immediate replacement` links into `old id -> final`.
 
-
-def _resolve(survivors: Dict[int, Step], step_id: int) -> Step:
-    """Follow a survivor chain to the final winning step."""
-    winner = survivors[step_id]
-    while winner.id != step_id and survivors[winner.id] is not winner:
-        step_id = winner.id
-        winner = survivors[step_id]
-    return winner
-
-
-def _as_survivors(steps: List[Step], replaced: Dict[int, Step]) -> Dict[int, Step]:
-    """Lift a sparse `old id -> replacement` map into a full survivors map.
-
-    `optimize`'s `replaced` only records the steps that rewrote themselves, but
-    `_rewire_dependencies`/`_resolve` require a winner for EVERY id they touch (an
-    unreplaced step is its own survivor). This fills the gaps so the same chain-
-    following primitives `deduplicate` uses apply unchanged to the optimize remap.
+    One pass can replace A with B and a later one replace B with C; callers want `A -> C`
+    directly. Follows each chain to the final survivor and returns only the entries that
+    actually moved (an unchanged step is absent — matching the old `_collapse_chain`).
     """
-    survivors: Dict[int, Step] = {s.id: s for s in steps}
-    survivors.update(replaced)
-    return survivors
-
-
-def _collapse_chain(steps: List[Step], replaced: Dict[int, Step]) -> Dict[int, Step]:
-    """Collapse transitive replacement chains into a direct `old id -> final` map.
-
-    One optimize iteration can replace A with B and a later one replace B with C;
-    callers want `A -> C` directly. Resolves each replaced id through the survivor
-    chain (filling unreplaced gaps via `_as_survivors`) and returns only the entries
-    that actually moved.
-    """
-    survivors = _as_survivors(steps, replaced)
-    return {old_id: _resolve(survivors, old_id) for old_id in replaced}
+    out: Dict[int, Step] = {}
+    for old_id, immediate in merged.items():
+        final = immediate
+        while final.id in merged and merged[final.id] is not final:
+            final = merged[final.id]
+        out[old_id] = final
+    return out
 
 
 def _compose_remaps(first: Dict[int, Step], second: Dict[int, Step]) -> Dict[int, Step]:

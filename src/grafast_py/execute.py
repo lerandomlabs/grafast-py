@@ -449,7 +449,9 @@ def complete_field(
         # now live) + the per-value parent-bucket owner (`live_idx`), so the child seeds those
         # columns instead of re-running the hoisted steps. None when nothing was hoisted (the
         # default — byte-identical: `complete_values` never threads it).
-        bridge = hoist_bridge_for_field(field_plan, step_columns, live_idx)
+        bridge = hoist_bridge_for_field(
+            field_plan, step_columns, live_idx, context.is_awaitable
+        )
     else:
         # serial (mutation) path: no bucket-level columns were precomputed, so run
         # just this field's step sub-DAG over the live parents — keeping each
@@ -787,7 +789,7 @@ def find_list_completer(completer):
     return None
 
 
-def hoist_bridge_for_field(field_plan, step_columns, live_idx):
+def hoist_bridge_for_field(field_plan, step_columns, live_idx, is_awaitable):
     """Build the :class:`HoistBridge` for a field that descends into a hoist-affected child.
 
     Projects each column the child's layer HOISTED OUT (produced once in THIS bucket's store,
@@ -805,6 +807,21 @@ def hoist_bridge_for_field(field_plan, step_columns, live_idx):
     if not hoisted_out:
         return None
     columns = {hid: [step_columns[hid][p] for p in live_idx] for hid in hoisted_out}
+    # SHARE-POINT GUARD: a hoisted column is FANNED to many child rows, so EVERY value must be
+    # concrete — an awaitable is single-await and cannot be copied (the @stream path, completing
+    # rows separately, would re-await it -> "cannot reuse already awaited coroutine"). Uses the
+    # request's CONFIGURED ``is_awaitable`` (not ``inspect.isawaitable``) so a host's custom
+    # promise-like is recognised exactly as completion would. A hoisted step is sync-eligible by
+    # construction; an awaitable here means a step lied about sync-ness (the LambdaStep detection
+    # blind spot). Checks the WHOLE column (cheap; does not rely on the request-constant uniformity
+    # invariant). Fail loudly rather than alias it.
+    for hid, col in columns.items():
+        if any(is_awaitable(v) for v in col):
+            raise AssertionError(
+                f"hoisted step #{hid} produced an awaitable; a hoisted value is fanned across rows"
+                f" and must be concrete (an async fn must not be hoistable — for async I/O use a"
+                f" load step, which batches AND resolves its column before any fan-out)"
+            )
     return HoistBridge(columns=columns)
 
 

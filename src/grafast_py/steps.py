@@ -90,6 +90,10 @@ class ResolveStep(Step):
     # a resolver is arbitrary/possibly side-effecting, so it must NEVER merge with
     # another field's resolver step.
     dedupable = False
+    # arbitrary host code: never hoist it (impure fan-out) and never treat it as unary
+    # (run-once would diverge from per-entry), exactly like LambdaStep / FilterStep.
+    hoistable = False
+    _is_unary = False
     # it needs the per-invocation request context + per-parent paths via BucketExtra.
     wants_extra = True
 

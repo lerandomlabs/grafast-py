@@ -149,6 +149,9 @@ class NestedExtractStep(Step):
     """
 
     is_sync_and_safe = True
+    # NEVER unary: it reads each parent row's folded nested column (a per-entry projection off
+    # the non-unary parent select), so it runs at full bucket count.
+    _is_unary = False
 
     def __init__(
         self,

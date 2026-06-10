@@ -18,6 +18,7 @@ two steps with the same class, the same dependency winner ids, the same
 to one, so a value loaded/accessed twice is loaded/accessed once.
 """
 
+import asyncio
 import base64
 import inspect
 import json
@@ -136,21 +137,61 @@ class AccessStep(Step):
         return (self.path, repr(self.fallback))
 
 
+def _is_async_callable(fn: Any) -> bool:
+    """True if calling ``fn`` yields a coroutine (used to decide LambdaStep share-eligibility).
+
+    ``asyncio.iscoroutinefunction`` catches an ``async def`` and unwraps ``functools.partial`` of
+    one, but returns False for a callable OBJECT whose ``__call__`` is async (it inspects the
+    instance, not its bound ``__call__``), so we check ``__call__`` too. The residual blind spot —
+    a plain sync ``fn`` that conditionally RETURNS a coroutine — cannot be detected statically and
+    is caught LOUDLY by the share-point guards instead.
+    """
+    if asyncio.iscoroutinefunction(fn):
+        return True
+    call = getattr(fn, "__call__", None)
+    return call is not None and asyncio.iscoroutinefunction(call)
+
+
 class LambdaStep(Step):
     """Maps each bucket entry through a user callable ``fn``.
 
     One dependency: the input step (use :func:`list_step` to feed several inputs as a
     tuple). ``execute`` runs ``fn`` over the dependency's whole column in one pass.
-    If ``fn`` is an async function the per-entry results are coroutines; the planner
-    treats lambdas as not sync-and-safe so the executor awaits them. Dedup is by
-    ``fn`` identity (a captured closure is unique, so only the same object merges).
-    """
+    If ``fn`` is an async function the per-entry results are coroutines; the executor awaits
+    them. Dedup is by ``fn`` identity (a captured closure is unique, so only the same object
+    merges).
 
-    is_sync_and_safe = False
+    TWO CONTRACTS govern whether this step may be SHARE-optimized (hoisted, or run once and the
+    result fanned to every row — both compute the value once and hand a COPY to each row):
+
+    * PURITY (semantics): ``fn`` MUST be a deterministic function of its input, so the one shared
+      result equals what per-row would have produced. An IMPURE ``fn`` (counter / uuid / clock /
+      write) is OUT of contract — for impure or side-effecting work use a plain resolver field
+      (a :class:`ResolveStep`, ``dedupable=False``, never shared), not a plan lambda.
+    * SYNC (mechanics): the shared value must be a CONCRETE result, not a coroutine — a coroutine is
+      single-await, so one cannot be copied across rows (the @stream path, completing rows
+      separately, would re-await it and raise "cannot reuse already awaited coroutine"). So the step
+      INSPECTS ``fn`` at construction: a SYNC ``fn`` is hoistable + run-once-able; an ASYNC ``fn`` is
+      neither (it runs per entry, each row getting its own coroutine). For async I/O prefer a LOAD
+      step (:func:`load_one` / :func:`load_many`) — it BATCHES the I/O across all rows (the whole
+      point of the engine) AND is share-safe (its column is resolved to concrete values before any
+      fan-out). An async lambda forgoes both batching and the share-optimization, so it is rarely
+      what you want.
+    """
 
     def __init__(self, dep: Step, fn: Callable[[Any], Any]) -> None:
         super().__init__()
         self.fn = fn
+        # share-eligibility decided per ``fn`` (see the class docstring's TWO CONTRACTS): a SYNC fn
+        # yields a concrete value safe to compute once and copy to every row; an ASYNC fn yields a
+        # per-row coroutine (single-await) that cannot be shared, so it is neither hoisted nor run
+        # once. ``_is_async_callable`` catches an ``async def`` (and ``functools.partial`` of one)
+        # AND a callable OBJECT whose ``__call__`` is async. The residual blind spot — a sync fn that
+        # conditionally RETURNS a coroutine — is caught LOUDLY by the share-point guards (in
+        # ``run_steps`` / ``hoist_bridge_for_field``) rather than silently aliasing a coroutine.
+        sync = not _is_async_callable(fn)
+        self.is_sync_and_safe = sync
+        self.hoistable = sync
         self.add_dependency(dep)
 
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
@@ -254,6 +295,9 @@ class EachStep(Step):
     """
 
     is_sync_and_safe = False
+    # NEVER unary: it explodes per-parent lists and runs a sub-DAG over the flattened items —
+    # a per-entry transform, not a request-constant value.
+    _is_unary = False
 
     def __init__(self, list_step: Step, mapper: Callable[["ItemStep"], Step]) -> None:
         super().__init__()
@@ -316,6 +360,8 @@ class ItemStep(Step):
     """
 
     is_sync_and_safe = True
+    # NEVER unary: the flattened item column is genuinely per-entry (upstream __item parity).
+    _is_unary = False
 
     def __init__(self, items: List[Any]) -> None:
         super().__init__()
@@ -336,6 +382,9 @@ class RootStep(Step):
     """
 
     is_sync_and_safe = True
+    # NEVER unary: this step's seeded column IS the bucket of N parents (the batch source that
+    # taints every field reading ``$parent``), so it must run at full bucket count.
+    _is_unary = False
 
     def execute(self, count: int, values: List[List[Any]]) -> List[Any]:
         raise AssertionError(
@@ -367,6 +416,11 @@ class LoadStep(Step):
     """
 
     is_sync_and_safe = False
+    # NOT routed through the executor run-once path: a load keeps the well-tested batch path (one
+    # ``load_fn`` call over the coalesced key column). This is INDEPENDENT of hoisting — a
+    # request-constant-keyed load is still hoistable (``hoistable=True``) and IS lifted to run once
+    # there; ``_is_unary=False`` only means the bucket executor never additionally collapses it.
+    _is_unary = False
 
     def __init__(self, spec: Step, load_fn: Callable[[List[Any]], Any]) -> None:
         super().__init__()
@@ -542,6 +596,8 @@ class NodeStep(Step):
     """
 
     is_sync_and_safe = False
+    # NEVER unary: a per-type batched dispatch over the id column (same rationale as LoadStep).
+    _is_unary = False
 
     def __init__(
         self, id_step: Step, loaders: Dict[str, Callable[[List[Any]], Any]]
@@ -697,6 +753,11 @@ class FilterStep(Step):
     as that entry's value (the completer locates it at the field's path), so one bad
     entry never poisons the whole bucket — mirroring :class:`LambdaStep`. Dedup is by
     predicate identity (a captured closure is unique), like :class:`LambdaStep`.
+
+    PURITY CONTRACT: like :class:`LambdaStep`, ``predicate`` MUST be pure (a deterministic
+    function of the item), so the step is hoistable and unary-capable — over a
+    request-constant list it may be run ONCE and the filtered result fanned to every child.
+    For impure / side-effecting filtering, filter in a plain resolver instead.
     """
 
     is_sync_and_safe = True

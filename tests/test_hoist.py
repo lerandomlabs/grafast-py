@@ -31,7 +31,7 @@ from graphql.execution.collect_fields import collect_fields
 from grafast_py import GrafastExecutionContext
 from grafast_py.completion import find_object_completer
 from grafast_py.config import GrafastConfig
-from grafast_py.core_steps import RootStep, access, constant, load_one
+from grafast_py.core_steps import RootStep, access, constant, lambda_step, load_one
 from grafast_py.dag import order_steps
 from grafast_py.entry import grafast_execute
 from grafast_py.plan import plan_operation
@@ -566,3 +566,59 @@ def test_build_hoist_parent_store_fails_loud_when_bridge_missing():
     # the no-hoist case stays a quiet None (the byte-identical default path).
     plain = SimpleNamespace(layer=SimpleNamespace(hoisted_out_ids=frozenset()))
     assert build_hoist_parent_store(plain, None, [0, 1]) is None
+
+
+def test_sync_lambda_over_constant_is_run_once():
+    """A SYNC ``lambda_step`` over a request-constant input is computed ONCE and shared, so ``fn``
+    fires exactly once for the whole request (``off_n == on_n == 1``), data byte-identical.
+
+    A sync lambda's value is a CONCRETE result, so it satisfies both share-contracts (pure by
+    contract + sync by inspection): the engine runs it once and copies the result to every row —
+    via the executor run-once (so it holds even with hoist OFF) and/or hoisting. An ASYNC lambda
+    does NOT get this (its result is a per-row coroutine that cannot be shared — see
+    tests/test_unary_model_gaps.py::test_unary_async_lambda_runs_per_entry_not_broadcast and the
+    @stream regression). The call counter is a test instrument only; ``fn``'s return is constant.
+    """
+    orgs = [{"id": 10}, {"id": 20}]
+    people = [{"id": 1}, {"id": 2}]
+
+    def run(hoist):
+        calls = {"n": 0}
+
+        def pure_tag(_):
+            calls["n"] += 1
+            return 100  # PURE: always 100, independent of call count / order
+
+        def plan_orgs(p, a, i):
+            return constant(orgs)
+
+        def plan_people(p, a, i):
+            return load_one(constant("p"), lambda keys: [people for _ in keys])
+
+        def plan_tag(p, a, i):
+            return lambda_step(constant("k"), pure_tag)  # pure, request-constant input
+
+        schema = make_grafast_schema(
+            TWO_LEVEL_SDL,
+            {
+                "Query": {"orgs": plan_orgs},
+                "Org": {"id": leaf("id"), "people": plan_people},
+                "Person": {"id": leaf("id"), "tag": plan_tag},
+            },
+        )
+        result = grafast_execute(
+            schema, "{ orgs { id people { id tag } } }", config=GrafastConfig(hoist=hoist)
+        )
+        assert result.errors is None
+        tags = [[pp["tag"] for pp in o["people"]] for o in result.data["orgs"]]
+        return tags, calls["n"]
+
+    off_tags, off_n = run(False)
+    on_tags, on_n = run(True)
+
+    # data byte-identical (pure fn), hoist ON == OFF.
+    assert off_tags == [[100, 100], [100, 100]]
+    assert on_tags == off_tags
+    # the SYNC lambda is run ONCE for the whole request (concrete value, shared) — whether or not
+    # hoist is on (the executor run-once already collapses it). With the old barrier both were 4.
+    assert off_n == 1 and on_n == 1

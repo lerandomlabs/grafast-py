@@ -23,6 +23,9 @@ def never_awaitable(_value: Any) -> bool:
 class SourceStep(Step):
     """0-dependency source seeded with a fixed column."""
 
+    # a per-entry batch source (like RootStep/ItemStep), so never unary.
+    _is_unary = False
+
     def __init__(self, column: List[Any]) -> None:
         super().__init__()
         self.column = column
@@ -99,6 +102,8 @@ def test_run_steps_threads_columns_through_a_chain():
 
 def test_run_steps_asserts_column_length_contract():
     class WrongLengthStep(Step):
+        _is_unary = False  # a batch step: must return one value per bucket entry
+
         def execute(self, count, values):
             return [0]  # returns 1 value for a bucket of 3 → contract violation
 
@@ -113,6 +118,8 @@ async def test_run_steps_supports_an_async_column():
     """A step may return a coroutine resolving to its whole column."""
 
     class AsyncSourceStep(Step):
+        _is_unary = False  # a batch source: returns a per-entry column
+
         async def execute(self, count, values):
             await asyncio.sleep(0)
             return [7, 8, 9]
