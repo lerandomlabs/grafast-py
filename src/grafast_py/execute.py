@@ -807,15 +807,16 @@ def hoist_bridge_for_field(field_plan, step_columns, live_idx, is_awaitable):
     if not hoisted_out:
         return None
     columns = {hid: [step_columns[hid][p] for p in live_idx] for hid in hoisted_out}
-    # SHARE-POINT GUARD: a hoisted column is FANNED to many child rows, so it must be concrete — an
-    # awaitable is single-await and cannot be copied (the @stream path, completing rows separately,
-    # would re-await it -> "cannot reuse already awaited coroutine"). Uses the request's CONFIGURED
-    # ``is_awaitable`` (not ``inspect.isawaitable``) so a host's custom promise-like is recognised
-    # exactly as completion would. A hoisted step is sync-eligible by construction AND request-
-    # constant (its column is uniform, so col[0] represents it); an awaitable here means a step lied
-    # about sync-ness (the LambdaStep detection blind spot). Fail loudly rather than alias it.
+    # SHARE-POINT GUARD: a hoisted column is FANNED to many child rows, so EVERY value must be
+    # concrete — an awaitable is single-await and cannot be copied (the @stream path, completing
+    # rows separately, would re-await it -> "cannot reuse already awaited coroutine"). Uses the
+    # request's CONFIGURED ``is_awaitable`` (not ``inspect.isawaitable``) so a host's custom
+    # promise-like is recognised exactly as completion would. A hoisted step is sync-eligible by
+    # construction; an awaitable here means a step lied about sync-ness (the LambdaStep detection
+    # blind spot). Checks the WHOLE column (cheap; does not rely on the request-constant uniformity
+    # invariant). Fail loudly rather than alias it.
     for hid, col in columns.items():
-        if col and is_awaitable(col[0]):
+        if any(is_awaitable(v) for v in col):
             raise AssertionError(
                 f"hoisted step #{hid} produced an awaitable; a hoisted value is fanned across rows"
                 f" and must be concrete (an async fn must not be hoistable — for async I/O use a"
