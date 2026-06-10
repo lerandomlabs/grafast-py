@@ -84,6 +84,13 @@ class Step:
     # it once and broadcast entry 0 to every position, with no loud failure.
     _is_unary: bool = True
 
+    # whether this step's ``execute`` is guaranteed SYNC — its column holds concrete values, never a
+    # per-entry awaitable. The concrete steps set this explicitly; the base default is conservative
+    # (False) so a step is run-once-broadcast (`_bucket_unariness`) only when PROVEN sync — otherwise
+    # broadcasting could alias one coroutine across parents (single-await). Run-once is the only
+    # consumer; correctness never depends on a False here, only the run-once optimization does.
+    is_sync_and_safe: bool = False
+
     def __init__(self) -> None:
         self.dependencies: List["Step"] = []
         self.id = -1
@@ -246,16 +253,23 @@ def _bucket_unariness(
 ) -> Dict[int, bool]:
     """Effective unariness of each step IN THIS BUCKET (`step.id -> bool`).
 
-    A step is run-once only if it is unary-capable (`step._is_unary`) AND none of its
-    dependencies is a per-entry source in this bucket — i.e. every dependency is itself
-    effectively unary and not a SEEDED boundary (a seeded column IS the bucket of parents,
-    so anything reading it is per-entry). Conservative: any uncertainty falls to batch.
+    A step is run-once-and-broadcast only if ALL of:
+      * it is unary-capable (`step._is_unary`) — its value is request-constant; AND
+      * it is provably SYNC (`is_sync_and_safe`) — so its column is CONCRETE values, never a raw
+        per-entry awaitable. Broadcasting an awaitable would alias ONE coroutine across every
+        parent (a coroutine is single-await; the @stream path, which completes parents
+        separately, would then raise "cannot reuse already awaited coroutine"). An async
+        ``lambda_step`` over a constant therefore runs per entry (distinct coroutines), not once; AND
+      * none of its dependencies is a per-entry source in this bucket — every dependency is itself
+        run-once here (so its column is concrete + all-equal) and not a SEEDED boundary (a seeded
+        column IS the bucket of parents, so anything reading it is per-entry).
+    Conservative: any uncertainty falls to batch.
     """
     unary_here: Dict[int, bool] = {}
     if count <= 0:
         return {step.id: False for step in ordered_steps}
     for step in ordered_steps:
-        eff = step._is_unary
+        eff = step._is_unary and step.is_sync_and_safe
         if eff:
             for dep in step.dependencies:
                 if dep.id in seeded or not unary_here.get(dep.id, False):

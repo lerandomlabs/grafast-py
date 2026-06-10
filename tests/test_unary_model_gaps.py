@@ -2,8 +2,11 @@
 
 Under the Grafast PURITY CONTRACT, a plan transform (``lambda_step`` / ``filter_step``) is a
 deterministic function of its input. So — like upstream Grafast's unary-value model — such a
-step over a request-CONSTANT input is ``_is_unary`` (run ONCE, the result fanned to every child)
-and ``hoistable`` (liftable to a shallower layer); over a per-entry input it narrows to batch.
+step over a request-CONSTANT input is ``_is_unary`` and ``hoistable`` (liftable to a shallower
+layer, run once and fanned); over a per-entry input it narrows to batch. The executor's
+run-once-broadcast additionally requires the step be provably SYNC (``is_sync_and_safe``) so it
+never aliases a per-entry awaitable across parents — an async ``lambda_step`` over a constant
+therefore runs per entry (distinct coroutines) and gets its run-once from HOISTING instead.
 
 The flags are the explicit IMPURE / side-effecting OPT-OUT: a plain resolver (``ResolveStep``)
 sets ``dedupable=False`` / ``hoistable=False`` / ``_is_unary=False`` so an impure per-entry
@@ -18,6 +21,10 @@ oracle (a pure filter's result is identical whether or not it is optimized). No 
 UnaryModel landed and again when the purity contract was adopted — plan lambdas/filters are now
 optimizable rather than barriered, matching upstream.)
 """
+
+import asyncio
+
+import pytest
 
 from grafast_py.config import GrafastConfig
 from grafast_py.core_steps import (
@@ -125,3 +132,35 @@ def test_pure_filter_over_constant_is_byte_identical_when_optimized():
     on = run(True)
     assert off == [[[2, 4], [2, 4]], [[2, 4], [2, 4]]]
     assert on == off
+
+
+@pytest.mark.asyncio
+async def test_unary_async_lambda_runs_per_entry_not_broadcast():
+    """A unary ASYNC lambda must NOT be run-once: broadcasting one coroutine across parents would
+    alias a single awaitable (a coroutine is single-await; the @stream path, which completes each
+    parent separately, would then raise "cannot reuse already awaited coroutine"). The engine only
+    run-once-broadcasts provably-SYNC steps (``is_sync_and_safe``), so an async ``lambda_step`` over
+    a constant runs per entry — distinct coroutines — with correct data. Regression for the
+    cross-parent coroutine-reuse hazard.
+    """
+    calls = {"n": 0}
+
+    async def async_tag(_):
+        calls["n"] += 1
+        await asyncio.sleep(0)
+        return 7
+
+    schema = make_grafast_schema(
+        "type Query { items: [Item!]! }\ntype Item { tag: Int! }",
+        {
+            "Query": {"items": lambda p, a, i: constant([{}, {}, {}])},  # 3 parents
+            "Item": {"tag": lambda p, a, i: lambda_step(constant("k"), async_tag)},
+        },
+    )
+    result = await grafast_execute(
+        schema, "{ items { tag } }", config=GrafastConfig(hoist=False)
+    )
+    assert result.errors is None, result.errors
+    assert result.data == {"items": [{"tag": 7}, {"tag": 7}, {"tag": 7}]}
+    # per entry: 3 DISTINCT coroutines, not one broadcast (which would be 1 call + an aliased coro).
+    assert calls["n"] == 3

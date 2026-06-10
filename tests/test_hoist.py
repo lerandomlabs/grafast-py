@@ -568,15 +568,17 @@ def test_build_hoist_parent_store_fails_loud_when_bridge_missing():
     assert build_hoist_parent_store(plain, None, [0, 1]) is None
 
 
-def test_pure_lambda_over_constant_is_run_once_not_per_entry():
-    """A PURE LambdaStep over a request-constant input is run ONCE, not per entry (Option B).
+def test_pure_lambda_over_constant_is_hoisted_to_fire_once():
+    """A PURE LambdaStep over a request-constant input is HOISTED to fire once (Option B).
 
-    Under the Grafast purity contract a lambda is a deterministic function of its input, so a
-    ``lambda_step(constant(...), fn)`` is unary (and hoistable): the engine runs ``fn`` over a
-    single representative entry and fans the result, rather than once-per-Person. The data is
-    byte-identical to the naive per-entry layout (``fn`` is pure) and hoist ON == OFF; the number
-    of ``fn`` invocations drops to EXACTLY ONE (vs the four per-entry calls a barrier forced).
-    The call counter is a test instrument only — ``fn``'s RETURN value is constant (pure).
+    Under the Grafast purity contract a lambda is a deterministic function of its input, so the
+    barrier from 76e9745 is gone: ``lambda_step(constant(...), fn)`` is hoistable, and under hoist
+    it is lifted to the root and fires ``fn`` ONCE for the whole request (``on_n == 1``) instead of
+    once-per-Person (``off_n == 4``), with data byte-identical (``fn`` is pure). The executor
+    run-once-broadcast path is reserved for provably-SYNC steps (a host lambda may be async, and
+    broadcasting a coroutine would alias one awaitable across parents), so a lambda gets its
+    run-once from HOISTING — which is per-entry-equivalent for a pure fn. The call counter is a
+    test instrument only; ``fn``'s RETURN value is constant (pure).
     """
     orgs = [{"id": 10}, {"id": 20}]
     people = [{"id": 1}, {"id": 2}]
@@ -618,8 +620,7 @@ def test_pure_lambda_over_constant_is_run_once_not_per_entry():
     # data byte-identical (pure fn), hoist ON == OFF.
     assert off_tags == [[100, 100], [100, 100]]
     assert on_tags == off_tags
-    # the run-once optimization fires: the pure constant-fed lambda is unary, so the engine runs
-    # ``fn`` EXACTLY ONCE for the whole request (vs the four per-entry calls the pre-Option-B
-    # barrier forced). Run-once is at the executor level, so the count is one whether hoist is
-    # on or off — `== 1` (not merely `< 4`, which would also pass if fn never ran at all).
-    assert off_n == 1 and on_n == 1
+    # hoisting fires the pure constant-fed lambda EXACTLY ONCE (lifted to the root), vs the four
+    # per-entry calls without hoist. `== 4` / `== 1` are exact (not `< 4`, which would also pass
+    # if fn never ran). With the barrier (pre-Option-B) both were 4 — the lambda was never lifted.
+    assert off_n == 4 and on_n == 1
