@@ -552,15 +552,19 @@ Two opt-in flags (both default **OFF**) let a host reuse a plan across requests:
   owns the predicate, so it opts in **per value** — there is no auto-placeholdering.
 
 - **`cache_plans`** reuses a finalized plan across requests of the same document, keyed by
-  `(schema identity, document text, operation name, variable-arg fingerprint)`. **Only a
-  value-independent plan is cached** — every SQL-affecting variable value must be either a
-  same-every-request literal or a value-agnostic placeholder; a plan that inlined a `$variable` as a
-  literal is value-specific and is *never* cached for reuse. On a cache **hit** the stored plan is
-  re-used **without deepcopy** — per-request variable values are **render-injected** at execute
-  time, never mutated into the shared plan, so the cached plan is safe to share across concurrent
-  requests; each placeholder is **re-bound** to this request's variable values (the cached SQL is
-  value-agnostic, so only the bound values move). It is a pure optimization: a hit changes only
-  *whether* planning re-runs — never the SQL text or the result data.
+  `(schema identity, document text, operation name, variable-arg fingerprint, config fingerprint,
+  incremental flag)`. Where planning **observed** a request input — an inlined `$variable` value, a
+  `@skip(if: $hide)` directive variable, a context `eval` — the plan caches as a per-value
+  **variant** guarded by re-checkable **constraints**: each key holds a small bucket of variants,
+  a hit is served only to a request the variant is provably correct for, and a different value
+  plans its own variant (never a stale serve). The fully value-agnostic plan (placeholders only)
+  stays a single unconstrained variant — the common multi-tenant path records **no** constraints
+  and its hit rate is unchanged. On a cache **hit** the stored plan is re-used **without
+  deepcopy** — per-request variable values are **render-injected** at execute time, never mutated
+  into the shared plan, so the cached plan is safe to share across concurrent requests; each
+  placeholder is **re-bound** to this request's variable values (the cached SQL is value-agnostic,
+  so only the bound values move). It is a pure optimization: a hit changes only *whether* planning
+  re-runs — never the SQL text or the result data.
 
   ```python
   from grafast_py import GrafastConfig, GrafastExecutionContext
@@ -573,42 +577,54 @@ Two opt-in flags (both default **OFF**) let a host reuse a plan across requests:
   `GrafastConfig(plan_cache=PlanCache(max_entries=...))`), so an adversarial stream of unique
   documents cannot grow it without bound.
 
-### ⚠️ Cache-safety: never bake a per-request value (the one contract you must honour)
+### The plan-time context gate: tokens by default, `eval` to branch
 
-`cache_plans` keys a plan by **document text** (plus schema / operation / variable-arg fingerprint) —
-**not** by your request context. So any *per-request* value — a tenant id, a user id, an RLS scope
-read from `info.context` — that you **bake as a literal** into the SQL is frozen into the *shared*
-cached plan, and the next request for the same document (a **different tenant**) is served that first
-request's value. That is a **cross-tenant data leak**. The rule is one line:
-
-**Scope by a placeholder, never by a baked context literal.**
+Inside a **plan resolver**, `info.context` is not the raw context object — it is a **gate**
+(upstream Grafast's model: planning never sees a context *value* unless it says so explicitly).
+The two reads carry the two intents:
 
 ```python
-from grafast_py.pg import pg_placeholder
+# runtime value — "thread this into the query, I never look at it":
+# a bare read yields a value-LESS TOKEN; in a predicate it becomes a ctx: placeholder,
+# re-bound to THIS request's context at execute (fails LOUD if the key is missing).
+step.builder().where(column("tenant_id") == info.context["tenant_id"])     # one shared plan
+pg_placeholder(info.context["tenant_id"], type_=Integer)                    # the typed form
 
-# ❌ LEAKS under cache_plans: the literal 42 is frozen into the shared plan
-step.builder().where(column("tenant_id") == info.context["tenant_id"])
-
-# ✅ SAFE + cacheable: value-LESS, re-bound to THIS request's context[...] at execute (fails LOUD
-#    if the key is missing — never a silent `col = NULL` that would widen the scope)
-step.builder().where(column("tenant_id") == pg_placeholder("ctx:tenant_id"))
+# plan-time read — "show me the value NOW, I am deciding the plan with it":
+# returns the real value AND records a cache CONSTRAINT, so this plan is only ever
+# served to requests where the read comes out the same (one cached variant per outcome).
+if info.context.eval_is("role", "admin"):      # constrains the OUTCOME (all non-admins share one plan)
+    ...                                        # .eval("key") / .eval_has("key") also available
 ```
 
-Two paths are **auto-protected** for you: a resource `customizer(context)` that bakes a literal, and
-an inlined `$variable`, are both detected and forced **non-cacheable** (that plan just re-plans every
-request). But a raw `.builder().where(...)` predicate and a `pgUnionAll` member `where=` are **not**
-inspected — and that is deliberate. By the time the engine sees `column == 42`, the value has already
-evaluated in Python, so a per-request `context["tenant_id"]` is **indistinguishable** from a safe
-constant like `status == "published"`; auto-rejecting *every* literal would force you to wrap harmless
-constants in placeholders too. So on those two paths the contract is **yours to honour**.
+Branching on a bare token fails loud (`bool()` raises and names both options), so the classic
+mistake — `if info.context["is_admin"]:` silently taking the same branch for every request — is
+unwritable. **Classic (runtime) resolvers are untouched**: they read the real context at execute
+time exactly as before; the gate exists only at plan time, where a context read is by definition
+request-dependent. The same `eval` vocabulary exists on `field_args` (`eval_is` / `eval_has`):
+reading a `$variable`-derived arg's **value** is an eval too — recorded automatically, so an
+"inlined" variable now caches per value instead of leaking or refusing to cache.
 
-> The proper fix — *tracking* context reads at the source so the engine can tell a context value from
-> a constant automatically (the way upstream Grafast's tracked-value steps do), and so keep constants
-> cacheable while catching context-bakes for free — is a planned follow-up. Until then: use the
-> placeholder.
+### ⚠️ Cache-safety: the residual contract (side-channel bakes)
 
-This only bites under `cache_plans=True`; with caching off, every request re-plans and a baked literal
-is correct (just not reused).
+Everything the engine can see is now tracked. What it *cannot* see is a per-request value that
+reaches planning **around** the API — a closure over request state, a `ContextVar`, a module
+global — and is baked into SQL as an already-evaluated Python literal:
+
+```python
+# ❌ LEAKS under cache_plans: the engine sees only the evaluated literal 42 — indistinguishable
+#    from a safe constant like status == "published"
+step.builder().where(column("tenant_id") == some_request_global())
+```
+
+Auto-rejecting every literal would outlaw harmless constants too, so on this path the contract is
+**yours to honour**: per-request values reach a plan through the gate (token/`eval`) or an
+`args.source()` placeholder — never through a side channel. A placeholder `transform=` callable is
+content-keyed (bytecode + closure cells), so a transform closing over request state forces a safe
+re-plan rather than reusing the first request's capture.
+
+This only bites under `cache_plans=True`; with caching off, every request re-plans and a baked
+literal is correct (just not reused).
 
 With both flags off (the default) `plan_operation` never reads or writes the cache and
 `FieldArgs.is_variable` is always `False`, so every host falls back to literal inlining and the
