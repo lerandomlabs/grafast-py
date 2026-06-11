@@ -63,6 +63,14 @@ from .core_steps import (
     object_step,
     reverse_step,
 )
+from .constraints import (
+    ContextGate,
+    ContextToken,
+    EqualityConstraint,
+    ExistsConstraint,
+    RequestFacts,
+    ValueConstraint,
+)
 from .schema import (
     FieldArgs,
     GrafastSchemaBindable,
@@ -109,6 +117,13 @@ __all__ = [
     "get_field_plan",
     "PlanResolver",
     "FieldArgs",
+    # request-input constraints + the plan-time context gate (see grafast_py.constraints)
+    "ContextGate",
+    "ContextToken",
+    "ValueConstraint",
+    "EqualityConstraint",
+    "ExistsConstraint",
+    "RequestFacts",
     # resolve_type bridges for Postgres-backed interfaces/unions (completion-time dispatch)
     "TypeResolver",
     "resolve_type_from_discriminator",

@@ -11,7 +11,7 @@ per-request source map, never stored on the shared step. This module is that reu
 Design (sqlalchemy-free — the core engine never imports the pg stack)
 ---------------------------------------------------------------------
 KEY. ``(id(schema), document-text-hash, operation-name, variable-arg-fingerprint,
-config-fingerprint)``:
+config-fingerprint, incremental-flag)``:
 
   * ``id(schema)`` distinguishes two schemas in one process (a host serving several).
   * the document-text hash — the PRINTED-AST text of the operation PLUS every fragment
@@ -35,20 +35,23 @@ config-fingerprint)``:
     branching plan resolver bypassed; a cache entry must be valid for the REQUESTING config, so
     the config the plan was built under is part of its key.
 
-VALUE. The three things ``plan_operation`` stashes on the context: the finalized
-``ObjectPlan`` tree, the operation ``RootStep``, and the ``Plan`` (the step DAG). A cache
-HIT returns them; the executor seeds + runs them exactly as a freshly-planned operation.
+VALUE. Each key holds a BUCKET of plan VARIANTS (bounded by ``MAX_VARIANTS_PER_KEY``), one
+:class:`CachedPlan` per constraint-distinguished build of the document: the finalized
+``ObjectPlan`` tree, the operation ``RootStep``, the ``Plan`` (the step DAG), and the
+candidate's CONSTRAINT set. A cache HIT returns the first candidate whose constraints
+validate for the requesting request; the executor seeds + runs it exactly as a
+freshly-planned operation. A document with no request-dependent planning keeps exactly one
+unconstrained variant.
 
-CACHEABILITY. Only a VALUE-INDEPENDENT plan is stored: ``Plan.cacheable`` is True iff no
-``$variable`` value was inlined as a plan-time literal (every SQL-affecting variable value
-is a same-every-request literal or a source-tagged placeholder). A plan that inlined a
-variable as a literal is value-specific and is NEVER cached — reusing it would serve a
-later request the earlier request's value. An operation that owns an ABSTRACT (interface /
-union) field is likewise NOT cached: its per-concrete-type subtrees are planned LAZILY at
-execute time, held on the completer (not in ``plan.steps``), so the per-request value map
-never reaches their placeholders — caching such an operation would serve a later request the
-first request's subtree value (``plan.owns_abstract_field`` flips ``cacheable`` False; see
-``plan_operation``).
+CORRECTNESS. A plan that OBSERVED a request input while planning (an inlined ``$variable``
+value, a directive ``if: $var`` resolved by ``collect_fields``, a context ``eval``) carries
+one re-checkable CONSTRAINT per observation (see :mod:`grafast_py.constraints`), validated
+on every hit — a different value is a different variant, never a stale serve. Two shapes
+remain flatly NON-cacheable (``Plan.cacheable`` False) because nothing in ``plan.steps``
+could be re-validated: a literal-baking customizer, and an operation owning an ABSTRACT
+(interface / union) field — its per-concrete-type subtrees are planned LAZILY at execute
+time, held on the completer (not in ``plan.steps``), so the per-request value map never
+reaches their placeholders (see ``plan_operation``).
 
 SHARED ENTRY ON HIT (deepcopy-free). The cached steps carry NO per-request value: a
 ``pg_placeholder`` WHERE bind is value-LESS, a pagination ``Placeholder`` is value-LESS, and a
@@ -75,7 +78,7 @@ OPT-IN. The cache is consulted ONLY when ``GrafastConfig.cache_plans`` is on; th
 
 from collections import OrderedDict
 from threading import Lock
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from graphql.language import (
     FragmentDefinitionNode,
@@ -83,6 +86,8 @@ from graphql.language import (
     VariableNode,
     print_ast,
 )
+
+from .config import log
 
 
 class CachedPlan(NamedTuple):
@@ -100,18 +105,25 @@ class CachedPlan(NamedTuple):
     re-check turns such a stale-``id`` collision into a miss (the holder also pins the schema,
     which is fine — schemas are long-lived).
 
-    ``constraints`` is the optimization-INDEPENDENT structural-divergence guard (the grafast-py
-    analogue of upstream's ``contextConstraints`` validated in ``establishOperationPlan``). It is
-    the list of every context-resolved customizer's value-agnostic predicate-shape signature,
-    captured at STORE time from ALL customizer-bearing steps — INCLUDING any that dedup-merged or
-    tree-shook out of ``plan.steps`` after optimization. On a HIT the WHOLE list is re-validated
-    against THIS request's context (see :func:`grafast_py.plan.constraints_match`); a structural
-    change in ANY captured customizer forces a re-plan, so a merged-away scoped step can no longer
-    escape the surviving-step walk. Empty for a plan with no customizer-bearing steps (the common
-    case), so a non-scoped plan validates trivially. Each entry is
-    ``(resolver_callable, arity, signature_tuple)`` — the customizer identity + its resolved
-    value-agnostic predicate keys; the resolver is re-invoked per request to recompute the
-    signature for comparison.
+    ``constraints`` is the candidate's REQUEST-CONSTRAINT set — the optimization-INDEPENDENT
+    guard re-validated on every hit (the grafast-py analogue of upstream's per-candidate
+    ``variableValuesConstraints``/``contextConstraints`` in ``establishOperationPlan``). It
+    holds, in one duck-typed list (every entry answers ``matches(facts)``; see
+    :mod:`grafast_py.constraints`):
+
+      * the directive-variable constraints (a ``$variable`` used by @skip/@include/@defer/
+        @stream changed the resolved field selection before planning);
+      * every plan-time eval the planning recorded (a context ``eval``/``eval_is``/
+        ``eval_has``, a raw read of a variable-derived argument, an
+        ``info.variable_values`` read) — captured into ``Plan.request_constraints``;
+      * every context-resolved customizer's value-agnostic predicate-shape signature
+        (:class:`~grafast_py.pg.customize.CustomizerConstraint`), captured at STORE time
+        over the PRE-optimization step set so a customizer-bearing step that dedup-merged
+        or tree-shook out of ``plan.steps`` still constrains.
+
+    A candidate whose constraints fail for a request is simply not a hit for it — the
+    bucket may hold OTHER candidates that match (the multi-variant cache). Empty for a
+    plan that never observed a request input (the common case), validating trivially.
     """
 
     object_plan: Any
@@ -126,10 +138,18 @@ class CachedPlan(NamedTuple):
 ConfigFingerprint = Tuple[bool, bool, bool, bool]
 
 # the cache key: (schema identity, document-text hash, operation name, variable fingerprint,
-# config fingerprint).
+# config fingerprint, incremental flag).
 CacheKey = Tuple[
-    int, int, Optional[str], Tuple[Tuple[str, ...], ...], ConfigFingerprint
+    int, int, Optional[str], Tuple[Tuple[str, ...], ...], ConfigFingerprint, bool
 ]
+
+# how many plan VARIANTS one cache key may hold (the per-bucket bound). Each variant is one
+# constraint-distinguished plan of the same document — e.g. the @skip(if:$hide) true/false
+# pair, or an admin/user customizer split. Boolean directive splits need 2; a handful of evals
+# stays comfortably under this; an eval over a HIGH-cardinality value (a raw tenant-id read)
+# churns the bucket instead of growing it unboundedly (upstream caps the same list at 50 and
+# leaves a "too much eval?" note — the log line below is that signal).
+MAX_VARIANTS_PER_KEY = 8
 
 
 def config_fingerprint(config: Any) -> ConfigFingerprint:
@@ -213,6 +233,7 @@ def compute_cache_key(
     operation: OperationDefinitionNode,
     fragments: Optional[Mapping[str, FragmentDefinitionNode]] = None,
     config: Any = None,
+    incremental: bool = False,
 ) -> CacheKey:
     """The bounded-LRU key for one operation (with its fragments) under one schema + config.
 
@@ -220,8 +241,10 @@ def compute_cache_key(
     fragments by their canonical printed text (stable across re-parses, unlike ``id``); the
     operation name selects one of a multi-operation document; the variable fingerprint pins
     the literal-vs-``$var`` structure; the config fingerprint pins the PLAN-AFFECTING config so
-    two configs sharing the default cache never collide (see :func:`config_fingerprint`).
-    Computed ONCE per request when caching is enabled.
+    two configs sharing the default cache never collide (see :func:`config_fingerprint`);
+    ``incremental`` pins the planning MODE — an incremental-built plan (deferred partitions,
+    @stream markers; the experimental 3.3 entry) and a normal plan of the same document have
+    different shapes and must never share an entry.
     """
     op_name = operation.name.value if operation.name else None
     return (
@@ -230,18 +253,37 @@ def compute_cache_key(
         op_name,
         variable_arg_fingerprint(operation),
         config_fingerprint(config),
+        bool(incremental),
     )
 
 
 class PlanCache:
-    """A bounded-LRU process cache of finalized plans, keyed by :func:`compute_cache_key`.
+    """A bounded-LRU process cache of plan-variant BUCKETS, keyed by :func:`compute_cache_key`.
 
-    Backed by an :class:`~collections.OrderedDict` under a lock: a GET moves the entry to the
-    most-recently-used end; a PUT past ``max_entries`` evicts the least-recently-used end. The
-    lock makes GET/PUT safe under the concurrent request fan-out (the entries themselves are
-    immutable plan trees — the per-request VALUES live only in the per-request source map
-    rendered into ``params``, never on the cached object — so two requests can share one entry
-    without racing on its contents).
+    One key (one document/config) holds a small MRU-ordered list of :class:`CachedPlan`
+    candidates — the plan VARIANTS the document's request-dependent planning produced (a
+    @skip(if:$hide) document holds the true and false variants; a structure-branching
+    customizer holds the admin and user variants). A GET walks the bucket and returns the
+    first candidate the caller's ``validate`` accepts (its constraint set holds for this
+    request), hoisting it to the bucket front; no acceptable candidate is a MISS — the
+    caller plans a fresh variant and PUTs it, which prepends to the bucket (bounded by
+    ``MAX_VARIANTS_PER_KEY``, dropping the least-recently-validated tail). This is
+    upstream ``establishOperationPlan``'s linked-list-of-candidates shape.
+
+    Backed by an :class:`~collections.OrderedDict` under a lock: a GET moves the bucket to
+    the most-recently-used end; a PUT past ``max_entries`` evicts the least-recently-used
+    bucket. ``validate`` runs OUTSIDE the lock, over a snapshot of the bucket: constraint
+    replay re-invokes host customizer callables, and however pure/cheap the contract makes
+    them, host code must never execute under the cache's global lock (one slow customizer
+    would serialize every cache user; a re-entrant one would deadlock). Validating a
+    snapshot is safe because candidates are immutable and shareable — a candidate that
+    validates is correct for this request even if it was concurrently evicted; the
+    MRU-hoist then simply finds it gone. The per-request VALUES live only in the
+    per-request source map rendered into ``params``, never on the cached object, so two
+    requests can share one candidate without racing on its contents.
+
+    ``hits`` counts VALIDATED hits (a candidate served); a bucket whose every candidate
+    fails validation counts as a miss, exactly like an absent key.
     """
 
     def __init__(self, max_entries: int = 1000) -> None:
@@ -250,32 +292,86 @@ class PlanCache:
                 f"PlanCache max_entries must be >= 1, got {max_entries}"
             )
         self.max_entries = max_entries
-        self._entries: "OrderedDict[CacheKey, CachedPlan]" = OrderedDict()
+        self._entries: "OrderedDict[CacheKey, List[CachedPlan]]" = OrderedDict()
         self._lock = Lock()
         # observability counters (read by tests / a host metrics hook); not load-bearing.
         self.hits = 0
         self.misses = 0
         self.evictions = 0
 
-    def get(self, key: CacheKey) -> Optional[CachedPlan]:
-        """Return the cached plan for ``key`` (marking it most-recently-used), or ``None``."""
+    def get(
+        self,
+        key: CacheKey,
+        validate: Optional[Callable[[CachedPlan], bool]] = None,
+    ) -> Optional[CachedPlan]:
+        """Return the first candidate under ``key`` that ``validate`` accepts, or ``None``.
+
+        The accepted candidate is hoisted to its bucket's front and the bucket marked
+        most-recently-used. ``validate`` runs over a SNAPSHOT of the bucket, outside the
+        lock (see the class docstring). ``validate=None`` accepts the first candidate
+        (the plain single-variant read used by direct unit tests).
+        """
         with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
+            bucket = self._entries.get(key)
+            if bucket is None:
                 self.misses += 1
                 return None
             self._entries.move_to_end(key)
-            self.hits += 1
-            return entry
+            candidates = list(bucket)
+        for candidate in candidates:
+            if validate is not None and not validate(candidate):
+                continue
+            with self._lock:
+                bucket = self._entries.get(key)
+                if bucket is not None:
+                    for index, current in enumerate(bucket):
+                        if current is candidate:
+                            if index:
+                                del bucket[index]
+                                bucket.insert(0, candidate)
+                            break
+                self.hits += 1
+            return candidate
+        with self._lock:
+            self.misses += 1
+        return None
 
     def put(self, key: CacheKey, value: CachedPlan) -> None:
-        """Store ``value`` under ``key`` as most-recently-used; evict the LRU if over cap."""
+        """Prepend ``value`` to ``key``'s bucket as its freshest variant; evict over caps.
+
+        A candidate already carrying the SAME constraint set is replaced, not duplicated —
+        two concurrent misses of one variant both plan and both store, and the variants
+        are interchangeable (equal constraints over one schema = one behaviour). A bucket
+        past ``MAX_VARIANTS_PER_KEY`` drops its least-recently-validated tail — with a log
+        line, since steady-state variant churn means some plan-time read is splitting on a
+        high-cardinality value (upstream's "too much eval?" signal).
+        """
+        dropped_tail = False
         with self._lock:
-            self._entries[key] = value
+            bucket = self._entries.get(key)
+            if bucket is None:
+                bucket = []
+                self._entries[key] = bucket
+            for index, current in enumerate(bucket):
+                if current.schema is value.schema and current.constraints == value.constraints:
+                    del bucket[index]
+                    break
+            bucket.insert(0, value)
             self._entries.move_to_end(key)
+            if len(bucket) > MAX_VARIANTS_PER_KEY:
+                del bucket[MAX_VARIANTS_PER_KEY:]
+                self.evictions += 1
+                dropped_tail = True
             while len(self._entries) > self.max_entries:
                 self._entries.popitem(last=False)
                 self.evictions += 1
+        if dropped_tail:
+            # outside the lock — logging handlers are host code.
+            log.info(
+                "plan variant cap reached, dropped oldest variant",
+                cap=MAX_VARIANTS_PER_KEY,
+                op=key[2],
+            )
 
     def clear(self) -> None:
         """Drop every entry (used by tests; a host rarely needs it)."""
@@ -336,6 +432,7 @@ __all__ = [
     "CachedPlan",
     "CacheKey",
     "ConfigFingerprint",
+    "MAX_VARIANTS_PER_KEY",
     "PlanCache",
     "compute_cache_key",
     "config_fingerprint",

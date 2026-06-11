@@ -75,7 +75,11 @@ class Placeholder:
     __slots__ = ("source",)
 
     def __init__(self, source: str) -> None:
-        self.source = source
+        # also accepts a plan-time context token (`info.context["page_size"]`) — a token IS
+        # a source tag, so `Placeholder(info.context["page_size"])` paginates by a
+        # per-request context value the same way `Placeholder(args.source("first"))` does
+        # by a variable.
+        self.source = getattr(source, "source", source)
 
     def __eq__(self, other: Any) -> bool:
         # key off the SOURCE tag ONLY (never the runtime value): two same-source
@@ -107,10 +111,24 @@ def resolve_placeholder(value: Any, source_values: Mapping[str, Any]) -> Any:
     ``source_values`` (the source-tag -> value map threaded via ``BucketExtra``); a plan-time
     literal arrives as the bare scalar / cursor string and passes through unchanged. Either
     way this returns the value the step computes with, so only the dedup key (which keeps the
-    sentinel) differs between the two. A source absent from the map resolves to ``None`` (an
-    omitted no-default variable), matching ``values_by_source``'s omitted-variable handling.
+    sentinel) differs between the two. A ``var:`` source absent from the map resolves to
+    ``None`` (an omitted no-default variable), matching ``values_by_source``'s
+    omitted-variable handling.
+
+    A ``ctx:`` source (``Placeholder(info.context["page_size"])``) resolves FRESH from the
+    pg request context — the same rules as the WHERE render seam (``where_params``): a
+    Mapping context by key, anything else by attribute, and a MISSING key fails LOUD (a
+    page size silently resolving to None would drop the window bound and widen the page).
     """
     if isinstance(value, Placeholder):
+        if value.source.startswith("ctx:"):
+            from .executor import current_pg_request
+
+            key = value.source[4:]
+            context = current_pg_request().context
+            if isinstance(context, Mapping):
+                return context[key]
+            return getattr(context, key)
         return source_values.get(value.source)
     return value
 
@@ -187,10 +205,16 @@ def pg_placeholder(
     placeholder (value-agnostic in the dedup key). A host only ever gets a placeholder by
     calling this — there is no auto-placeholdering — because only the host knows the column
     type and owns the predicate construction.
+
+    ``source`` also accepts a plan-time context token (``info.context["tenant_id"]``, a
+    :class:`~grafast_py.constraints.ContextToken`) — a token IS a source tag
+    (``"ctx:tenant_id"``), so ``pg_placeholder(info.context["tenant_id"], type_=...)`` is
+    the typed / transformed form of the bare ``column == token`` coercion.
     """
+    source_tag = getattr(source, "source", source)
     name = f"grafast_ph_{next(_placeholder_counter)}"
     bind = bindparam(name, type_=type_, required=False)
-    setattr(bind, PLACEHOLDER_SOURCE_ATTR, source)
+    setattr(bind, PLACEHOLDER_SOURCE_ATTR, source_tag)
     if transform is not None:
         setattr(bind, PLACEHOLDER_TRANSFORM_ATTR, transform)
     return bind

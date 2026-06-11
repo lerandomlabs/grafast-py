@@ -12,7 +12,7 @@ under-the-hood pillars that path relies on, exercised in isolation:
     a hand-baked literal) re-binds to each request's OWN context value off the SHARED step; and
   * the optimization-INDEPENDENT constraint guard — a customizer's value-agnostic predicate-shape
     signature, captured at store time over the PRE-optimization step set and re-validated on every
-    hit (:func:`grafast_py.plan.constraints_match`), so a structural divergence is a MISS even for
+    hit (:func:`grafast_py.constraints.constraints_match`), so a structural divergence is a MISS even for
     a customizer-bearing step that dedup-merged or tree-shook out of ``plan.steps``.
 """
 
@@ -28,7 +28,11 @@ from grafast_py.pg.executor import pg_request_context
 from grafast_py.pg.placeholders import pg_placeholder
 from grafast_py.pg.resource import PgRegistry, PgResource
 from grafast_py.pg.union import PgUnionAllStep, PgUnionMember
-from grafast_py.plan import constraints_match
+from grafast_py.constraints import RequestFacts, constraints_match
+
+# constraint replay is pure: the facts carry the request's variable values + context value
+# (a CustomizerConstraint ignores them — it reads the pg request context itself).
+NO_FACTS = RequestFacts({}, None)
 
 
 class _Exec:
@@ -156,7 +160,7 @@ def test_constraint_value_only_change_still_matches():
     constraint = build_constraint({"owner_id": 1, "admin": False})
     with pg_request_context(_Exec(), context={"owner_id": 9, "admin": False}):
         assert constraint.matches() is True
-        assert constraints_match((constraint,)) is True
+        assert constraints_match((constraint,), NO_FACTS) is True
 
 
 def test_constraint_structural_divergence_is_a_miss():
@@ -169,7 +173,7 @@ def test_constraint_structural_divergence_is_a_miss():
     constraint = build_constraint({"owner_id": 1, "admin": False})
     with pg_request_context(_Exec(), context={"owner_id": 9, "admin": True}):
         assert constraint.matches() is False
-        assert constraints_match((constraint,)) is False
+        assert constraints_match((constraint,), NO_FACTS) is False
 
 
 def transform_customizer(ctx, sources):
@@ -197,9 +201,9 @@ def test_constraint_with_transform_customizer_still_matches_on_reinvocation():
     constraint = CustomizerConstraint(transform_customizer, 2, keys)
     with pg_request_context(_Exec(), context={"owner_id": 9}):
         assert constraint.matches() is True
-        assert constraints_match((constraint,)) is True
+        assert constraints_match((constraint,), NO_FACTS) is True
 
 
 def test_empty_constraint_list_matches_trivially():
     """A plan with no context-scoping customizer carries no constraints and always matches."""
-    assert constraints_match(()) is True
+    assert constraints_match((), NO_FACTS) is True

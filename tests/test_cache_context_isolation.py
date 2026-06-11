@@ -105,12 +105,14 @@ def compiled_sql(stmt) -> str:
 def stand_in_context(schema):
     """A minimal stand-in for a graphql-core ExecutionContext that lookup_cached_plan reads.
 
-    ``lookup_cached_plan`` touches only ``schema`` / ``fragments`` / ``variable_values`` on the
-    context and writes the resolved plan back onto it — a SimpleNamespace covers all of that
-    without standing up a real operation, keeping the construction no-DB and focused on the cache
-    lookup itself.
+    ``lookup_cached_plan`` touches only ``schema`` / ``fragments`` / ``variable_values`` /
+    ``context_value`` on the context and writes the resolved plan back onto it — a
+    SimpleNamespace covers all of that without standing up a real operation, keeping the
+    construction no-DB and focused on the cache lookup itself.
     """
-    return types.SimpleNamespace(schema=schema, fragments=None, variable_values={})
+    return types.SimpleNamespace(
+        schema=schema, fragments=None, variable_values={}, context_value=None
+    )
 
 
 def serve_second_request(plan: Plan, *, context):

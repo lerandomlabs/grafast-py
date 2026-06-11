@@ -30,6 +30,8 @@ from graphql import (
 )
 from graphql.utilities import build_schema
 
+from .constraints import values_equal
+
 # the plan-resolver callable signature: ($parent_step, field_args, info) -> Step
 PlanResolver = Callable[..., Any]
 
@@ -69,16 +71,24 @@ class FieldArgs:
     defaults to empty, so ``is_variable`` is always ``False`` and every host falls back to
     literal inlining (the behaviour when no provenance is threaded in).
 
-    Cacheability tracking (plan cache)
-    ----------------------------------
-    A plan is only safe to cache across requests when every SQL-affecting ``$variable`` value
-    is VALUE-AGNOSTIC (a source-tagged placeholder), never INLINED as a plan-time literal. The
-    seam is HOW a host reads a variable-derived arg: building a placeholder reads ``source()``
-    (value-agnostic), while inlining reads the raw value (``__getitem__`` / ``get``). So this
-    accessor records, in ``literal_variable_reads``, every variable arg whose RAW value was
-    read — the planner consults it after the resolver runs and marks the plan non-cacheable
-    when a variable value was inlined. Reading ``source()`` does NOT record a literal read, so
-    a placeholdered arg keeps the plan cacheable.
+    Eval semantics (plan cache)
+    ---------------------------
+    Reading a variable-derived arg's VALUE at plan time is an **eval** — the value enters
+    the plan, so the plan is only correct for requests carrying the same value. This
+    accessor records every such observation (``__getitem__`` / ``get`` / ``raw`` for
+    values, ``in`` / ``eval_has`` for presence, ``eval_is`` for a comparison outcome) and
+    the planner converts the bookkeeping into per-variable CONSTRAINTS after the resolver
+    runs (see ``plan.record_field_args_constraints``): the plan then caches as a per-value
+    VARIANT — never stale, split per distinct value. Reading a LITERAL arg records nothing
+    (its value is document-pinned, identical every request). The constraint-free channel
+    is ``source()``: taking a variable arg's placeholder source (value never observed)
+    nets out a raw read of the same arg, so the placeholder path records nothing at all.
+
+    This mirrors the context gate (``info.context``) with one deliberate asymmetry: a
+    bare context read yields a value-less token (every context read is per-request),
+    while a bare arg read yields the value (most args are literals, and the variable case
+    is recorded as the eval it is). Same vocabulary, two defaults — see AGENTS.md
+    "purposeful distinctions from upstream".
     """
 
     def __init__(
@@ -86,62 +96,122 @@ class FieldArgs:
         args: Optional[Mapping[str, Any]],
         variable_args: Optional[FrozenSet[str]] = None,
         variable_sources: Optional[Mapping[str, str]] = None,
+        nested_variable_args: Optional[Mapping[str, FrozenSet[str]]] = None,
     ) -> None:
-        self.raw: Dict[str, Any] = dict(args or {})
+        self._args: Dict[str, Any] = dict(args or {})
         self.variable_args: FrozenSet[str] = (
             frozenset(variable_args) if variable_args else frozenset()
         )
         # arg name -> the GraphQL variable name it resolved from; used to build the
         # stable source tag. Defaults empty so source() falls back to the arg name.
         self.variable_sources: Dict[str, str] = dict(variable_sources or {})
-        # variable-derived arg names whose RAW (coerced) value the host READ (``__getitem__`` /
-        # ``get``), and (separately) those for which the host asked for the placeholder
-        # ``source()``. A variable arg READ raw but NOT placeholdered was INLINED as a plan-time
-        # literal — that pins the plan to a per-request value, so the plan is non-cacheable. A
-        # variable arg whose ``source()`` was taken (even if its raw value was also read, to bind
-        # it onto a ``pg_placeholder``) is value-agnostic and keeps the plan cacheable. Both
-        # empty when no provenance was threaded (placeholders off), so the default path never
-        # marks anything non-cacheable. See :meth:`inlined_variable_args`.
+        # arg name -> variable names NESTED inside the arg's list/object literal
+        # (``where: {status: $s}``). Not placeholderable as a whole (the surrounding
+        # structure is a literal), so a raw read of such an arg observes those variables'
+        # values and constrains on each.
+        self.nested_variable_args: Dict[str, FrozenSet[str]] = dict(
+            nested_variable_args or {}
+        )
+        # the bookkeeping the planner nets after the resolver runs: variable-derived arg
+        # names whose value was OBSERVED (read raw — direct or nested), those whose
+        # placeholder ``source()`` was taken (value-agnostic; nets out an observation of
+        # the same arg), presence checks, and eval_is outcomes. All empty when no
+        # provenance was threaded (placeholders + caching off), so the default path
+        # records nothing.
         self.literal_variable_reads: Set[str] = set()
         self.placeholdered_variable_args: Set[str] = set()
+        self.membership_checks: Set[str] = set()
+        self.equality_checks: list = []
 
     def get(self, name: str, default: Any = None) -> Any:
         self._note_literal_read(name)
-        return self.raw.get(name, default)
+        return self._args.get(name, default)
 
     def __getitem__(self, name: str) -> Any:
         self._note_literal_read(name)
-        return self.raw[name]
+        return self._args[name]
+
+    @property
+    def raw(self) -> Dict[str, Any]:
+        """The whole coerced dict — observing EVERY variable-derived arg at once.
+
+        The dict hands out values unrecorded, so taking it counts as a raw read of every
+        variable-derived arg (direct and nested); placeholdered args still net out.
+        """
+        self.literal_variable_reads |= self.variable_args
+        self.literal_variable_reads |= self.nested_variable_args.keys()
+        return self._args
 
     def _note_literal_read(self, name: str) -> None:
-        """Record a RAW read of a variable-derived arg (a candidate inline-as-literal use).
+        """Record a value observation of a variable-derived arg (direct or nested).
 
         Only variable-derived args matter — reading a plan-time literal arg's value is
-        always cacheable (it is the same every request). A variable arg read raw is a
-        CANDIDATE inline; :meth:`inlined_variable_args` subtracts those the host also
-        placeholdered (where the raw read only fed the placeholder's bound value).
+        always safe (it is the same every request). An observed arg is a CANDIDATE
+        inline; ``inlined_variable_args`` subtracts those the host also placeholdered
+        (where the raw read only fed the placeholder's bound value).
         """
-        if name in self.variable_args:
+        if name in self.variable_args or name in self.nested_variable_args:
             self.literal_variable_reads.add(name)
 
     def inlined_variable_args(self) -> Set[str]:
-        """Variable-derived args the host INLINED as plan-time literals (read raw, not placeholdered).
+        """Variable-derived args whose VALUE the host observed without placeholdering.
 
-        The planner reads this to decide cacheability: a non-empty result means a per-request
-        variable value entered the SQL text, so the plan is value-specific and must NOT be
-        cached. Reading a variable's raw value to BIND it onto a placeholder (``source()`` was
-        also taken) does not count — that path is value-agnostic and stays cacheable.
+        The planner converts each to a per-variable value constraint after the resolver
+        runs: the plan caches as a per-value variant. Reading a variable's raw value to
+        BIND it onto a placeholder (``source()`` was also taken) does not count — that
+        path is value-agnostic and records nothing.
         """
         return self.literal_variable_reads - self.placeholdered_variable_args
 
     def __contains__(self, name: str) -> bool:
-        return name in self.raw
+        # presence of a DIRECT variable arg tracks whether the variable was provided —
+        # a per-request fact a host may branch on, so it is recorded (a presence
+        # constraint). A literal or nested-literal arg's presence is document-pinned.
+        if name in self.variable_args:
+            self.membership_checks.add(name)
+        return name in self._args
+
+    def eval(self, name: str, default: Any = None) -> Any:
+        """The explicit spelling of a value observation (identical to ``args[name]``).
+
+        Named for symmetry with ``info.context.eval``: the value is read NOW and the
+        plan constrains on it (one cached variant per distinct value).
+        """
+        return self.get(name, default)
+
+    def eval_is(self, name: str, expected: Any) -> bool:
+        """Whether arg ``name`` equals ``expected``, constraining only the OUTCOME.
+
+        The split-reducing read (mirrors ``info.context.eval_is``): every request on the
+        same side of the comparison shares one cached plan variant. Only a DIRECT
+        variable arg gets the outcome treatment — the comparison observes the COERCED
+        arg, which tracks the variable only while the variable is present, so the
+        recorded check is paired with a presence constraint at conversion (see
+        ``plan.record_field_args_constraints``). An arg with NESTED variables has no
+        single outcome to pin (the comparison saw every nested value), so it is recorded
+        as a full value observation instead.
+        """
+        # the SAME comparison the hit-time replay uses (type-pinned ==): a build/replay
+        # divergence (True == 1 here, type-mismatch there) would record a constraint that
+        # fails for its own builder — a permanent-miss churn.
+        passed = values_equal(self._args.get(name), expected)
+        if name in self.variable_args:
+            self.equality_checks.append((name, expected, passed))
+        elif name in self.nested_variable_args:
+            self.literal_variable_reads.add(name)
+        return passed
+
+    def eval_has(self, name: str) -> bool:
+        """Whether arg ``name`` is present, constraining only the presence."""
+        return self.__contains__(name)
 
     def is_variable(self, name: str) -> bool:
-        """True iff argument ``name`` originated from a GraphQL ``$variable``.
+        """True iff argument ``name`` originated DIRECTLY from a GraphQL ``$variable``.
 
         Always ``False`` when no provenance was threaded in (the default / placeholders
-        off), so a host then sees every arg as a literal and inlines it by value.
+        off), so a host then sees every arg as a literal and inlines it by value. An arg
+        whose variables are NESTED inside a literal (``where: {status: $s}``) is not
+        "a variable" — it cannot ride a single placeholder; reading it is an eval.
         """
         return name in self.variable_args
 
@@ -155,9 +225,20 @@ class FieldArgs:
         ``variable_args`` alone).
 
         Taking a variable arg's source records it as PLACEHOLDERED, so a raw value-read of the
-        same arg (to bind it onto the placeholder) does not mark the plan non-cacheable — the
+        same arg (to bind it onto the placeholder) does not record a constraint — the
         value never enters the SQL text, only a value-agnostic ``%(name)s`` does.
+
+        Fails loud for an arg whose variables are NESTED inside a literal: the composite
+        value cannot ride one placeholder, so handing out a source tag would silently
+        resolve to nothing at render.
         """
+        if name in self.nested_variable_args:
+            raise ValueError(
+                f"argument {name!r} cannot be placeholdered: its variables "
+                f"({sorted(self.nested_variable_args[name])}) are nested inside a "
+                "literal structure — read the value (the plan then caches per value) "
+                "or restructure the argument as a direct $variable"
+            )
         if name in self.variable_args:
             self.placeholdered_variable_args.add(name)
         var_name = self.variable_sources.get(name, name)
@@ -165,8 +246,8 @@ class FieldArgs:
 
     def __repr__(self) -> str:
         if self.variable_args:
-            return f"FieldArgs({self.raw!r}, variable_args={sorted(self.variable_args)!r})"
-        return f"FieldArgs({self.raw!r})"
+            return f"FieldArgs({self._args!r}, variable_args={sorted(self.variable_args)!r})"
+        return f"FieldArgs({self._args!r})"
 
 
 def set_field_plan(field: GraphQLField, plan: PlanResolver) -> None:

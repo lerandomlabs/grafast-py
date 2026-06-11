@@ -36,6 +36,17 @@ from .completion import (
     build_completer,
     find_object_completer,
 )
+from .constraints import (
+    ABSENT,
+    ContextGate,
+    EqualityConstraint,
+    ExistsConstraint,
+    RequestFacts,
+    TrackedVariables,
+    ValueConstraint,
+    constraints_match,
+    directive_variable_constraints,
+)
 from .dag import Plan, _compose_remaps, order_steps, order_steps_within
 from .schema import FieldArgs, get_field_plan
 from .step_model import Step
@@ -244,31 +255,49 @@ def plan_object(
                 parent_type,
                 Path(None, response_name, parent_type.name),
             )
+            # the plan-time CONTEXT GATE + tracked variables: a plan resolver never sees the
+            # raw per-request context — `info.context[...]` yields value-less tokens (the
+            # runtime/placeholder channel) and `info.context.eval*` is the explicit look-now
+            # read that records a constraint into `plan.request_constraints`. Likewise every
+            # `info.variable_values` read is an eval. Classic (runtime) resolvers are
+            # untouched: they read the REAL context off graphql-core's own execute-time info
+            # (see ResolveStep.execute). Uniform in all modes — with caching off the recorded
+            # constraints are simply never consumed.
+            info = info._replace(
+                context=ContextGate(context.context_value, plan.request_constraints),
+                variable_values=TrackedVariables(
+                    context.variable_values, plan.request_constraints
+                ),
+            )
             # per-argument variable provenance (placeholders): walk this field's
             # argument AST so a plan resolver can tell a `$variable`-derived value from a
             # plan-time literal. Computed when `placeholders` is on OR when `cache_plans` is on
-            # — caching NEEDS the provenance so an INLINED variable (read raw, not
-            # placeholdered) is detected below and the plan marked non-cacheable; without it a
+            # — caching NEEDS the provenance so a raw read of a variable-derived arg (an
+            # inline) is detected below and recorded as a per-value constraint; without it a
             # `cache_plans=True` / `placeholders=False` host would bleed the first request's
             # value across requests. Both off (the default) => empty provenance =>
             # `FieldArgs.is_variable` is always False => every host inlines literals by value.
-            variable_args, variable_sources = (
+            variable_args, variable_sources, nested_variable_args = (
                 variable_provenance(field_nodes[0])
                 if (plan.placeholders or plan.cache_plans)
-                else (None, None)
+                else (None, None, None)
             )
             field_args = FieldArgs(
-                args, variable_args=variable_args, variable_sources=variable_sources
+                args,
+                variable_args=variable_args,
+                variable_sources=variable_sources,
+                nested_variable_args=nested_variable_args,
             )
             field_step = plan_fn(parent_step, field_args, info)
             plan.add_step(field_step)
-            # cacheability: if the host INLINED a variable-derived arg's value as a plan-time
-            # literal (read its raw value WITHOUT taking its placeholder source) the plan is
-            # value-specific and must NOT be cached across requests. `FieldArgs` tracks the
-            # raw reads and the placeholdered sources and nets them; a fully-placeholdered or
-            # all-literal field leaves `cacheable` True.
-            if field_args.inlined_variable_args():
-                plan.cacheable = False
+            # a variable value the host OBSERVED raw (read without taking its placeholder
+            # source) is an eval: the value entered the plan, so record a constraint per
+            # observed variable — the plan caches as a per-value VARIANT and can never serve
+            # another value's request. The placeholder path (`source()` taken) records
+            # nothing. Membership checks (`"x" in args`) constrain only the variable's
+            # PRESENCE. Gated on `cache_plans`: constraints exist for the cache alone.
+            if plan.cache_plans:
+                record_field_args_constraints(plan, field_args, context.variable_values)
         else:
             # no-plan resolver field (plan_fn is None): the resolver-adapter now lives IN
             # the operation plan as a ResolveStep depending on the bucket parent_step, so
@@ -281,16 +310,33 @@ def plan_object(
                 )
                 field_step.add_dependency(parent_step)
                 plan.add_step(field_step)
-                if plan.cache_plans and args_error is None:
-                    # KEEP the legacy cacheability guard: the coerced args are FROZEN onto
-                    # FieldPlan.args from this request, and a cache HIT replays them — so a
-                    # resolver reading a `$variable`-derived arg would serve a later request
-                    # the FIRST request's value, and a ResolveStep has no placeholder to
-                    # re-point. Refuse to cache a plan carrying any variable-derived resolver
-                    # arg (re-plan per request); such a plan is not cacheable.
-                    legacy_variable_args, _ = variable_provenance(field_nodes[0])
-                    if legacy_variable_args:
-                        plan.cacheable = False
+                if plan.cache_plans:
+                    # a plain-resolver field's coerced args are FROZEN onto FieldPlan.args
+                    # from this request, and a cache HIT replays them — a ResolveStep has no
+                    # placeholder to re-point. So every `$variable` the args derive from
+                    # (directly or nested inside an input literal) records a value
+                    # constraint: the frozen args are then provably correct on a hit (equal
+                    # variables => equal coerced args), and a different value plans its own
+                    # variant instead of re-planning every request. This covers args_error
+                    # too (a plan-resolver field's coercion failure also lands here): whether
+                    # coercion ERRORS is itself a function of the variable values (a null
+                    # for a non-null arg), so the frozen args_error — served as a located
+                    # field error on every hit — must never reach a request whose variables
+                    # would have coerced cleanly, nor vice versa.
+                    legacy_args, legacy_sources, legacy_nested = variable_provenance(
+                        field_nodes[0]
+                    )
+                    names: Set[str] = {legacy_sources[a] for a in legacy_args}
+                    for nested in legacy_nested.values():
+                        names |= nested
+                    for name in sorted(names):
+                        plan.request_constraints.append(
+                            ValueConstraint(
+                                "variables",
+                                (name,),
+                                context.variable_values.get(name, ABSENT),
+                            )
+                        )
 
         # every field passes its step down as the child bucket's parent (a plan field's
         # step, or a resolver field's ResolveStep); only the impossible no-plan-no-parent
@@ -432,7 +478,7 @@ def _primary_label(usage_set):
 
 def variable_provenance(
     field_node: FieldNode,
-) -> Tuple[FrozenSet[str], Dict[str, str]]:
+) -> Tuple[FrozenSet[str], Dict[str, str], Dict[str, FrozenSet[str]]]:
     """Compute per-argument variable provenance from a field's argument AST.
 
     graphql-core's ``get_argument_values`` coerces a ``$variable`` argument to its
@@ -441,20 +487,104 @@ def variable_provenance(
     ``.value`` is a :class:`~graphql.language.VariableNode` came from a variable, and the
     variable name is ``arg.value.name.value``.
 
-    Returns the SET of variable-derived argument names plus a mapping arg-name ->
-    GraphQL-variable-name, which :class:`FieldArgs` turns into the stable ``"var:<name>"``
-    source tag a placeholder dedups by. Arguments given as literals (or as a list/object
-    literal) are not included, so a host inlines them by value. This is pure
-    ``graphql.language`` — no execute-internals dependency.
+    Returns three views:
+
+    * ``variable_args`` — argument names whose value node IS a variable (directly).
+      These are the placeholderable args: :class:`FieldArgs` maps each to the stable
+      ``"var:<name>"`` source tag a placeholder dedups by.
+    * ``variable_sources`` — arg name -> GraphQL variable name, for those direct args.
+    * ``nested_variable_args`` — arg name -> the variable names appearing INSIDE the
+      arg's list/object literal (``where: {status: $s}``). Such an arg cannot ride a
+      single placeholder (the structure around the variable is a literal), so a raw
+      read of its coerced value observes the variables' values — the planner records a
+      value constraint per nested variable so the cached plan splits per value instead
+      of silently serving the building request's value.
+
+    Pure-literal arguments appear in none of them, so a host inlines those by value.
+    This is pure ``graphql.language`` — no execute-internals dependency.
     """
     variable_args: Set[str] = set()
     variable_sources: Dict[str, str] = {}
+    nested_variable_args: Dict[str, FrozenSet[str]] = {}
+
+    def nested_variables(value_node) -> Set[str]:
+        found: Set[str] = set()
+        values = getattr(value_node, "values", None)  # ListValueNode
+        if values is not None:
+            for item in values:
+                found |= nested_variables(item)
+        fields = getattr(value_node, "fields", None)  # ObjectValueNode
+        if fields is not None:
+            for field in fields:
+                found |= nested_variables(field.value)
+        if isinstance(value_node, VariableNode):
+            found.add(value_node.name.value)
+        return found
+
     for arg in field_node.arguments:
+        arg_name = arg.name.value
         if isinstance(arg.value, VariableNode):
-            arg_name = arg.name.value
             variable_args.add(arg_name)
             variable_sources[arg_name] = arg.value.name.value
-    return frozenset(variable_args), variable_sources
+        else:
+            nested = nested_variables(arg.value)
+            if nested:
+                nested_variable_args[arg_name] = frozenset(nested)
+    return frozenset(variable_args), variable_sources, nested_variable_args
+
+
+def record_field_args_constraints(plan: Plan, field_args: FieldArgs, variable_values) -> None:
+    """Convert one resolver's FieldArgs bookkeeping into request constraints.
+
+    Three observations, three constraint shapes (all against the ``variables`` scope —
+    arguments are derived from variables, so that is what a hit re-validates):
+
+    * a raw VALUE read of a variable-derived arg that was NOT placeholdered (an inline)
+      -> a value constraint per observed variable, for direct (``status: $s``) and
+      nested (``where: {status: $s}``) variables alike;
+    * an ``eval_is`` comparison -> an equality constraint on the OUTCOME (the
+      split-reducing read);
+    * a membership check (``"x" in args`` / ``eval_has``) of a direct variable arg ->
+      a presence constraint on its variable.
+
+    The placeholder path (``source()`` taken, value never observed) records nothing —
+    that is the hit-rate guarantee.
+    """
+    names: Set[str] = set()
+    for arg_name in field_args.inlined_variable_args():
+        var_name = field_args.variable_sources.get(arg_name)
+        if var_name is not None:
+            names.add(var_name)
+        names |= field_args.nested_variable_args.get(arg_name, frozenset())
+    for name in sorted(names):
+        plan.request_constraints.append(
+            ValueConstraint("variables", (name,), variable_values.get(name, ABSENT))
+        )
+    for arg_name, expected, passed in field_args.equality_checks:
+        var_name = field_args.variable_sources.get(arg_name)
+        if var_name is None:
+            continue
+        # eval_is compared the COERCED arg, but constraints validate the VARIABLE — and
+        # the two coincide only while the variable is PRESENT (an omitted variable lets
+        # the ARGUMENT-definition default flow into the coerced arg, which no
+        # variable-space comparison can reproduce). So pin the presence: a present-built
+        # outcome holds for every present request via the equality constraint; an
+        # absent-built outcome came from the schema default, which is identical for
+        # every absent request, so presence alone pins it.
+        present = var_name in variable_values
+        plan.request_constraints.append(
+            ExistsConstraint("variables", (var_name,), present)
+        )
+        if present:
+            plan.request_constraints.append(
+                EqualityConstraint("variables", (var_name,), expected, passed)
+            )
+    for arg_name in sorted(field_args.membership_checks):
+        var_name = field_args.variable_sources.get(arg_name)
+        if var_name is not None:
+            plan.request_constraints.append(
+                ExistsConstraint("variables", (var_name,), var_name in variable_values)
+            )
 
 
 def attach_child_plan(completer: Completer, child_plan: ObjectPlan) -> Completer:
@@ -500,7 +630,7 @@ def plan_operation(
 
     config = context.grafast_config
     if config.cache_plans:
-        cached = lookup_cached_plan(context, operation, config)
+        cached = lookup_cached_plan(context, operation, config, incremental)
         if cached is not None:
             return cached
 
@@ -600,8 +730,28 @@ def plan_operation(
     context._grafast_root_step = root_step
 
     if config.cache_plans and plan.cacheable:
+        # the candidate's full constraint set, one duck-typed list: the directive-variable
+        # constraints (which $variable values the pre-planning field collection resolved),
+        # every plan-time eval this build recorded (context gate / raw variable reads), and
+        # the customizer constraints captured pre-optimization above. Re-validated on every
+        # hit; a mismatch makes this candidate invisible to that request (it plans its own
+        # variant), never a stale serve.
+        all_constraints = (
+            *directive_variable_constraints(
+                operation, context.fragments, context.variable_values
+            ),
+            *plan.request_constraints,
+            *constraints,
+        )
         store_cached_plan(
-            context, operation, config, object_plan, root_step, plan, constraints
+            context,
+            operation,
+            config,
+            object_plan,
+            root_step,
+            plan,
+            all_constraints,
+            incremental,
         )
 
     return object_plan
@@ -641,8 +791,26 @@ def owns_abstract_field(object_plan: ObjectPlan) -> bool:
     return visit(object_plan)
 
 
-def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
-    """Return the SHARED cached ObjectPlan for this request (deepcopy-free), or None.
+def lookup_cached_plan(
+    context, operation: OperationDefinitionNode, config, incremental: bool = False
+):
+    """Return the SHARED cached ObjectPlan of a VALIDATED candidate, or None.
+
+    The key's bucket holds one candidate per plan VARIANT (a @skip(if:$hide) document
+    holds the true and false variants; an admin/user customizer split holds both
+    shapes). Each candidate is validated against THIS request — in order:
+
+    * schema identity (`cached.schema is context.schema`): a freed schema's `id` can be
+      reused, so the key's `id(schema)` component alone is not proof;
+    * the surviving-step walk: each customizer-bearing step in `cached.plan.steps`
+      re-resolves its customizer against this request's pg context
+      (`customizer_structure_matches`, duck-typed so core takes no pg import);
+    * the candidate's stored constraint set (`constraints_match`): directive-variable
+      values, plan-time evals, and the pre-optimization customizer constraints — pure
+      replay against this request's variable values + context value.
+
+    The first candidate that validates is the hit; none validating is a MISS, and the
+    fresh plan joins the bucket as a new variant (no thrash between variants).
 
     A cache HIT stashes the SHARED cached triple DIRECTLY on the context — `context._grafast_plan
     IS cached.plan`, no copy — plus this request's SOURCE MAP (`_grafast_source_values`: the
@@ -650,37 +818,30 @@ def lookup_cached_plan(context, operation: OperationDefinitionNode, config):
     cached steps carry NO per-request value (a value-LESS `pg_placeholder` bind, a value-LESS
     pagination `Placeholder`, a per-request-decoded cursor), so sharing them is concurrency-safe:
     two concurrent hits of the same document with different variables reuse the identical objects
-    but each renders its OWN source map into its OWN `params`, never bleeding. A MISS returns None
-    so `plan_operation` plans normally. Only called when `cache_plans` is on.
+    but each renders its OWN source map into its OWN `params`, never bleeding. Only called when
+    `cache_plans` is on.
     """
     from .cache import compute_cache_key, values_by_source
 
     cache = config.plan_cache if config.plan_cache is not None else _process_cache()
-    key = compute_cache_key(context.schema, operation, context.fragments, config)
-    cached = cache.get(key)
+    key = compute_cache_key(
+        context.schema, operation, context.fragments, config, incremental
+    )
+    facts = RequestFacts(context.variable_values, context.context_value)
+
+    def validate(candidate) -> bool:
+        if candidate.schema is not context.schema:
+            return False
+        for step in candidate.plan.steps:
+            matches = getattr(step, "customizer_structure_matches", None)
+            if matches is not None and not matches():
+                return False
+        if candidate.constraints and not constraints_match(candidate.constraints, facts):
+            return False
+        return True
+
+    cached = cache.get(key, validate)
     if cached is None:
-        return None
-    if cached.schema is not context.schema:
-        # a stale `id(schema)` collision (a freed schema's id reused by this one) — treat as a
-        # miss so we never serve a plan built against a different schema.
-        return None
-    # structural-divergence guard: a resource select_customizer whose predicate SHAPE depends on
-    # the request (it branches its STRUCTURE on context — e.g. no filter for an admin vs a scoped
-    # filter for a user) would otherwise let this HIT reuse the FIRST request's structure. Re-resolve
-    # each customizer-bearing step against THIS request; a STRUCTURAL change forces a re-plan (a
-    # miss). A value-only change is NOT a divergence — the placeholder re-binds per request, so a
-    # well-behaved value-varying customizer still hits. Duck-typed: core takes no pg import (the
-    # method lives on the pg step; a non-pg step never carries it).
-    for step in cached.plan.steps:
-        matches = getattr(step, "customizer_structure_matches", None)
-        if matches is not None and not matches():
-            return None
-    # the OPTIMIZATION-INDEPENDENT structural guard: re-validate the WHOLE captured constraint list
-    # against THIS request's context, so a customizer-bearing step that dedup-merged or tree-shook
-    # out of `plan.steps` (and so escaped the surviving-step walk above) is still checked. A
-    # divergence forces a re-plan (a miss) rather than serving this request another request's
-    # customizer-decided structure. Empty for a plan with no context-scoping customizer.
-    if cached.constraints and not constraints_match(cached.constraints):
         return None
     # the SHARED triple is read-only at execute (no per-request value lives on it); each request
     # carries its OWN source map, so no copy is needed (the deepcopy-free hit path).
@@ -712,20 +873,6 @@ def collect_customizer_constraints(plan) -> tuple:
     return tuple(constraints)
 
 
-def constraints_match(constraints) -> bool:
-    """Whether every captured customizer CONSTRAINT still resolves to its shape for this request.
-
-    The on-hit, optimization-independent structural-divergence guard (the grafast-py analogue of
-    upstream `matchesConstraints(contextConstraints, context)`): re-validates the WHOLE stored
-    constraint list, so a customizer whose step merged or shook out of `plan.steps` is still
-    checked. Each constraint reads the per-request context itself (so core stays pg-free, calling
-    this duck-typed like the surviving-step guard). A single structural divergence -> the hit is
-    treated as a MISS (re-plan). An empty list (a plan with no context-scoping customizer) matches
-    trivially.
-    """
-    return all(constraint.matches() for constraint in constraints)
-
-
 def store_cached_plan(
     context,
     operation: OperationDefinitionNode,
@@ -734,19 +881,22 @@ def store_cached_plan(
     root_step,
     plan,
     constraints: tuple = (),
+    incremental: bool = False,
 ):
-    """Store a freshly-finalized, value-independent plan under its cache key.
+    """Store a freshly-finalized plan as a new VARIANT under its cache key.
 
-    Called only on a MISS when `cache_plans` is on AND `plan.cacheable` (no variable value
-    was inlined as a plan-time literal). A value-specific plan is never stored — reusing it
-    would serve a later request the earlier request's value. `constraints` is the structural
-    guard list captured over the pre-optimization step set (see `collect_customizer_constraints`),
-    re-validated on every hit so a merged-away scoped step cannot escape the divergence check.
+    Called only on a MISS when `cache_plans` is on AND `plan.cacheable` (no literal-baking
+    customizer, no abstract field). `constraints` is the candidate's full request-constraint
+    set — directive-variable values, plan-time evals, and the customizer constraints captured
+    over the pre-optimization step set — re-validated on every hit, so the candidate is only
+    ever served to a request it is provably correct for.
     """
     from .cache import CachedPlan, compute_cache_key
 
     cache = config.plan_cache if config.plan_cache is not None else _process_cache()
-    key = compute_cache_key(context.schema, operation, context.fragments, config)
+    key = compute_cache_key(
+        context.schema, operation, context.fragments, config, incremental
+    )
     cache.put(
         key,
         CachedPlan(
