@@ -369,8 +369,8 @@ def test_cache_hit_returns_the_shared_plan_object(monkeypatch):
     captured = {}
     real_lookup = plan_module.lookup_cached_plan
 
-    def spy_lookup(context, operation, cfg):
-        result = real_lookup(context, operation, cfg)
+    def spy_lookup(context, operation, cfg, *args):
+        result = real_lookup(context, operation, cfg, *args)
         if result is not None:  # a HIT — capture what was stashed on the context
             captured["object_plan"] = result
             captured["plan"] = context._grafast_plan
@@ -440,12 +440,16 @@ def plan_query(schema, query, config, variables):
     return ctx._grafast_plan
 
 
-def test_plan_inlining_a_variable_literal_is_not_cacheable():
-    """A plan that INLINED a $variable value as a literal is marked NON-cacheable.
+def test_plan_inlining_a_variable_literal_constrains_per_value():
+    """A plan that INLINED a $variable value as a literal caches as a PER-VALUE variant.
 
-    Reusing it across requests would serve a later request the earlier value, so it must not
-    be cached. ``FieldArgs`` records the raw read; the planner flips ``plan.cacheable`` False.
+    The value entered the plan (an eval), so ``FieldArgs`` records the raw read and the
+    planner converts it into a value constraint on the variable: the plan stays cacheable,
+    but a hit requires THIS value — a different value plans its own variant (never stale,
+    and strictly better than the old blanket non-cacheable rule, which re-planned the same
+    value every request).
     """
+    from grafast_py.constraints import ValueConstraint
     from grafast_py.schema import make_grafast_schema
 
     schema = make_grafast_schema(
@@ -457,7 +461,10 @@ def test_plan_inlining_a_variable_literal_is_not_cacheable():
         GrafastConfig(placeholders=True, cache_plans=True),
         {"s": "published"},
     )
-    assert plan.cacheable is False
+    assert plan.cacheable is True
+    assert plan.request_constraints == [
+        ValueConstraint("variables", ("s",), "published")
+    ]
 
 
 def test_plan_using_a_placeholder_stays_cacheable():
@@ -476,14 +483,15 @@ def test_plan_using_a_placeholder_stays_cacheable():
     assert plan.cacheable is True
 
 
-def test_inlining_a_variable_is_not_cacheable_even_with_placeholders_off():
-    """cache_plans WITHOUT placeholders still detects an inlined $variable -> non-cacheable.
+def test_inlining_a_variable_constrains_even_with_placeholders_off():
+    """cache_plans WITHOUT placeholders still detects an inlined $variable -> a constraint.
 
     With placeholders off, provenance would not otherwise be computed, so an inlined variable
-    would go unrecorded and the value-pinned plan would be cached — a later request bleeding the
-    first value. Caching forces provenance (placeholders OR cache_plans), so the inline is
-    detected and the plan re-plans per request.
+    would go unrecorded and the value-pinned plan would be cached UNGUARDED — a later request
+    bleeding the first value. Caching forces provenance (placeholders OR cache_plans), so the
+    inline is detected and recorded as a per-value constraint.
     """
+    from grafast_py.constraints import ValueConstraint
     from grafast_py.schema import make_grafast_schema
 
     schema = make_grafast_schema(
@@ -495,16 +503,20 @@ def test_inlining_a_variable_is_not_cacheable_even_with_placeholders_off():
         GrafastConfig(placeholders=False, cache_plans=True),
         {"s": "published"},
     )
-    assert plan.cacheable is False
+    assert plan.request_constraints == [
+        ValueConstraint("variables", ("s",), "published")
+    ]
 
 
-def test_legacy_resolver_field_with_variable_arg_is_not_cacheable():
-    """A legacy (no-plan-resolver) field with a $variable arg is non-cacheable under cache_plans.
+def test_legacy_resolver_field_with_variable_arg_constrains_per_value():
+    """A legacy (no-plan-resolver) field with a $variable arg constrains on the variable.
 
-    The coerced args are frozen on FieldPlan.args and a cache HIT replays them, so a legacy
-    resolver reading the $variable would serve a later request the first value — and a legacy
-    resolver has no step to re-point. The plan must therefore not be cached (re-plan instead).
+    The coerced args are frozen on FieldPlan.args and a cache HIT replays them, and a legacy
+    resolver has no step to re-point — so the variable's value is recorded as a constraint:
+    a hit is only served to a request carrying the SAME value (the frozen args are then
+    provably correct), and a different value plans its own variant.
     """
+    from grafast_py.constraints import ValueConstraint
     from grafast_py.schema import make_grafast_schema
 
     # `things` has NO plan resolver -> the legacy graphql-core resolver path.
@@ -515,7 +527,10 @@ def test_legacy_resolver_field_with_variable_arg_is_not_cacheable():
         GrafastConfig(cache_plans=True),
         {"s": "published"},
     )
-    assert plan.cacheable is False
+    assert plan.cacheable is True
+    assert plan.request_constraints == [
+        ValueConstraint("variables", ("s",), "published")
+    ]
 
 
 def test_all_literal_plan_is_cacheable():
@@ -1130,14 +1145,24 @@ async def test_structure_branching_customizer_does_not_leak_across_contexts(seed
         user = await graphql(schema, query, execution_context_class=_Ctx)
 
     assert admin.errors is None and user.errors is None
-    # the two requests share a cache KEY (same document/config), so the user's lookup matches the
-    # admin's entry — exactly the collision that leaked before the guard.
-    assert cache.hits == 1
-    # ...yet the user still sees ONLY their scoped (draft) rows, never admin's full set: the
+    # the two requests share a cache KEY (same document/config), so the user's lookup walks the
+    # admin's candidate — exactly the collision that leaked before the guard. The structural
+    # mismatch makes it a MISS (hits counts VALIDATED hits), and the user's plan joins the bucket
+    # as a second VARIANT.
+    assert cache.misses == 2 and cache.hits == 0
+    # ...so the user sees ONLY their scoped (draft) rows, never admin's full set: the
     # structural-divergence guard rejected the shape mismatch and re-planned.
     assert sorted(w["id"] for w in admin.data["widgets"]) == [1, 2, 3, 4, 5, 6]
     assert sorted(w["id"] for w in user.data["widgets"]) == [2, 5]
     assert {w["status"] for w in user.data["widgets"]} == {"draft"}
+
+    # the multi-variant payoff: BOTH shapes now coexist under the key, so a second admin
+    # request validates against the admin variant — a true hit, no thrash.
+    with pg_request_context(SQLAlchemyExecutor(get_engine()), context={"role": "admin"}):
+        admin_again = await graphql(schema, query, execution_context_class=_Ctx)
+    assert admin_again.errors is None
+    assert sorted(w["id"] for w in admin_again.data["widgets"]) == [1, 2, 3, 4, 5, 6]
+    assert cache.hits == 1 and cache.misses == 2
 
 
 AUTHORS_POSTS_SDL = """
@@ -1231,9 +1256,10 @@ async def test_structure_branching_customizer_on_inlined_relation_does_not_leak(
     # matches nothing, must see NONE — never the admin's posts.
     assert sum(len(a["posts"]) for a in admin.data["authors"]) == 9
     assert sum(len(a["posts"]) for a in user.data["authors"]) == 0
-    # the two requests collide on the cache key (a hit), yet the user stays isolated: the
-    # customizer-bearing child is not folded, so the structural guard re-planned for the user.
-    assert cache.hits == 1
+    # the two requests collide on the cache key, yet the user stays isolated: the
+    # customizer-bearing child is not folded, so the structural guard rejected the admin
+    # candidate (a MISS — hits counts VALIDATED hits) and the user re-planned its own variant.
+    assert cache.misses == 2 and cache.hits == 0
 
 
 def build_same_table_two_resource_schema(scoped_customizer):

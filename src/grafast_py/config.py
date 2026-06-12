@@ -123,14 +123,16 @@ class GrafastConfig:
     cache_plans
         Cross-request plan caching: when ON, ``plan_operation`` caches the finalized plan
         tree keyed by (schema identity, document text, operation name, variable-arg
-        fingerprint) and reuses it across requests of the same document, skipping plan
-        construction on a hit. A cache hit re-binds placeholder values from THIS request's
-        variables at execute time, so the cached SQL is value-agnostic and shared safely.
-        It is a pure optimization: caching changes only WHETHER planning re-runs, never the
-        SQL text or the result data — the first request of a document still plans normally,
-        and a cached plan only ever holds value-INDEPENDENT SQL (every SQL-affecting variable
-        value is either a same-every-request literal or a value-agnostic placeholder), so a
-        plan that inlined a per-request variable as a literal is never cached for reuse. Like
+        fingerprint, config fingerprint, incremental flag) and reuses it across requests of
+        the same document, skipping plan construction on a hit. A cache hit re-binds
+        placeholder values from THIS request's variables/context at execute time, so the
+        cached SQL is value-agnostic and shared safely. Where planning OBSERVED a request
+        input (an inlined ``$variable`` value, a directive ``if: $var``, a context ``eval``)
+        the plan caches as a per-value VARIANT guarded by re-checkable CONSTRAINTS (see
+        :mod:`grafast_py.constraints`): a hit is served only to a request the plan is
+        provably correct for, and a different value plans its own variant. It is a pure
+        optimization: caching changes only WHETHER planning re-runs, never the SQL text or
+        the result data — the first request of a document still plans normally. Like
         ``inline_relations`` this is a PLAN-LEVEL constant read once via
         ``type(context).grafast_config`` and stashed on the plan. ``False`` (default) ships it
         dark — ``plan_operation`` never reads or writes the cache, so every operation plans

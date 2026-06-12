@@ -371,15 +371,20 @@ class CustomizerConstraint(NamedTuple):
     arity: int
     keys: Tuple[str, ...]
 
-    def matches(self) -> bool:
+    def matches(self, facts=None) -> bool:
         """Whether re-resolving the customizer under THIS request yields the captured shape.
 
-        Re-invokes the (pure) customizer against ``current_pg_request().context`` — read here,
-        not passed in, so the core cache lookup stays pg/sqlalchemy-free (it calls this duck-typed
-        like the surviving-step guard) — and compares the fresh value-agnostic predicate keys to
-        the captured ``keys``. Equal -> the structure is unchanged (a value-only difference rides
-        the placeholders, so the cache HIT is correct); different -> a structural divergence, so
-        the caller treats the hit as a MISS and re-plans.
+        One case of the core constraint protocol (``matches(facts)``, see
+        :mod:`grafast_py.constraints`) so it rides the same stored list and replay as the
+        value/equality/exists constraints. ``facts`` is accepted for the protocol but unused:
+        a customizer is resolved against ``current_pg_request().context`` (the pg request
+        context, NOT the GraphQL ``context_value``) — read here from the ContextVar, so the
+        core cache lookup stays pg/sqlalchemy-free (it calls this duck-typed like the
+        surviving-step guard). Re-invokes the (pure) customizer and compares the fresh
+        value-agnostic predicate keys to the captured ``keys``. Equal -> the structure is
+        unchanged (a value-only difference rides the placeholders, so the cache HIT is
+        correct); different -> a structural divergence, so the caller treats the hit as a
+        MISS and re-plans.
         """
         fresh, _ = resolve_customizer_predicates(
             self.customizer, current_pg_request().context, self.arity

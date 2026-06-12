@@ -53,15 +53,22 @@ class Plan:
         # provenance and caches nothing — both features stay dark.
         self.placeholders: bool = False
         self.cache_plans: bool = False
-        # whether this finalized plan is VALUE-INDEPENDENT and so safe to cache across
-        # requests of the same document. Defaults True; the planner flips it False when a
-        # GraphQL `$variable` value was INLINED as a plan-time literal (the value is baked
-        # into the SQL text, so the plan is value-specific and reusing it across requests
-        # would serve the wrong value). A value-agnostic plan — every SQL-affecting variable
-        # value is either a same-every-request literal or a source-tagged placeholder — stays
-        # True and may be cached. Only consulted when `cache_plans` is on (default-off => the
-        # cache is never read/written, so the flag is inert and the planning path is unaffected).
+        # whether this finalized plan may be cached across requests of the same document.
+        # Defaults True; the planner flips it False for the structurally-uncacheable cases (a
+        # literal-baking customizer, an abstract field whose subtrees plan lazily at execute —
+        # nothing in `plan.steps` to re-validate). A plan-time read of a REQUEST input (a raw
+        # variable read, a context eval) no longer disables caching: it records a constraint
+        # into `request_constraints` instead, so the plan caches as a per-value VARIANT. Only
+        # consulted when `cache_plans` is on (default-off => the cache is never read/written,
+        # so the flag is inert and the planning path is unaffected).
         self.cacheable: bool = True
+        # the plan-time request-input reads this plan build recorded — duck-typed constraint
+        # objects (`matches(facts)`, see grafast_py.constraints): a context gate eval, a raw
+        # read of a `$variable`-derived argument, an `info.variable_values` read. Combined at
+        # store time with the directive-variable and customizer constraints into the cached
+        # candidate's constraint set, re-validated on every hit. Stays empty on the
+        # constraint-free placeholder path (the hit-rate guarantee) and when caching is off.
+        self.request_constraints: List = []
         # plan-level hoisting decision (one operation = one decision): the
         # `GrafastConfig.hoist` flag, stashed here by `plan_operation` /
         # `abstract_child_plan` so `finalize_plan` can run the cross-parent hoist pass

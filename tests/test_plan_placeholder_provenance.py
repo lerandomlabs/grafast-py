@@ -136,7 +136,7 @@ def test_variable_provenance_splits_variables_from_literals():
     """The AST walk marks only `$variable`-valued args; literals are excluded."""
     doc = parse("query Q($s: String) { things(status: $s, limit: 10) { id } }")
     field = doc.definitions[0].selection_set.selections[0]
-    variable_args, variable_sources = variable_provenance(field)
+    variable_args, variable_sources, _nested = variable_provenance(field)
     assert variable_args == frozenset({"status"})
     assert variable_sources == {"status": "s"}
 
@@ -145,7 +145,7 @@ def test_variable_provenance_maps_arg_name_to_variable_name():
     """The mapping keys off the GraphQL VARIABLE name, not the argument name."""
     doc = parse("query Q($wantedStatus: String) { things(status: $wantedStatus) { id } }")
     field = doc.definitions[0].selection_set.selections[0]
-    variable_args, variable_sources = variable_provenance(field)
+    variable_args, variable_sources, _nested = variable_provenance(field)
     assert variable_args == frozenset({"status"})
     assert variable_sources == {"status": "wantedStatus"}
     # the value node really is a VariableNode (the seam the walk keys off)
@@ -156,9 +156,27 @@ def test_variable_provenance_empty_when_all_literals():
     """A field whose args are all literals yields empty provenance."""
     doc = parse('{ things(status: "published", limit: 10) { id } }')
     field = doc.definitions[0].selection_set.selections[0]
-    variable_args, variable_sources = variable_provenance(field)
+    variable_args, variable_sources, _nested = variable_provenance(field)
     assert variable_args == frozenset()
     assert variable_sources == {}
+
+
+def test_variable_provenance_finds_variables_nested_in_literals():
+    """A $variable INSIDE a list/object literal is nested provenance, not a direct variable.
+
+    ``where: {status: $s, tags: [$t, "x"]}`` cannot ride one placeholder (the structure
+    around the variables is a literal), so the arg is reported in ``nested_variable_args``
+    — a raw read of it observes those variables' values and constrains per variable.
+    """
+    doc = parse(
+        "query Q($s: String, $t: String) "
+        '{ things(where: {status: $s, tags: [$t, "x"]}, limit: 10) { id } }'
+    )
+    field = doc.definitions[0].selection_set.selections[0]
+    variable_args, variable_sources, nested = variable_provenance(field)
+    assert variable_args == frozenset()  # not directly placeholderable
+    assert variable_sources == {}
+    assert nested == {"where": frozenset({"s", "t"})}
 
 
 # ----------------------------- plan_object threads provenance into FieldArgs (flag-gated)

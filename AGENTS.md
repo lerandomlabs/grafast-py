@@ -45,6 +45,13 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        optimizer flags inline_relations / cache_plans / placeholders (opt-in,
                        default OFF) + hoist (default ON, like upstream) + error class (query
                        cost/depth limiting is a validation-layer concern, not here)
+  constraints.py       request-input constraints (the plan-cache correctness substrate):
+                       Value/Equality/Exists constraints + constraints_match replay (upstream
+                       constraints.ts), directive_variable_constraints (the @skip/@include/
+                       @defer/@stream document scan), and the plan-resolver accessors —
+                       ContextGate/ContextToken (info.context: bare read = value-less token,
+                       eval/eval_is/eval_has = look-now + constraint) and TrackedVariables
+                       (info.variable_values: every read is an eval)
   pg/                  Postgres data source — the optional `[pg]` extra (SQLAlchemy/asyncpg):
                        resource.py (PgResource: attributes/codecs/relations, select_customizer,
                          single- OR composite-column match keys; decode_row/decode_value),
@@ -78,14 +85,19 @@ src/grafast_py/        the engine (the only thing the published wheel ships)
                        Deferred: HAVING on aggregates.
 
 src/grafast_py/cache.py  cross-request plan cache (core, sqlalchemy-free): a bounded-LRU
-                       process cache of finalized plans keyed by (id(schema), document-text hash,
-                       operation name, variable-arg fingerprint); a HIT re-binds each placeholder
-                       to THIS request's variables by source tag via render-injection — it NEVER
-                       deepcopies or mutates the shared plan (per-request values are injected at
-                       execute time, so the cached plan is safe to share across concurrent requests).
-                       Opt-in via GrafastConfig.cache_plans (default OFF); only a value-agnostic
-                       (placeholder-bearing / all-literal) plan is cacheable across values, so a plan
-                       that inlined a variable literal is never reused.
+                       process cache keyed by (id(schema), document-text hash, operation name,
+                       variable-arg fingerprint, config fingerprint, incremental flag); each key
+                       holds a small MRU bucket of plan VARIANTS (MAX_VARIANTS_PER_KEY), one per
+                       constraint-distinguished build (upstream establishOperationPlan's
+                       candidate list). A HIT = the first candidate whose constraint set
+                       validates for THIS request (constraints.py replay + the customizer
+                       guards); it re-binds each placeholder to THIS request's variables by
+                       source tag via render-injection — it NEVER deepcopies or mutates the
+                       shared plan (per-request values are injected at execute time, so the
+                       cached plan is safe to share across concurrent requests). Opt-in via
+                       GrafastConfig.cache_plans (default OFF); a plan that OBSERVED a request
+                       input (inlined variable, directive variable, context eval) caches as a
+                       per-value variant guarded by constraints.
 
 tests/                 our own pytest suite (fast, pure-Python; run in CI)
 tests/differential/    parity vs reference Node Grafast (on-demand; needs Node) — see its README
@@ -179,45 +191,72 @@ uv run python benchmarks/soak.py
   the query's own transaction (auto-clearing at commit). Enforcement needs a DB role that
   does not bypass RLS — a superuser/`BYPASSRLS` role is never subject to a policy.
 
-## Request-dependent planning & the plan cache — the vectors that bite
+## Request-dependent planning & the plan cache — the invariant and its machinery
 
-This is the area where we have repeatedly missed subtle correctness holes. Walk ALL of these
-before touching anything cache-related; this list exists so you don't have to be told "did you
-consider X?".
+This is the area where we repeatedly missed subtle correctness holes before the general
+substrate landed. The invariant: **no per-request input may influence a plan's shape or field
+selection without the cache either re-validating that influence on a hit, or refusing to cache.**
+Walk ALL the vectors below whenever you touch anything cache-related.
 
 `cache_plans` (opt-in, default off) builds a plan ONCE and reuses it for the same document. The
 cache key — `(schema id, document text, operation name, variable-arg fingerprint, config
-fingerprint)` — deliberately does **NOT** include request **context** or variable **values**. So a
-cache HIT is only correct because of two things, and every caching bug is a hole in one of them:
+fingerprint, incremental flag)` — deliberately does **NOT** include request **context** or
+variable **values**. A cache HIT is correct because of exactly two channels (every caching bug is
+a hole in one of them):
 
 1. **Runtime VALUE channel** — a per-request value (tenant/RLS, a `$variable`) flows in at execute
-   time, never baked into the shared plan. Ours: value-less `ctx:` / `var:` placeholders
-   (`pg/placeholders.py`, resolved per request in `where_params` / `member_where_params`).
-   ≈ upstream Grafast `__ValueStep` + bucket-store seed + `addUnaryDependency`/`unaryValue`.
-2. **On-HIT structural re-validation** — if planning *branched its shape* on an input, re-check it
-   against THIS request or reject the hit. Ours: `CustomizerConstraint` capture/replay
-   (`plan.py` `collect_customizer_constraints` / `constraints_match`, `pg/customize.py`).
-   ≈ upstream `__TrackedValueStep.eval*` → `Constraint` → `matchesConstraints`.
+   time, never baked into the shared plan, and records NO constraint (the hit-rate guarantee).
+   Ours: value-less `ctx:` / `var:` placeholders (`pg/placeholders.py`, resolved per request in
+   `where_params` / `member_where_params`); plan resolvers reach the ctx channel via the gate —
+   `info.context["k"]` is a value-less `ContextToken` (`constraints.py`), `args.source("x")` is
+   the var channel. ≈ upstream `__ValueStep` + bucket-store seed + `unaryValue`.
+2. **Constraint channel (on-HIT re-validation)** — when planning OBSERVES an input (branches shape
+   on it, or bakes its value), the observation is recorded as a re-checkable constraint and the
+   plan caches as one VARIANT in its key's bucket; every hit replays the candidate's whole
+   constraint set against THIS request (`constraints.py` `constraints_match` + the customizer
+   guards in `lookup_cached_plan`). ≈ upstream `__TrackedValueStep.eval*` → `Constraint` →
+   `matchesConstraints` over `establishOperationPlan`'s candidate list.
 
-**THE TRAP we keep falling into: on a hit we re-validate ONLY the pg `select_customizer`.** Any
-OTHER plan-time dependence on a per-request input is invisible to the cache → a stale plan is
-served. Enumerate these vectors every time:
+**The vectors, and what covers each** (all regression-tested in
+`tests/test_cache_request_constraints.py`):
 
-- **Raw baked literal** — `.where(col == info.context["tenant"])` freezes a value into the shared
-  SQL; NOT auto-detected → cross-tenant leak. Contract (README): scope by a placeholder, never bake.
-- **Custom (non-pg) plan resolver reading `info.context` and branching plan STRUCTURE** — records no
-  constraint (only the pg customizer does) → leaks under caching. The general open gap.
-- **`@skip`/`@include`/`@defer`/`@stream`/fragment `if:` that is a `$variable`** — the
-  easily-overlooked one, and a **KNOWN BUG under `cache_plans`**. graphql-core's `collect_fields`
-  resolves these against variable VALUES *before* planning, so the resolved FIELD SELECTION is
-  frozen into the cached plan and served to later requests with a different value (verified:
-  `@skip(if: $hide)` returns request 1's field set for both `$hide` values). Nothing catches it —
-  the key holds *which* args are variables, not their values, and the on-hit guard only checks the
-  pg customizer. This is exactly what upstream's `variableValuesConstraints` exist for. Fix vector:
-  mark non-cacheable when a directive `if:` references a variable, OR fold those variable values
-  into the key.
-- **A placeholder `transform=` that closes over per-request state** — bakes that state into the
-  shared callable. Same class as the raw-literal bake.
+- **Directive variables** (`@skip`/`@include`/`@defer`/`@stream`/fragment `if:` = `$variable`):
+  resolved by graphql-core's `collect_fields` against variable VALUES *before* planning — a read
+  inside foreign code that no accessor can intercept. Covered by the document scan
+  (`directive_variable_constraints`): one value constraint per directive variable, recorded on
+  every miss. `@stream` IS constrained here (unlike upstream, our planner reads its args at plan
+  time into `FieldPlan.stream`).
+- **Plan-resolver context reads**: `info.context` is a `ContextGate` — bare reads yield tokens
+  (channel 1), `eval`/`eval_is`/`eval_has` return the value AND record a constraint (channel 2),
+  `bool(token)` raises. There is no raw plan-time context object to leak.
+- **Variable values observed raw**: a `FieldArgs` value read of a variable-derived arg (direct
+  `status: $s` or NESTED `where: {status: $s}`), `args.raw`, `"x" in args`, and
+  `info.variable_values[...]` all record constraints (the eval semantics; see
+  `record_field_args_constraints`). An "inlined" variable therefore caches per value — it is
+  never stale and never blanket-non-cacheable.
+- **Plain-resolver (ResolveStep) fields with variable args**: coerced args are frozen onto
+  `FieldPlan.args`; value constraints on the deriving variables make the frozen args provably
+  correct on a hit.
+- **pg `select_customizer` structure-branching**: `CustomizerConstraint` (re-invokes the pure
+  customizer per hit and compares value-agnostic predicate keys) — now one case of the same
+  constraint protocol (`matches(facts)`, facts ignored: it reads the pg request context), riding
+  the same stored list. Plus the per-surviving-step `customizer_structure_matches` walk.
+- **Structurally unre-validatable shapes stay non-cacheable**: a literal-baking customizer and
+  any operation owning an abstract (interface/union) field (its subtrees plan lazily at execute,
+  outside `plan.steps`).
+- **Side-channel bakes** (a closure/ContextVar/global evaluated into a literal) — the engine sees
+  only the evaluated constant; this is the one DOCUMENTED CONTRACT left (README "Cache-safety").
+  A placeholder `transform=` closing over request state is caught by content-keying (below).
+
+**Constraint discipline.** Capture happens over the PRE-optimization step set
+(`collect_customizer_constraints` runs before `finalize_plan`, so a dedup-merged step still
+constrains); re-validation is PURE, cheap, and runs on EVERY hit (it executes under the cache
+lock); record a constraint ONLY for reads that affect plan shape/selection — every constraint is
+a split point, and the placeholder path must stay constraint-free
+(`test_placeholder_path_records_zero_constraints` pins this). Prefer outcome constraints
+(`eval_is`/`eval_has` → Equality/Exists) over full value constraints where the plan only needed a
+comparison. Buckets are bounded (`MAX_VARIANTS_PER_KEY`); steady-state variant churn in the logs
+means something records a high-cardinality value constraint.
 
 **Transform identity** (`transform_key` + `sentinel_placeholders`, `pg/placeholders.py` /
 `pg/customize.py`): `predicate_key` feeds BOTH within-plan dedup AND the cross-request constraint
@@ -228,29 +267,67 @@ closure values; a callable instance by type + `__dict__`; a builtin by qualname)
 history shows the ~6 ways this was gotten wrong.
 
 **Drop-in nuance — don't re-derive the wrong conclusion.** Supporting classic graphql-core
-resolvers is NOT what blocks tracking context. Classic resolvers read context at RUN time (post-
-plan, nothing to track) — like upstream's `GraphQLResolverStep` (`addDependency(context())`). The
-only PLAN-time context read is our own plan-resolver API (`info.context` inside `plan(p, a, info)`),
-which we control — so an upstream-style mandatory accessor (`eval` = look now & record a constraint
-vs `placeholder` = runtime value) is portable for plan resolvers WITHOUT breaking the drop-in. The
-one exception is the `@skip`/`@include` vector: that read lives in graphql-core's `collect_fields`,
-not our API, so it can't be routed through an accessor and needs the key/non-cacheable fix instead.
+resolvers is NOT in tension with the context gate. Classic resolvers read context at RUN time
+(post-plan; `ResolveStep.execute` builds its own info with the REAL context) — like upstream's
+`GraphQLResolverStep`. Only the PLAN-time info our planner hands to plan resolvers carries the
+gate + `TrackedVariables`, and that info exists in all modes (uniform API; with caching off the
+recorded constraints are simply never consumed).
 
-**Substrate status (so you don't redo the analysis).** We already have BOTH upstream channels — the
-runtime one (placeholders) and the plan-split one (`CustomizerConstraint`) — but the plan-split one
-is wired ONLY for the pg customizer. A general "any plan-time read of a request input records a
-constraint" substrate (a core `ContextStep` + a `Constraint` protocol that `CustomizerConstraint`
-becomes one case of) would close the non-pg vectors; it is feasible and does NOT fight the drop-in,
-but is deferred until a real second consumer exists (a second SQL backend, or a non-pg
-context-scoping plan resolver). Do NOT port upstream's value-identity `eval`/`evalKeys`/`evalLength`
-surface wholesale — most of it has no consumer here.
+**Search terms / where to look.** Ours: `constraints.py` (the substrate), `cache_plans`,
+`compute_cache_key`, `MAX_VARIANTS_PER_KEY`, `lookup_cached_plan`, `record_field_args_constraints`,
+`directive_variable_constraints`, `collect_customizer_constraints`, `constraints_match`,
+`customizer_structure_matches`, `CustomizerConstraint`, `ContextGate`, `ContextToken`,
+`pg_placeholder`, `where_params`, `transform_key`, `sentinel_placeholders`, `values_by_source`.
+Upstream reference (cloned at `grafast-crystal/grafast/grafast/src`): `steps/__value.ts`,
+`steps/__trackedValue.ts`, `constraints.ts`, `establishOperationPlan.ts`,
+`graphqlCollectFields.ts`.
 
-**Search terms / where to look.** Ours: `cache_plans`, `compute_cache_key`, `lookup_cached_plan`,
-`collect_customizer_constraints`, `constraints_match`, `customizer_structure_matches`,
-`CustomizerConstraint`, `pg_placeholder`, `where_params`, `transform_key`, `sentinel_placeholders`,
-`values_by_source`; the `@skip` vector lives in graphql-core's `collect_fields` (called from
-`plan.py`). Upstream reference (cloned at `grafast-crystal/grafast/grafast/src`): `steps/__value.ts`,
-`steps/__trackedValue.ts`, `constraints.ts`, `establishOperationPlan.ts`.
+## Purposeful distinctions from upstream
+
+Deliberate design divergences from upstream Grafast — do not "fix" these toward upstream without
+revisiting the reasoning:
+
+- **Context: withhold by default, public `eval` as an extension.** Upstream's public `context()`
+  exposes ONLY the untracked runtime channel (plan authors cannot eval context at all; the eval
+  machinery is engine-internal). We adopt the same withholding default (`info.context[...]` =
+  value-less token) but expose `eval`/`eval_is`/`eval_has` publicly — same machinery upstream uses
+  internally for `@skip`, deliberately offered to plan resolvers (spec R3). Our tokens also fail
+  LOUD on `bool()` where upstream's steps are vacuously truthy.
+- **Arguments are plain coerced VALUES, not steps.** Upstream hands plan resolvers input STEPS
+  (`fieldArgs.getRaw` → `__TrackedValueStep`, tokens all the way down). We hand coerced Python
+  values (the friendlier API) and recover provenance from the field AST
+  (`variable_provenance`, incl. variables nested in input literals); a value read of a
+  variable-derived arg is recorded as the eval it is. Same eval vocabulary as the gate, two
+  defaults: bare context reads are always per-request (token), bare arg reads are usually
+  document-literals (value). An all-tokens FieldArgs is upstream's shape if ever wanted.
+- **Field collection stays graphql-core's; directive variables are constrained by a document
+  scan.** Upstream reimplements CollectFields (`graphqlCollectFields.ts`) so directive-arg reads
+  route through its tracked step. We keep calling graphql-core's `collect_fields` and instead
+  pre-record the same constraints from the AST (`directive_variable_constraints`) — identical
+  outcome, no engine fork. Consequence: our `@stream` args are read at PLAN time
+  (`FieldPlan.stream`) and therefore constrained, where upstream resolves them at runtime
+  (unconstrained).
+- **Constraints may re-invoke host code; matching is `==`.** Upstream constraints are pure data
+  compared with `===`. Ours are a duck-typed protocol (`matches(facts)`) so the pg
+  `CustomizerConstraint` — which re-invokes the (contractually pure, cheap) customizer per hit —
+  rides the same list; value matching uses Python `==` (GraphQL coercion pins types per
+  operation, and `==` compares coerced dicts/lists sanely where reference identity would always
+  miss). Only the three constraint shapes with consumers exist (value/equal/exists) — upstream's
+  `evalKeys`/`evalLength`/`evalIsEmpty` surface has no consumer here (spec: out of scope).
+- **Cache keyed by document TEXT, candidates in an LRU bucket.** Upstream keys by
+  OperationDefinitionNode object identity (works because of its query-string→AST cache) and keeps
+  up to 50 candidates per operation on the schema object. We key by printed document text (stable
+  across re-parses) in a process `PlanCache`, `MAX_VARIANTS_PER_KEY`=8, and count hits as
+  VALIDATED hits. Upstream also caches planning ERRORS per constraint set; we don't (no consumer).
+- **"Placeholder" is our name for upstream's unary/value-step channel** (`pg_placeholder`,
+  pagination `Placeholder`, `ContextToken`): a source-tagged value-less slot resolved per request
+  at the render seam, instead of a `__ValueStep` wired through the DAG. DAG context-edges are
+  deliberately not built (spec: out of scope until a consumer exists).
+- **`info.root_value` is NOT tracked** (upstream tracks rootValue as its third entity). No
+  consumer here; a plan resolver reading it at plan time is the same side-channel class as a
+  closure bake (the documented contract) — note the subscription per-event path, where
+  root_value is the EVENT payload and plans are cached across events. Wire it as a third
+  constraint scope if a consumer appears.
 
 ## Database (DB-backed tests + benchmarks)
 
