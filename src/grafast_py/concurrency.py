@@ -7,9 +7,10 @@ from inspect import iscoroutine
 class OwnedAwaitable(Coroutine):
     """Keep unstarted batch wrappers responsible for their raw coroutines."""
 
-    def __init__(self, awaitable, *owned):
+    def __init__(self, awaitable, *owned, on_unstarted_close=None):
         self.awaitable = awaitable
         self.owned = owned
+        self.on_unstarted_close = on_unstarted_close
         self.driver = self.run()
 
     def __await__(self):
@@ -19,18 +20,29 @@ class OwnedAwaitable(Coroutine):
         return self.driver.send(value)
 
     def throw(self, *args):
-        return self.driver.throw(*args)
+        try:
+            return self.driver.throw(*args)
+        except BaseException:
+            self.close()
+            raise
 
     async def run(self):
+        # Once started, the wrapped run owns its pending span's normal/error exit.
+        self.on_unstarted_close = None
         try:
             return await self.awaitable
         finally:
             self.close_owned()
 
     def close(self):
-        self.driver.close()
-        self.awaitable.close()
-        self.close_owned()
+        try:
+            self.driver.close()
+            self.awaitable.close()
+            self.close_owned()
+        finally:
+            callback, self.on_unstarted_close = self.on_unstarted_close, None
+            if callback is not None:
+                callback()
 
     def close_owned(self):
         for awaitable in self.owned:

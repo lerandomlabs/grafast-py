@@ -110,7 +110,7 @@ jobs:
         run: .venv33/bin/python scripts/fetch_conformance.py 3.3.0a12
 
       - name: function-seam, concurrency and incremental tests under 3.3
-        run: .venv33/bin/python -m pytest tests/test_function_seam.py tests/test_compat.py tests/test_hardening.py tests/test_incremental.py -m 'not pg' -p anyio -q
+        run: .venv33/bin/python -m pytest tests/test_function_seam.py tests/test_compat.py tests/test_hardening.py tests/test_incremental.py tests/test_step_model.py -m 'not pg' -p anyio -q
 
       - name: 3.3 execution conformance under grafast
         # @defer/@stream/subscriptions ARE implemented (P7). The 2 incremental test files are

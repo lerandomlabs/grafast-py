@@ -254,6 +254,7 @@ def run_steps(
                     semaphore,
                 ),
                 out,
+                on_unstarted_close=lambda: span.__exit__(None, None, None),
             )
         span.__exit__(None, None, None)
         _store(results, step, count, out, unary, is_awaitable)
