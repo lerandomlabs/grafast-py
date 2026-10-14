@@ -20,6 +20,8 @@ per-parent paths) as a third `execute` argument; pure value/load steps do not.
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
+from .concurrency import OwnedAwaitable, await_limited, include_owned_awaitables
+
 if TYPE_CHECKING:
     from .dag import Plan
 
@@ -178,6 +180,7 @@ def run_steps(
     seed: Optional[Dict[int, List[Any]]] = None,
     on_step_batch: Optional[Callable[[Step, int], Any]] = None,
     extra=None,
+    semaphore=None,
 ):
     """Execute a topologically ordered list of steps once each over a bucket.
 
@@ -204,6 +207,7 @@ def run_steps(
     dependency order so a dependent never runs before its dependency's column is
     materialised. `is_awaitable` is the context's awaitable predicate.
     """
+    is_awaitable = include_owned_awaitables(is_awaitable)
     results: dict[int, List[Any]] = dict(seed) if seed else {}
     # effective per-bucket unariness: a SEEDED boundary column is per-entry (it IS the bucket of
     # parents, e.g. a constant LIST exploded into a child object bucket), so a step is run ONCE
@@ -233,19 +237,23 @@ def run_steps(
             raise
         if is_awaitable(out):
             # the real work is in the await; keep the span open across it.
-            return _run_steps_async(
-                count,
-                ordered_steps,
-                results,
-                index,
-                step,
+            return OwnedAwaitable(
+                _run_steps_async(
+                    count,
+                    ordered_steps,
+                    results,
+                    index,
+                    step,
+                    out,
+                    span,
+                    unary,
+                    unary_here,
+                    is_awaitable,
+                    on_step_batch,
+                    extra,
+                    semaphore,
+                ),
                 out,
-                span,
-                unary,
-                unary_here,
-                is_awaitable,
-                on_step_batch,
-                extra,
             )
         span.__exit__(None, None, None)
         _store(results, step, count, out, unary, is_awaitable)
@@ -294,11 +302,11 @@ def _span(on_step_batch, step, count):
 
 async def _run_steps_async(
     count, ordered_steps, results, index, pending_step, pending, pending_span, pending_unary,
-    unary_here, is_awaitable, on_step_batch=None, extra=None,
+    unary_here, is_awaitable, on_step_batch=None, extra=None, semaphore=None,
 ):
     """Finish a step run that hit an awaitable column, awaiting in dep order."""
     try:
-        out = await pending
+        out = await await_limited(pending, semaphore)
     except BaseException:
         # the span carried across the sync->async handoff must still close if the awaited step
         # raises (mirrors the sync path) — otherwise the failure-time span leaks.
@@ -318,7 +326,7 @@ async def _run_steps_async(
                 else step.execute(step_count, cols)
             )
             if is_awaitable(out):
-                out = await out
+                out = await await_limited(out, semaphore)
         _store(results, step, count, out, unary, is_awaitable)
 
     return results

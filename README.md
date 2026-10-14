@@ -326,7 +326,7 @@ from grafast_py import GrafastConfig, GrafastExecutionContext
 class HardenedContext(GrafastExecutionContext):
     grafast_config = GrafastConfig(
         execution_timeout_s=5.0,    # async-path wall-clock budget
-        max_step_concurrency=32,    # cap in-flight step fan-out (see pool note below)
+        max_step_concurrency=32,    # cap active async loads/resolvers (see pool note below)
         # tracing hooks (no-ops by default); each may return a context-manager span:
         on_operation=my_op_span,    # (context, operation)
         on_plan=my_plan_span,       # (context, operation)
@@ -348,8 +348,13 @@ configure_engine(
 **Concurrency / pool relationship:** the real ceiling on concurrent in-flight DB
 connections is `pool_size + max_overflow` (SQLAlchemy enforces it; excess operations
 queue on checkout, raising the latency tail). Size the pool to your target
-concurrency. `max_step_concurrency` is a secondary throttle on the engine's own step
-fan-out, not the DB bound — the pool is. For per-statement bounds, set a server-side
+concurrency. `max_step_concurrency` limits active async step, resolver, iterator and
+type resolver awaits within one operation. A permit is released before completing nested
+fields, so query depth cannot exhaust the budget with waiting parents. It does not
+limit concurrent requests, host-created tasks already running, or additional work a
+callback starts internally (including the default type resolver's concurrent
+`is_type_of` checks). Use the shared pool (and admission before checkout when
+needed) to bound aggregate database demand. For per-statement bounds, set a server-side
 `statement_timeout` via `connect_args`.
 
 ### Bring your own pool (the production path)

@@ -96,11 +96,16 @@ class GrafastConfig:
         the pg engine's ``connect_args``) for a hard database-side bound.
         ``None`` = unbounded.
     max_step_concurrency
-        Secondary throttle on the bucket executor's sibling-field completion fan-out,
-        via an :class:`asyncio.Semaphore`. NOTE: this is **not** the bound on
+        Per-operation throttle on asynchronous step, resolver, iterator and type
+        resolver awaits, via an :class:`asyncio.Semaphore`. Permits are released before
+        completing child fields; a parent waiting for children is not active work.
+        NOTE: this is **not** the bound on
         concurrent DB round-trips — that is the pg connection pool
         (``pool_size + max_overflow``), which SQLAlchemy enforces by queuing checkouts.
-        Bound DB concurrency with the pool; this knob bounds in-engine fan-out.
+        A callback counts as one work unit even if it fans out internally (including
+        the default type resolver's concurrent ``is_type_of`` checks).
+        Bound DB concurrency with the pool. Work already scheduled by host code
+        and work spawned internally by a loader still need their resource limits.
         ``None`` = unbounded.
 
     Optimization knobs (off by default)

@@ -260,6 +260,50 @@ def test_stream_equals_inline_list():
     assert inline["data"]["items"] == full
 
 
+@pytest.mark.parametrize("initial_count", [0, 1])
+def test_async_stream_pulls_share_the_concurrency_budget(initial_count):
+    async def go():
+        active = 0
+        peak = 0
+
+        async def items(_parent, _info):
+            nonlocal active, peak
+            for item in ["first", "second", "third"]:
+                active += 1
+                peak = max(peak, active)
+                try:
+                    await asyncio.sleep(0)
+                finally:
+                    active -= 1
+                yield item
+
+        schema = GraphQLSchema(GraphQLObjectType("Query", {
+            name: GraphQLField(GraphQLList(GraphQLString), resolve=items)
+            for name in "abc"
+        }))
+        query = "{ " + " ".join(
+            f"{name} @stream(initialCount: {initial_count})" for name in "abc"
+        ) + " }"
+        result = await experimental_execute_incrementally(
+            schema, parse(query), config=GrafastConfig(max_step_concurrency=1)
+        )
+        initial = result.initial_result
+        assert initial.errors is None
+        merged = initial.data
+        paths = {pending.id: pending.path[0] for pending in initial.pending}
+        async for patch in result.subsequent_results:
+            for entry in patch.incremental or []:
+                assert entry.errors is None
+                merged[paths[entry.id]].extend(entry.items)
+            for completed in patch.completed or []:
+                assert completed.errors is None
+        assert merged == {name: ["first", "second", "third"] for name in "abc"}
+        assert active == 0
+        assert peak == 1
+
+    asyncio.run(go())
+
+
 def test_async_stream_equals_inline_list():
     """A @stream'd ASYNC GENERATOR yields the same full list as the inline query, over >1 payload.
 

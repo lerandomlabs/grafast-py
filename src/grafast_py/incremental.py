@@ -46,6 +46,7 @@ from graphql.pyutils import Undefined
 
 from . import _compat
 from .bubble import Bubble
+from .concurrency import await_limited
 from .config import log
 
 
@@ -878,7 +879,10 @@ class AsyncStreamProducer:
         index = self._index
         self._index += 1
         try:
-            item = await self._iterator.__anext__()
+            item = await await_limited(
+                self._iterator.__anext__(),
+                getattr(self._context, "_grafast_concurrency", None),
+            )
         except StopAsyncIteration:
             return StreamItemResult()
         except (GraphQLError, TypeError, ValueError, RuntimeError) as exc:
@@ -909,7 +913,10 @@ class AsyncStreamProducer:
         index = self._index
         self._index += 1
         try:
-            item = await self._iterator.__anext__()
+            item = await await_limited(
+                self._iterator.__anext__(),
+                getattr(self._context, "_grafast_concurrency", None),
+            )
         except StopAsyncIteration:
             return StreamItemResult()
         except (GraphQLError, TypeError, ValueError, RuntimeError) as exc:
