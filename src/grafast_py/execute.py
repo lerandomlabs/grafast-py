@@ -27,6 +27,7 @@ from graphql.pyutils import Path, Undefined, is_iterable
 
 from . import _compat
 from .bubble import Bubble
+from .concurrency import await_limited
 from .completion import (
     HoistBridge,
     NonNullCompleter,
@@ -125,6 +126,7 @@ def run_layer(
         seed=seed,
         on_step_batch=getattr(context, "_grafast_on_step_batch", None),
         extra=extra,
+        semaphore=getattr(context, "_grafast_concurrency", None),
     )
 
 
@@ -253,14 +255,11 @@ def walk_output(
         # sibling fields run concurrently: their resolver coroutines were already
         # created during the synchronous pass above, so gathering the per-field
         # completion coroutines lets all in-flight resolvers progress in parallel.
-        # When `max_step_concurrency` is set, a semaphore caps how many run at once.
+        # Completion recurses into children, so it must never hold a work permit
+        # while waiting for them. Only raw load/resolver awaits consume permits.
         from asyncio import gather
 
-        semaphore = getattr(context, "_grafast_concurrency", None)
-        if semaphore is None:
-            await gather(*pending)
-        else:
-            await gather(*(_gated(semaphore, p) for p in pending))
+        await gather(*pending)
         if not early:
             capture_deferred_jobs(context, plan, parents, parent_paths, state)
         return assemble(state)
@@ -308,12 +307,6 @@ def capture_deferred_jobs(context, plan, parents, parent_paths, state) -> None:
         if not is_live(state, i):
             continue
         sink(plan.deferred, parents[i], parent_paths[i], plan.parent_type)
-
-
-async def _gated(semaphore, awaitable):
-    """Await `awaitable` while holding `semaphore` (bounded concurrency)."""
-    async with semaphore:
-        return await awaitable
 
 
 def execute_object_plan_serially(
@@ -578,7 +571,9 @@ def complete_one_stream_value(
 
         async def after_await():
             try:
-                resolved = await value
+                resolved = await await_limited(
+                    value, getattr(context, "_grafast_concurrency", None)
+                )
             except (GraphQLError, TypeError, ValueError, RuntimeError) as exc:
                 emit(Bubble(located_error(exc, field_plan.field_nodes, path.as_list())))
                 return
@@ -698,7 +693,10 @@ def drain_async_head(
         bubbled = None
         for _ in range(producer.initial_count):
             try:
-                item = await producer._iterator.__anext__()
+                item = await await_limited(
+                    producer._iterator.__anext__(),
+                    getattr(context, "_grafast_concurrency", None),
+                )
             except StopAsyncIteration:
                 break
             except (GraphQLError, TypeError, ValueError, RuntimeError) as exc:
@@ -844,6 +842,7 @@ def run_effect_steps(context, plan: ObjectPlan, parents: List[Any]):
         context.is_awaitable,
         seed=seed,
         on_step_batch=getattr(context, "_grafast_on_step_batch", None),
+        semaphore=getattr(context, "_grafast_concurrency", None),
     )
     if context.is_awaitable(columns):
 
@@ -876,6 +875,7 @@ def run_serial_plan_field(context, field_plan, live_parents, live_paths, parent_
         seed=seed,
         on_step_batch=getattr(context, "_grafast_on_step_batch", None),
         extra=extra,
+        semaphore=getattr(context, "_grafast_concurrency", None),
     )
 
     field_def = field_plan.field_def

@@ -36,6 +36,7 @@ from graphql.validation import validate
 
 from . import _compat
 from .bubble import Bubble
+from .concurrency import include_owned_awaitables
 from .config import DEFAULT_CONFIG, GrafastConfig, GrafastTimeoutError, log
 from .execute import execute_object_plan, execute_object_plan_serially
 from .plan import plan_operation
@@ -118,6 +119,7 @@ def run_planned_operation(
     ``context`` is any object exposing the pipeline surface — a :class:`_PlanRunContext`
     or a ``GrafastExecutionContext`` shim — including a ``grafast_config`` attribute.
     """
+    context.is_awaitable = include_owned_awaitables(context.is_awaitable)
     config = context.grafast_config
     # expose the opt-in step-batch tracing hook + concurrency gate to the executor without
     # changing the stock context constructor signature.
@@ -515,6 +517,7 @@ def run_planned_operation_incremental(context, operation, root_value):
     """
     from .incremental import make_defer_sink
 
+    context.is_awaitable = include_owned_awaitables(context.is_awaitable)
     config = context.grafast_config
     context._grafast_on_step_batch = config.on_step_batch
     context._grafast_concurrency = (

@@ -33,7 +33,7 @@ from graphql.type import (
 
 from grafast_py import _compat
 from grafast_py.config import GrafastConfig
-from grafast_py.core_steps import constant, lambda_step
+from grafast_py.core_steps import constant, lambda_step, load_one
 from grafast_py.entry import experimental_execute_incrementally
 from grafast_py.schema import make_grafast_schema
 
@@ -258,6 +258,101 @@ def test_stream_equals_inline_list():
             streamed_items.extend(entry["items"])
     assert initial_items + streamed_items == inline["data"]["items"]
     assert inline["data"]["items"] == full
+
+
+def test_early_deferred_load_shares_budget_with_serial_mutation_steps():
+    async def go():
+        active = 0
+        peak = 0
+
+        async def load(keys):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0)
+                return [2 if key == "second" else 3 for key in keys]
+            finally:
+                active -= 1
+
+        schema = make_grafast_schema(
+            """
+            type Query { unused: Int }
+            type Mutation { first: Payload second: Int }
+            type Payload { id: ID! deferred: Int }
+            """,
+            {
+                "Mutation": {
+                    "first": lambda p, a, i: constant({"id": "1"}),
+                    "second": lambda p, a, i: load_one(constant("second"), load),
+                },
+                "Payload": {
+                    "deferred": lambda p, a, i: load_one(constant("deferred"), load),
+                },
+            },
+        )
+        result = await experimental_execute_incrementally(
+            schema,
+            parse("mutation { first { id ... @defer { deferred } } second }"),
+            config=GrafastConfig(max_step_concurrency=1),
+            enable_early_execution=True,
+        )
+        assert result.initial_result.errors is None
+        assert result.initial_result.data == {"first": {"id": "1"}, "second": 2}
+        deferred_data = []
+        async for patch in result.subsequent_results:
+            for entry in patch.incremental or []:
+                assert entry.errors is None
+                deferred_data.append(entry.data)
+        assert deferred_data == [{"deferred": 3}]
+        assert active == 0
+        assert peak == 1
+
+    asyncio.run(asyncio.wait_for(go(), timeout=1))
+
+
+@pytest.mark.parametrize("initial_count", [0, 1])
+def test_async_stream_pulls_share_the_concurrency_budget(initial_count):
+    async def go():
+        active = 0
+        peak = 0
+
+        async def items(_parent, _info):
+            nonlocal active, peak
+            for item in ["first", "second", "third"]:
+                active += 1
+                peak = max(peak, active)
+                try:
+                    await asyncio.sleep(0)
+                finally:
+                    active -= 1
+                yield item
+
+        schema = GraphQLSchema(GraphQLObjectType("Query", {
+            name: GraphQLField(GraphQLList(GraphQLString), resolve=items)
+            for name in "abc"
+        }))
+        query = "{ " + " ".join(
+            f"{name} @stream(initialCount: {initial_count})" for name in "abc"
+        ) + " }"
+        result = await experimental_execute_incrementally(
+            schema, parse(query), config=GrafastConfig(max_step_concurrency=1)
+        )
+        initial = result.initial_result
+        assert initial.errors is None
+        merged = initial.data
+        paths = {pending.id: pending.path[0] for pending in initial.pending}
+        async for patch in result.subsequent_results:
+            for entry in patch.incremental or []:
+                assert entry.errors is None
+                merged[paths[entry.id]].extend(entry.items)
+            for completed in patch.completed or []:
+                assert completed.errors is None
+        assert merged == {name: ["first", "second", "third"] for name in "abc"}
+        assert active == 0
+        assert peak == 1
+
+    asyncio.run(go())
 
 
 def test_async_stream_equals_inline_list():

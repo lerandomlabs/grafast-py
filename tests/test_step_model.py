@@ -139,3 +139,39 @@ async def test_run_steps_supports_an_async_column():
     assert results[source.id] == [7, 8, 9]
     assert results[mapper.id] == [6, 7, 8]
     assert mapper.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_mode", ["close", "task-cancel"])
+async def test_cancelling_before_async_column_starts_closes_its_span(cancel_mode):
+    class AsyncSourceStep(Step):
+        _is_unary = False
+
+        async def execute(self, count, values):
+            await asyncio.sleep(0)
+            return [7]
+
+    class Span:
+        open = False
+
+        def __enter__(self):
+            self.open = True
+
+        def __exit__(self, *args):
+            self.open = False
+
+    source = AsyncSourceStep()
+    assign_ids([source])
+    span = Span()
+    pending = run_steps(
+        1, [source], asyncio.iscoroutine,
+        on_step_batch=lambda step, count: span,
+    )
+    if cancel_mode == "close":
+        pending.close()
+    else:
+        task = asyncio.create_task(pending)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert not span.open

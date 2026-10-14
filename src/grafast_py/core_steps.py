@@ -24,6 +24,7 @@ import inspect
 import json
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from .concurrency import OwnedAwaitable
 from .step_model import Step
 
 # the marker used to mean "no fallback supplied" so a real ``None`` fallback is
@@ -341,7 +342,7 @@ class EachStep(Step):
             async def finish():
                 return regroup(await results)
 
-            return finish()
+            return OwnedAwaitable(finish(), results)
         return regroup(results)
 
     @property
@@ -466,7 +467,7 @@ class LoadStep(Step):
                     return [raw_error] * count
                 return self._scatter(resolved, entry_slot, count, len(unique_keys))
 
-            return finish()
+            return OwnedAwaitable(finish(), loaded)
         return self._scatter(loaded, entry_slot, count, len(unique_keys))
 
     def _scatter(
@@ -667,7 +668,9 @@ class NodeStep(Step):
                     keys_by_type, loaded_by_type,
                 )
 
-            return finish()
+            return OwnedAwaitable(
+                finish(), *(loaded_by_type[typename] for typename in pending_types)
+            )
 
         return self._scatter_nodes(
             count, per_entry_error, entry_type,

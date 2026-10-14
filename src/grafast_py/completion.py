@@ -43,6 +43,7 @@ from graphql.type import (
 )
 
 from .bubble import Bubble
+from .concurrency import await_limited
 
 
 class LeafCompleter(NamedTuple):
@@ -224,7 +225,10 @@ def resolve_awaitable_values(context, values: List[Any]):
         return None
 
     async def run():
-        resolved = await gather(*(values[i] for i in idx), return_exceptions=True)
+        semaphore = getattr(context, "_grafast_concurrency", None)
+        resolved = await gather(
+            *(await_limited(values[i], semaphore) for i in idx), return_exceptions=True
+        )
         for i, r in zip(idx, resolved):
             values[i] = r
 
@@ -396,16 +400,20 @@ def prepare_list_inputs(context, values):
     if not work:
         return None
 
+    async def drain(iterable):
+        return [item async for item in iterable]
+
     async def settle(kind, v):
+        semaphore = getattr(context, "_grafast_concurrency", None)
         if kind == "await":
             try:
-                awaited = await v
+                awaited = await await_limited(v, semaphore)
             except (GraphQLError, TypeError, ValueError, RuntimeError) as exc:
                 return exc
             if not is_iterable(awaited) and isinstance(awaited, AsyncIterable):
-                return [item async for item in awaited]
+                return await await_limited(drain(awaited), semaphore)
             return awaited
-        return [item async for item in v]
+        return await await_limited(drain(v), semaphore)
 
     async def run():
         resolved = await gather(*(settle(k, v) for k, v in work))
@@ -604,8 +612,12 @@ def gather_guard(context, guard):
     from asyncio import gather
 
     async def run():
+        semaphore = getattr(context, "_grafast_concurrency", None)
         return await gather(
-            *(g if context.is_awaitable(g) else _wrap(g) for g in guard)
+            *(
+                await_limited(g, semaphore) if context.is_awaitable(g) else _wrap(g)
+                for g in guard
+            )
         )
 
     return run()
@@ -801,8 +813,10 @@ def settle_runtimes(context, runtimes, awaitable_idx):
     from asyncio import gather
 
     async def run():
+        semaphore = getattr(context, "_grafast_concurrency", None)
         resolved = await gather(
-            *(runtimes[i] for i in awaitable_idx), return_exceptions=True
+            *(await_limited(runtimes[i], semaphore) for i in awaitable_idx),
+            return_exceptions=True,
         )
         for i, r in zip(awaitable_idx, resolved):
             runtimes[i] = r
