@@ -842,6 +842,7 @@ def run_effect_steps(context, plan: ObjectPlan, parents: List[Any]):
         context.is_awaitable,
         seed=seed,
         on_step_batch=getattr(context, "_grafast_on_step_batch", None),
+        semaphore=getattr(context, "_grafast_concurrency", None),
     )
     if context.is_awaitable(columns):
 
@@ -874,6 +875,7 @@ def run_serial_plan_field(context, field_plan, live_parents, live_paths, parent_
         seed=seed,
         on_step_batch=getattr(context, "_grafast_on_step_batch", None),
         extra=extra,
+        semaphore=getattr(context, "_grafast_concurrency", None),
     )
 
     field_def = field_plan.field_def
